@@ -1,0 +1,72 @@
+{
+  "enabled": {
+    "description": "启用提示词编排",
+    "type": "bool",
+    "default": true
+  },
+  "context_budget": {
+    "description": "默认上下文预算（token）",
+    "hint": "无法从模型元数据取得上限时使用。",
+    "type": "int",
+    "default": 32768
+  },
+  "output_reserve": {
+    "description": "输出预留（token）",
+    "type": "int",
+    "default": 2048
+  },
+  "scan_depth": {
+    "description": "默认世界书扫描深度",
+    "type": "int",
+    "default": 4
+  },
+  "max_recursion_steps": {
+    "description": "最大递归扫描次数",
+    "type": "int",
+    "default": 3
+  },
+  "vector_enabled": {
+    "description": "启用向量条目",
+    "type": "bool",
+    "default": false
+  },
+  "embedding_provider_id": {
+    "description": "Embedding Provider ID",
+    "type": "string",
+    "default": ""
+  },
+  "tool_delivery_enabled": {
+    "description": "启用发送工具引导",
+    "type": "bool",
+    "default": false
+  },
+  "qq_forward_split_enabled": {
+    "description": "拆分 QQ 合并转发节点",
+    "hint": "非流式纯文本回复超过触发字数时，拆成多个转发 Node。仅作用于 aiocqhttp。",
+    "type": "bool",
+    "default": true
+  },
+  "qq_forward_trigger_chars": {
+    "description": "QQ 合并转发触发字数",
+    "hint": "回复总字符数超过此值后改用合并转发。中文、英文、标点和换行均按 Unicode 字符计数。",
+    "type": "int",
+    "default": 1500
+  },
+  "qq_forward_node_chars": {
+    "description": "每个 QQ 转发 Node 最大字数",
+    "hint": "推荐 2000-3000。优先按段落和句末拆分，无法找到边界时按此字数硬切。",
+    "type": "int",
+    "default": 2500
+  },
+  "status_bar_enabled": {
+    "description": "启用状态栏解析",
+    "type": "bool",
+    "default": false
+  },
+  "status_bar_template": {
+    "description": "状态栏格式",
+    "hint": "使用 {content} 放置解析后的状态。",
+    "type": "text",
+    "default": "**Status**\n```\n{content}\n```"
+  }
+}

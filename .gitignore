@@ -1,0 +1,25 @@
+# AstrBot runtime data and local configuration
+data/
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.bak
+*.log
+.env
+.env.*
+
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+
+# Frontend dependencies and local tooling
+web/node_modules/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
