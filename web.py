@@ -164,7 +164,10 @@ class TavernWebApi:
             parsed = (parse_binary_payload(str(payload.get("base64", "")), str(payload.get("file_name", "data.png")))
                       if payload.get("base64") else
                       parse_payload(str(payload.get("content", "")), str(payload.get("file_name", "data.json"))))
-            return self.ok({"preview": preview_import(parsed, payload.get("kind")), "parsed": parsed})
+            return self.ok({
+                "preview": preview_import(parsed, payload.get("kind"), payload.get("file_name")),
+                "parsed": parsed,
+            })
         except Exception as exc:
             return self.error(str(exc))
 
@@ -176,7 +179,7 @@ class TavernWebApi:
                 parsed = (parse_binary_payload(str(payload.get("base64", "")), str(payload.get("file_name", "data.png")))
                           if payload.get("base64") else
                           parse_payload(str(payload.get("content", "")), str(payload.get("file_name", "data.json"))))
-            info = preview_import(parsed, payload.get("kind"))
+            info = preview_import(parsed, payload.get("kind"), payload.get("file_name"))
             normalized, errors, warnings = validate_document(info["kind"], parsed)
             if errors:
                 return self.error("；".join(errors))
@@ -235,7 +238,7 @@ class TavernWebApi:
             tasks.append("把角色绑定到 Persona 或会话")
         if counts.get("lorebook") and not any(item["kind"] == "lorebook" for item in bindings):
             tasks.append("已有世界书尚未绑定")
-        return self.ok({"version": "0.2.5", "counts": counts, "bindings": len(bindings),
+        return self.ok({"version": "0.2.6", "counts": counts, "bindings": len(bindings),
                         "tasks": tasks, "ready": not tasks})
 
     async def personas(self):

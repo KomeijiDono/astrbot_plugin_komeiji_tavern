@@ -8,7 +8,7 @@ import struct
 import zlib
 from pathlib import Path
 
-from astrbot_plugin_komeiji_tavern.importers import detect_kind, export_document, parse_binary_payload, preview_import
+from astrbot_plugin_komeiji_tavern.importers import detect_kind, export_document, parse_binary_payload, parse_payload, preview_import
 from astrbot_plugin_komeiji_tavern.documents import validate_document
 from astrbot_plugin_komeiji_tavern.lore import LoreScanner, normalize_entries
 from astrbot_plugin_komeiji_tavern.models import Position, ScanResult
@@ -280,6 +280,7 @@ class CoreTests(unittest.TestCase):
     payload = {"entries": {"0": entry(0, ["key"], "content", extensions={"sticky": 2})}}
     self.assertEqual(detect_kind(payload), "lorebook")
     self.assertEqual(preview_import(payload)["count"], 1)
+    self.assertEqual(preview_import(payload, file_name="MYGO_Mujica.json")["name"], "MYGO_Mujica")
     document = {"raw": json.loads(json.dumps(payload)), "data": payload}
     self.assertEqual(export_document(document), payload)
 
@@ -293,6 +294,16 @@ class CoreTests(unittest.TestCase):
     self.assertEqual(exported["entries"]["7"]["content"], "new")
     self.assertEqual(exported["entries"]["7"]["extensions"]["unknown"], 1)
     self.assertNotIn("_komeiji_tavern_version", exported)
+
+ def test_plain_text_prompt_import(self):
+    data = parse_payload('"第一行\n第二行"', "System_prompt.txt")
+    parsed = preview_import(data)
+    normalized, errors, warnings = validate_document(parsed["kind"], data)
+    self.assertEqual(parsed["kind"], "preset")
+    self.assertEqual(parsed["name"], "System_prompt")
+    self.assertEqual(normalized["main_prompt"], "第一行\n第二行")
+    self.assertEqual(errors, [])
+    self.assertEqual(warnings, [])
 
  def test_png_character_import(self):
     card = {"spec": "chara_card_v2", "data": {"name": "Alice", "first_mes": "Hello"}}

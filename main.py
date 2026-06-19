@@ -26,7 +26,7 @@ _STATE_JSON = re.compile(r"\[TAVERN_STATE\]\s*(\{.*?\})\s*$", re.DOTALL)
 _STATE_FIELDS = re.compile(r"\[LOVE_DATA\]\s*(.+)$", re.MULTILINE)
 
 
-@register(PLUGIN_ID, "KomeijiDono", DESCRIPTION, "0.2.5")
+@register(PLUGIN_ID, "KomeijiDono", DESCRIPTION, "0.2.6")
 class KomeijiTavernPlugin(Star):
     def __init__(self, context: Context, config: dict[str, Any] | None = None):
         super().__init__(context)
@@ -216,7 +216,7 @@ class KomeijiTavernPlugin(Star):
         if action == "status":
             state = self.storage.get_session(session_id)
             event.set_result(event.plain_result(
-                f"Komeiji's Tavern 0.2.5\n会话：{session_id}\n轮次：{state.get('turn', 0)}\n"
+                f"Komeiji's Tavern 0.2.6\n会话：{session_id}\n轮次：{state.get('turn', 0)}\n"
                 f"生命周期记录：{len(state.get('effects', {}))}\n可在插件管理页查看绑定和最终 messages[]。"
             ))
             return

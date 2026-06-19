@@ -17,6 +17,13 @@ def parse_payload(content: str, file_name: str = "data.json") -> Any:
     suffix = Path(file_name).suffix.lower()
     if suffix in {".yaml", ".yml"}:
         return yaml.safe_load(content)
+    if suffix in {".txt", ".md"}:
+        text = content.strip().lstrip("\ufeff")
+        if len(text) >= 2 and text[0] == text[-1] and text[0] in {'"', "'"}:
+            text = text[1:-1].strip()
+        if not text:
+            raise ValueError("提示词文本为空")
+        return {"name": Path(file_name).stem, "main_prompt": text, "blocks": []}
     return json.loads(content)
 
 
@@ -56,14 +63,19 @@ def detect_kind(payload: Any) -> str:
     return "document"
 
 
-def preview_import(payload: Any, requested_kind: str | None = None) -> dict[str, Any]:
+def preview_import(
+    payload: Any,
+    requested_kind: str | None = None,
+    file_name: str | None = None,
+) -> dict[str, Any]:
     kind = requested_kind or detect_kind(payload)
-    name = "Imported"
+    fallback_name = Path(file_name).stem if file_name else "Imported"
+    name = fallback_name
     count = 1
     warnings: list[str] = []
     if isinstance(payload, dict):
         data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
-        name = str(data.get("name", payload.get("name", "Imported")))
+        name = str(data.get("name", payload.get("name", fallback_name)) or fallback_name)
         entries = payload.get("entries")
         if isinstance(entries, (dict, list)):
             count = len(entries)

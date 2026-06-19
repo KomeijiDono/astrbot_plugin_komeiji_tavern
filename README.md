@@ -2,9 +2,15 @@
 
 Komeiji's Tavern 是 AstrBot 的角色扮演提示词编排插件。它负责管理角色卡、用户设定、提示词预设、世界书和会话生命周期，并展示某次请求最终发送给模型的 `messages[]`。
 
-当前版本：`0.2.5`。仅支持 AstrBot Chat Completion 管线。
+当前版本：`0.2.6`。仅支持 AstrBot Chat Completion 管线。
 
 ## 版本更新记录
+
+### 0.2.6
+
+- 支持将 `.txt` 和 `.md` 纯文本文件导入为提示词预设。
+- 自动去掉纯文本提示词首尾匹配的单层引号。
+- 导入后的文本作为 Main Prompt，并继续使用默认角色、世界书和 Persona 提示块。
 
 ### 0.2.5
 
@@ -73,11 +79,19 @@ Komeiji's Tavern 是 AstrBot 的角色扮演提示词编排插件。它负责管
 
 管理页使用 AstrBot Dashboard 的登录状态，不提供匿名入口。插件或页面升级后，需要在插件管理中重载一次插件。
 
+本机也可以在已经登录 Dashboard 的浏览器中直接访问：
+
+```text
+http://127.0.0.1:6185/api/plug/astrbot_plugin_komeiji_tavern/v1/panel
+```
+
+插件不单独监听网络端口。是否能从局域网或公网访问完全取决于 AstrBot Dashboard 的监听地址、防火墙和反向代理配置；所有页面和接口仍要求 Dashboard 身份认证，不提供匿名外部地址。
+
 ## 第一次使用
 
 ### 1. 准备角色
 
-打开“角色卡”，点击“新建角色卡”，或在页面右上角导入 JSON、YAML、YML、带角色卡元数据的 PNG。
+打开“角色卡”，点击“新建角色卡”，或在页面右上角导入 JSON、YAML、YML、带角色卡元数据的 PNG。纯文本 `.txt` 和 `.md` 文件会作为提示词预设导入。
 
 角色卡可以设置：
 
