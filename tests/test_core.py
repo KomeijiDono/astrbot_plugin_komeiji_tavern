@@ -17,6 +17,8 @@ from astrbot_plugin_komeiji_tavern.qq_delivery import split_forward_text
 from astrbot_plugin_komeiji_tavern.storage import TavernStorage
 from astrbot_plugin_komeiji_tavern.service import TavernService
 from astrbot_plugin_komeiji_tavern.web import TavernWebApi
+from astrbot_plugin_komeiji_tavern.main import KomeijiTavernPlugin
+from astrbot.api.message_components import Plain
 
 
 def run(coro):
@@ -28,6 +30,46 @@ def entry(uid, keys, content, **extra):
 
 
 class CoreTests(unittest.TestCase):
+ def test_qq_direct_split_sends_plain_messages_and_clears_result(self):
+    class Result:
+     def __init__(self):
+      self.chain = [Plain("中" * 3200)]
+
+     @staticmethod
+     def is_llm_result():
+      return True
+
+    class Event:
+     def __init__(self):
+      self.result = Result()
+      self.sent = []
+
+     @staticmethod
+     def get_platform_name():
+      return "aiocqhttp"
+
+     def get_result(self):
+      return self.result
+
+     def clear_result(self):
+      self.result = None
+
+     async def send(self, chain):
+      self.sent.append(chain)
+
+    plugin = KomeijiTavernPlugin.__new__(KomeijiTavernPlugin)
+    plugin.config = {
+        "qq_direct_split_enabled": True,
+        "qq_direct_message_chars": 1500,
+        "qq_direct_send_interval_ms": 0,
+        "qq_forward_trigger_chars": 100,
+    }
+    event = Event()
+    run(plugin.deliver_qq_long_reply(event))
+    self.assertIsNone(event.result)
+    self.assertEqual([len(chain.chain[0].text) for chain in event.sent], [1500, 1500, 200])
+    self.assertTrue(all(isinstance(chain.chain[0], Plain) for chain in event.sent))
+
  def test_qq_forward_text_split_preserves_content_and_limit(self):
     text = ("第一段。\n" * 900) + ("x" * 3000)
     chunks = split_forward_text(text, 2500)

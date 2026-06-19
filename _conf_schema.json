@@ -40,6 +40,24 @@
     "type": "bool",
     "default": false
   },
+  "qq_direct_split_enabled": {
+    "description": "QQ 长回复逐条直接发送",
+    "hint": "开启后优先于合并转发：长回复会拆成多条普通 QQ 消息依次发送，便于排查合并转发失败。",
+    "type": "bool",
+    "default": false
+  },
+  "qq_direct_message_chars": {
+    "description": "QQ 直接发送每条最大字数",
+    "hint": "按 Unicode 字符计数，推荐 1000-2000。优先在段落和句末切分。",
+    "type": "int",
+    "default": 1500
+  },
+  "qq_direct_send_interval_ms": {
+    "description": "QQ 逐条发送间隔（毫秒）",
+    "hint": "避免连续发送过快触发限流，推荐 500-1500。",
+    "type": "int",
+    "default": 800
+  },
   "qq_forward_split_enabled": {
     "description": "拆分 QQ 合并转发节点",
     "hint": "非流式纯文本回复超过触发字数时，拆成多个转发 Node。仅作用于 aiocqhttp。",

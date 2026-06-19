@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from pathlib import Path
 from typing import Any
 
 from astrbot.api import logger
-from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.message_components import Node, Nodes, Plain
 from astrbot.api.provider import LLMResponse, ProviderRequest
 from astrbot.api.star import Context, Star, register
@@ -25,7 +26,7 @@ _STATE_JSON = re.compile(r"\[TAVERN_STATE\]\s*(\{.*?\})\s*$", re.DOTALL)
 _STATE_FIELDS = re.compile(r"\[LOVE_DATA\]\s*(.+)$", re.MULTILINE)
 
 
-@register(PLUGIN_ID, "KomeijiDono", DESCRIPTION, "0.2.3")
+@register(PLUGIN_ID, "KomeijiDono", DESCRIPTION, "0.2.4")
 class KomeijiTavernPlugin(Star):
     def __init__(self, context: Context, config: dict[str, Any] | None = None):
         super().__init__(context)
@@ -107,11 +108,9 @@ class KomeijiTavernPlugin(Star):
             response.completion_text = (response.completion_text or "").rstrip() + "\n\n" + template.replace("{content}", status_content)
         self.storage.save_session(session_id, state)
 
-    @filter.on_decorating_result(priority=1000)
-    async def split_qq_forward_nodes(self, event: AstrMessageEvent):
-        """Split long plain-text QQ replies into configurable forward nodes."""
-        if not self.config.get("qq_forward_split_enabled", True):
-            return
+    @filter.on_decorating_result(priority=-1000)
+    async def deliver_qq_long_reply(self, event: AstrMessageEvent):
+        """Deliver long plain-text QQ replies as direct chunks or forward nodes."""
         if event.get_platform_name() != "aiocqhttp":
             return
         result = event.get_result()
@@ -123,6 +122,27 @@ class KomeijiTavernPlugin(Star):
         text = "".join(component.text for component in result.chain)
         trigger = max(100, int(self.config.get("qq_forward_trigger_chars", 1500)))
         if len(text) <= trigger:
+            return
+
+        if self.config.get("qq_direct_split_enabled", False):
+            message_chars = max(100, int(self.config.get("qq_direct_message_chars", 1500)))
+            interval_ms = max(0, int(self.config.get("qq_direct_send_interval_ms", 800)))
+            chunks = split_forward_text(text, message_chars)
+            event.clear_result()
+            for index, chunk in enumerate(chunks):
+                await event.send(MessageChain([Plain(chunk)]))
+                if interval_ms and index + 1 < len(chunks):
+                    await asyncio.sleep(interval_ms / 1000)
+            logger.info(
+                "[%s] QQ 长回复已按每条最多 %d 字符直接发送为 %d 条消息（共 %d 字符）",
+                DISPLAY_NAME,
+                message_chars,
+                len(chunks),
+                len(text),
+            )
+            return
+
+        if not self.config.get("qq_forward_split_enabled", True):
             return
         node_chars = max(100, int(self.config.get("qq_forward_node_chars", 2500)))
         chunks = split_forward_text(text, node_chars)
@@ -159,7 +179,7 @@ class KomeijiTavernPlugin(Star):
         if action == "status":
             state = self.storage.get_session(session_id)
             event.set_result(event.plain_result(
-                f"Komeiji's Tavern 0.2.3\n会话：{session_id}\n轮次：{state.get('turn', 0)}\n"
+                f"Komeiji's Tavern 0.2.4\n会话：{session_id}\n轮次：{state.get('turn', 0)}\n"
                 f"生命周期记录：{len(state.get('effects', {}))}\n可在插件管理页查看绑定和最终 messages[]。"
             ))
             return

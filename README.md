@@ -2,9 +2,15 @@
 
 Komeiji's Tavern 是 AstrBot 的角色扮演提示词编排插件。它负责管理角色卡、用户设定、提示词预设、世界书和会话生命周期，并展示某次请求最终发送给模型的 `messages[]`。
 
-当前版本：`0.2.3`。仅支持 AstrBot Chat Completion 管线。
+当前版本：`0.2.4`。仅支持 AstrBot Chat Completion 管线。
 
 ## 版本更新记录
+
+### 0.2.4
+
+- 新增 QQ 长回复逐条普通消息发送模式，可通过插件配置与合并转发切换。
+- 支持设置每条普通消息的最大字符数和发送间隔。
+- 调整长回复发送钩子顺序，使 token 统计等附加文本一并参与分片。
 
 ### 0.2.3
 
@@ -48,6 +54,8 @@ Komeiji's Tavern 是 AstrBot 的角色扮演提示词编排插件。它负责管
 ## QQ 长回复分片
 
 插件设置提供“拆分 QQ 合并转发节点”“QQ 合并转发触发字数”和“每个 QQ 转发 Node 最大字数”。非流式纯文本回复超过触发值后，会在 AstrBot 自动包装前拆为多个 Node。默认每个 Node 最多 2500 个 Unicode 字符，中文、英文、标点和换行通常都各计 1 个字符。建议设置在 2000-3000；过高仍可能被 QQ 拒绝，内容审核导致的拒绝也无法靠分片解决。
+
+开启“QQ 长回复逐条直接发送”后，该模式优先于合并转发。插件会按“QQ 直接发送每条最大字数”拆分正文，通过普通 QQ 消息接口逐条发送，并按配置的毫秒间隔限速。关闭此开关后恢复合并转发 Node 模式。
 
 ## 打开管理页
 
@@ -177,6 +185,9 @@ tavern.db.v0.1.0.bak
 - `vector_enabled`：启用向量条目，默认关闭。
 - `embedding_provider_id`：向量条目使用的 AstrBot Embedding Provider。
 - `tool_delivery_enabled`：临时调整发送工具说明，引导模型通过工具发送正文。
+- `qq_direct_split_enabled`：将 QQ 长回复拆成多条普通消息直接发送；开启时优先于合并转发。
+- `qq_direct_message_chars`：每条普通 QQ 消息的最大 Unicode 字符数。
+- `qq_direct_send_interval_ms`：相邻普通 QQ 消息的发送间隔，单位为毫秒。
 - `qq_forward_split_enabled`：启用非流式 QQ 长回复的合并转发节点分片。
 - `qq_forward_trigger_chars`：回复超过多少 Unicode 字符后改用合并转发。
 - `qq_forward_node_chars`：每个 QQ 转发 Node 的最大 Unicode 字符数，建议设置为 2000-3000。

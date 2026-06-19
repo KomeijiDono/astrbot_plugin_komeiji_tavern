@@ -2,4 +2,4 @@ name: astrbot_plugin_komeiji_tavern
 display_name: Komeiji's Tavern
 desc: 为 AstrBot 提供角色卡、提示词编排、世界书、创作素材与最终请求预览的一体化角色扮演工具。
 author: KomeijiDono
-version: 0.2.3
+version: 0.2.4
