@@ -70,6 +70,52 @@ class CoreTests(unittest.TestCase):
     self.assertEqual([len(chain.chain[0].text) for chain in event.sent], [1500, 1500, 200])
     self.assertTrue(all(isinstance(chain.chain[0], Plain) for chain in event.sent))
 
+ def test_qq_direct_split_retries_failed_chunk(self):
+    class Result:
+     chain = [Plain("中" * 2200)]
+
+     @staticmethod
+     def is_llm_result():
+      return True
+
+    class Event:
+     def __init__(self):
+      self.result = Result()
+      self.calls = []
+      self.successful = []
+
+     @staticmethod
+     def get_platform_name():
+      return "aiocqhttp"
+
+     def get_result(self):
+      return self.result
+
+     def clear_result(self):
+      self.result = None
+
+     async def send(self, chain):
+      length = len(chain.chain[0].text)
+      self.calls.append(length)
+      if len(self.calls) == 2:
+       raise RuntimeError("temporary failure")
+      self.successful.append(length)
+
+    plugin = KomeijiTavernPlugin.__new__(KomeijiTavernPlugin)
+    plugin.config = {
+        "qq_direct_split_enabled": True,
+        "qq_direct_message_chars": 1000,
+        "qq_direct_send_interval_ms": 0,
+        "qq_direct_retry_count": 1,
+        "qq_direct_retry_delay_ms": 0,
+        "qq_forward_trigger_chars": 100,
+    }
+    event = Event()
+    run(plugin.deliver_qq_long_reply(event))
+    self.assertIsNone(event.result)
+    self.assertEqual(event.calls, [1000, 1000, 1000, 200])
+    self.assertEqual(event.successful, [1000, 1000, 200])
+
  def test_qq_forward_text_split_preserves_content_and_limit(self):
     text = ("第一段。\n" * 900) + ("x" * 3000)
     chunks = split_forward_text(text, 2500)

@@ -26,7 +26,7 @@ _STATE_JSON = re.compile(r"\[TAVERN_STATE\]\s*(\{.*?\})\s*$", re.DOTALL)
 _STATE_FIELDS = re.compile(r"\[LOVE_DATA\]\s*(.+)$", re.MULTILINE)
 
 
-@register(PLUGIN_ID, "KomeijiDono", DESCRIPTION, "0.2.4")
+@register(PLUGIN_ID, "KomeijiDono", DESCRIPTION, "0.2.5")
 class KomeijiTavernPlugin(Star):
     def __init__(self, context: Context, config: dict[str, Any] | None = None):
         super().__init__(context)
@@ -125,12 +125,49 @@ class KomeijiTavernPlugin(Star):
             return
 
         if self.config.get("qq_direct_split_enabled", False):
-            message_chars = max(100, int(self.config.get("qq_direct_message_chars", 1500)))
-            interval_ms = max(0, int(self.config.get("qq_direct_send_interval_ms", 800)))
+            message_chars = max(100, int(self.config.get("qq_direct_message_chars", 1000)))
+            interval_ms = max(0, int(self.config.get("qq_direct_send_interval_ms", 2000)))
+            retry_count = max(0, int(self.config.get("qq_direct_retry_count", 2)))
+            retry_delay_ms = max(0, int(self.config.get("qq_direct_retry_delay_ms", 3000)))
             chunks = split_forward_text(text, message_chars)
             event.clear_result()
             for index, chunk in enumerate(chunks):
-                await event.send(MessageChain([Plain(chunk)]))
+                retry = 0
+                while True:
+                    try:
+                        await event.send(MessageChain([Plain(chunk)]))
+                        logger.info(
+                            "[%s] QQ 普通消息分片 %d/%d 发送成功（%d 字符）",
+                            DISPLAY_NAME,
+                            index + 1,
+                            len(chunks),
+                            len(chunk),
+                        )
+                        break
+                    except Exception as exc:
+                        if retry >= retry_count:
+                            logger.error(
+                                "[%s] QQ 普通消息分片 %d/%d 发送失败，已用尽 %d 次重试：%s",
+                                DISPLAY_NAME,
+                                index + 1,
+                                len(chunks),
+                                retry_count,
+                                exc,
+                            )
+                            raise
+                        retry += 1
+                        logger.warning(
+                            "[%s] QQ 普通消息分片 %d/%d 发送失败，%dms 后进行第 %d/%d 次重试：%s",
+                            DISPLAY_NAME,
+                            index + 1,
+                            len(chunks),
+                            retry_delay_ms,
+                            retry,
+                            retry_count,
+                            exc,
+                        )
+                        if retry_delay_ms:
+                            await asyncio.sleep(retry_delay_ms / 1000)
                 if interval_ms and index + 1 < len(chunks):
                     await asyncio.sleep(interval_ms / 1000)
             logger.info(
@@ -179,7 +216,7 @@ class KomeijiTavernPlugin(Star):
         if action == "status":
             state = self.storage.get_session(session_id)
             event.set_result(event.plain_result(
-                f"Komeiji's Tavern 0.2.4\n会话：{session_id}\n轮次：{state.get('turn', 0)}\n"
+                f"Komeiji's Tavern 0.2.5\n会话：{session_id}\n轮次：{state.get('turn', 0)}\n"
                 f"生命周期记录：{len(state.get('effects', {}))}\n可在插件管理页查看绑定和最终 messages[]。"
             ))
             return

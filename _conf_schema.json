@@ -50,13 +50,25 @@
     "description": "QQ 直接发送每条最大字数",
     "hint": "按 Unicode 字符计数，推荐 1000-2000。优先在段落和句末切分。",
     "type": "int",
-    "default": 1500
+    "default": 1000
   },
   "qq_direct_send_interval_ms": {
     "description": "QQ 逐条发送间隔（毫秒）",
     "hint": "避免连续发送过快触发限流，推荐 500-1500。",
     "type": "int",
-    "default": 800
+    "default": 2000
+  },
+  "qq_direct_retry_count": {
+    "description": "QQ 直接发送失败重试次数",
+    "hint": "单片普通消息发送失败后的最大重试次数。",
+    "type": "int",
+    "default": 2
+  },
+  "qq_direct_retry_delay_ms": {
+    "description": "QQ 直接发送重试等待（毫秒）",
+    "hint": "发送失败后等待多久再重试，推荐 2000-5000。",
+    "type": "int",
+    "default": 3000
   },
   "qq_forward_split_enabled": {
     "description": "拆分 QQ 合并转发节点",

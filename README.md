@@ -2,9 +2,15 @@
 
 Komeiji's Tavern 是 AstrBot 的角色扮演提示词编排插件。它负责管理角色卡、用户设定、提示词预设、世界书和会话生命周期，并展示某次请求最终发送给模型的 `messages[]`。
 
-当前版本：`0.2.4`。仅支持 AstrBot Chat Completion 管线。
+当前版本：`0.2.5`。仅支持 AstrBot Chat Completion 管线。
 
 ## 版本更新记录
+
+### 0.2.5
+
+- QQ 普通消息分片增加逐片日志和失败重试。
+- 支持配置重试次数与重试等待时间。
+- 当前测试参数调整为每片 1000 字、发送间隔 2000ms。
 
 ### 0.2.4
 
@@ -188,6 +194,8 @@ tavern.db.v0.1.0.bak
 - `qq_direct_split_enabled`：将 QQ 长回复拆成多条普通消息直接发送；开启时优先于合并转发。
 - `qq_direct_message_chars`：每条普通 QQ 消息的最大 Unicode 字符数。
 - `qq_direct_send_interval_ms`：相邻普通 QQ 消息的发送间隔，单位为毫秒。
+- `qq_direct_retry_count`：单片普通消息发送失败后的重试次数。
+- `qq_direct_retry_delay_ms`：发送失败后的重试等待时间，单位为毫秒。
 - `qq_forward_split_enabled`：启用非流式 QQ 长回复的合并转发节点分片。
 - `qq_forward_trigger_chars`：回复超过多少 Unicode 字符后改用合并转发。
 - `qq_forward_node_chars`：每个 QQ 转发 Node 的最大 Unicode 字符数，建议设置为 2000-3000。
