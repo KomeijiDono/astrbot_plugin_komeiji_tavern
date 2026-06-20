@@ -18,6 +18,7 @@ from astrbot_plugin_komeiji_tavern.storage import TavernStorage
 from astrbot_plugin_komeiji_tavern.service import TavernService
 from astrbot_plugin_komeiji_tavern.web import TavernWebApi
 from astrbot_plugin_komeiji_tavern.main import KomeijiTavernPlugin
+from astrbot_plugin_komeiji_tavern.illustration import OmniDrawBridge
 from astrbot.api.message_components import Plain
 
 
@@ -315,5 +316,105 @@ class CoreTests(unittest.TestCase):
     self.assertEqual(parsed["data"]["name"], "Alice")
 
 
+class _FakeResponse:
+ def __init__(self, text):
+  self.completion_text = text
+
+
+class _FakeEvent:
+ def __init__(self):
+  self.sent = []
+
+ async def send(self, chain):
+  self.sent.append(chain)
+
+ def chain_result(self, components):
+  return type("R", (), {"chain": list(components)})()
+
+
+class _FakeOmniDraw:
+ def __init__(self, result):
+  self.result = result
+  self.calls = []
+
+ async def generate_images_for_plugin(self, **kwargs):
+  self.calls.append(kwargs)
+  return self.result
+
+
+class _FakeContext:
+ def __init__(self, star=None):
+  self._star = star
+
+ def get_registered_star(self, name):
+  return self._star
+
+
+class IllustrationTests(unittest.TestCase):
+ def test_build_prompt_truncates_and_prefixes(self):
+  bridge = OmniDrawBridge(_FakeContext(), {
+   "illustration_enabled": True,
+   "illustration_max_text_chars": 50,
+   "illustration_prompt_prefix": "roleplay scene,",
+  })
+  self.assertEqual(bridge._build_prompt("x" * 200), "roleplay scene, " + "x" * 50)
+  bridge.config["illustration_prompt_prefix"] = ""
+  self.assertEqual(bridge._build_prompt("hello"), "hello")
+  self.assertEqual(bridge._build_prompt(""), "")
+
+ def test_maybe_illustrate_skips_when_disabled(self):
+  bridge = OmniDrawBridge(_FakeContext(_FakeOmniDraw({"success": True})), {"illustration_enabled": False})
+  run(bridge.maybe_illustrate(_FakeEvent(), _FakeResponse("a" * 100)))
+  self.assertEqual(bridge._tasks, set())
+
+ def test_maybe_illustrate_skips_when_omnidraw_missing(self):
+  bridge = OmniDrawBridge(_FakeContext(None), {"illustration_enabled": True})
+  run(bridge.maybe_illustrate(_FakeEvent(), _FakeResponse("a" * 100)))
+  self.assertEqual(bridge._tasks, set())
+
+ def test_maybe_illustrate_skips_short_text(self):
+  bridge = OmniDrawBridge(_FakeContext(_FakeOmniDraw({"success": True})), {"illustration_enabled": True})
+  run(bridge.maybe_illustrate(_FakeEvent(), _FakeResponse("短文本")))
+  self.assertEqual(bridge._tasks, set())
+
+ def test_run_sends_image_on_success(self):
+  with tempfile.TemporaryDirectory() as d:
+   img_path = Path(d) / "a.png"
+   img_path.write_bytes(b"\x89PNG\r\n\x1a\n")
+   omni = _FakeOmniDraw({"success": True, "images": [{"file_path": str(img_path)}]})
+   bridge = OmniDrawBridge(_FakeContext(), {"illustration_enabled": True, "illustration_mode": "text2img"})
+   event = _FakeEvent()
+   run(bridge._run(event, omni, "prompt", consume=False))
+   self.assertEqual(len(event.sent), 1)
+   self.assertEqual(omni.calls[0]["prompt"], "prompt")
+   self.assertEqual(omni.calls[0]["event"], None)
+   self.assertFalse(omni.calls[0]["record_usage"])
+
+ def test_run_passes_event_when_consuming_quota(self):
+  with tempfile.TemporaryDirectory() as d:
+   img_path = Path(d) / "a.png"
+   img_path.write_bytes(b"\x89PNG\r\n\x1a\n")
+   omni = _FakeOmniDraw({"success": True, "images": [{"file_path": str(img_path)}]})
+   bridge = OmniDrawBridge(_FakeContext(), {"illustration_enabled": True})
+   event = _FakeEvent()
+   run(bridge._run(event, omni, "prompt", consume=True))
+   self.assertIs(omni.calls[0]["event"], event)
+   self.assertTrue(omni.calls[0]["record_usage"])
+
+ def test_run_silent_on_failure(self):
+  omni = _FakeOmniDraw({"success": False, "message": "boom"})
+  bridge = OmniDrawBridge(_FakeContext(), {"illustration_enabled": True})
+  event = _FakeEvent()
+  run(bridge._run(event, omni, "prompt", consume=False))
+  self.assertEqual(event.sent, [])
+
+ def test_run_silent_when_no_images(self):
+  omni = _FakeOmniDraw({"success": True, "images": []})
+  bridge = OmniDrawBridge(_FakeContext(), {"illustration_enabled": True})
+  event = _FakeEvent()
+  run(bridge._run(event, omni, "prompt", consume=False))
+  self.assertEqual(event.sent, [])
+
+
 if __name__ == "__main__":
-    unittest.main()
+ unittest.main()

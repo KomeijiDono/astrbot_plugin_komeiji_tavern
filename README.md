@@ -2,9 +2,15 @@
 
 Komeiji's Tavern 是 AstrBot 的角色扮演提示词编排插件。它负责管理角色卡、用户设定、提示词预设、世界书和会话生命周期，并展示某次请求最终发送给模型的 `messages[]`。
 
-当前版本：`0.2.6`。仅支持 AstrBot Chat Completion 管线。
+当前版本：`0.3.0`。仅支持 AstrBot Chat Completion 管线。
 
 ## 版本更新记录
+
+### 0.3.0
+
+- 新增自动配图：每次 LLM 回复后可异步调用 `astrbot_plugin_omnidraw` 生成一张配图并补发到当前会话。
+- 软依赖 omnidraw，未安装或未激活时自动跳过；不修改文本回复流程。
+- 新增 7 个 `illustration_*` 配置项，支持开关、模式、尺寸、额度策略与提示词前缀。
 
 ### 0.2.6
 
@@ -159,6 +165,42 @@ http://127.0.0.1:6185/api/plug/astrbot_plugin_komeiji_tavern/v1/panel
 
 管理页调试器也可以只读模拟这些模式。
 
+## 自动配图
+
+0.3.0 起，插件可在每次 LLM 回复后自动生成一张配图并补发到当前会话，适合角色扮演场景的"每句话配一张图"。
+
+### 前置条件
+
+1. 安装并配置好 [`astrbot_plugin_omnidraw`](https://github.com/diaomin66/astrbot_plugin_omnidraw)（万象画卷）。
+2. 在 omnidraw 中至少配置一个可用的图像 Provider 节点，并确认 `/画 一只猫` 能正常出图。
+3. 建议开启 omnidraw 的副脑（`enable_optimizer`），它会把中文回复全文优化成更适合画图模型的英文提示词。
+
+### 工作方式
+
+- 文本回复照常走原 pipeline 发送（含 QQ 长回复分片）。
+- 同时在后台异步调用 omnidraw 的 `generate_images_for_plugin()` 生图，不阻塞文本。
+- 生图完成（几秒到两分钟）后，用 `event.send()` 单独补发一张图片，自然落在所有文本之后。
+- 配图失败时静默记日志，不打扰聊天。
+
+### 配置项
+
+| 配置项 | 默认 | 说明 |
+| :--- | :--- | :--- |
+| `illustration_enabled` | `false` | 启用自动配图。默认关闭，需显式开启。 |
+| `illustration_plugin_id` | `astrbot_plugin_omnidraw` | 要调用的生图插件 ID。 |
+| `illustration_mode` | `text2img` | 配图模式：`text2img` 文生图 / `selfie` 人设自拍。 |
+| `illustration_max_text_chars` | `600` | 传给生图的回复文本最大字符数，过长会被截断。 |
+| `illustration_size` | `""` | 配图默认尺寸，留空用 omnidraw 节点默认。 |
+| `illustration_consume_quota` | `false` | 是否走 omnidraw 权限检查并消耗用户每日额度。默认关闭，配图作为 bot 自动行为不扣额度。 |
+| `illustration_prompt_prefix` | `""` | 可选提示词前缀，会拼接到回复文本前再交给 omnidraw 副脑。 |
+
+### 注意事项
+
+- 每轮都生图会显著增加 API 调用量与成本，建议配合较便宜的图像模型。
+- `illustration_consume_quota=false` 时绕过 omnidraw 白名单与额度，适合 bot 自动行为；若希望统一计数则改为 `true`。
+- `selfie` 模式会使用 omnidraw 当前激活人设的参考图，适合固定角色的日常场景配图。
+- 配图输入为去掉状态栏标记后的纯叙事文本，按 `illustration_max_text_chars` 截断后送入副脑。
+
 ## 状态和排错命令
 
 ```text
@@ -215,5 +257,12 @@ tavern.db.v0.1.0.bak
 - `qq_forward_node_chars`：每个 QQ 转发 Node 的最大 Unicode 字符数，建议设置为 2000-3000。
 - `status_bar_enabled`：解析回复中的状态变量。
 - `status_bar_template`：状态栏显示格式，使用 `{content}` 放置内容。
+- `illustration_enabled`：启用每次 LLM 回复后的自动配图（需安装 omnidraw）。
+- `illustration_plugin_id`：生图插件 ID，默认 `astrbot_plugin_omnidraw`。
+- `illustration_mode`：配图模式，`text2img` 或 `selfie`。
+- `illustration_max_text_chars`：传入生图的回复最大字符数，默认 600。
+- `illustration_size`：配图默认尺寸，留空用 omnidraw 节点默认。
+- `illustration_consume_quota`：配图是否消耗 omnidraw 用户额度，默认 false。
+- `illustration_prompt_prefix`：配图提示词前缀，可选。
 
 向量条目未配置有效 Embedding Provider 时会跳过，并在请求调试结果中显示警告。

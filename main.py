@@ -13,6 +13,7 @@ from astrbot.api.provider import LLMResponse, ProviderRequest
 from astrbot.api.star import Context, Star, register
 from astrbot.core.star.filter.command import GreedyStr
 
+from .illustration import OmniDrawBridge
 from .service import TavernService
 from .qq_delivery import split_forward_text
 from .storage import TavernStorage
@@ -26,7 +27,7 @@ _STATE_JSON = re.compile(r"\[TAVERN_STATE\]\s*(\{.*?\})\s*$", re.DOTALL)
 _STATE_FIELDS = re.compile(r"\[LOVE_DATA\]\s*(.+)$", re.MULTILINE)
 
 
-@register(PLUGIN_ID, "KomeijiDono", DESCRIPTION, "0.2.6")
+@register(PLUGIN_ID, "KomeijiDono", DESCRIPTION, "0.3.0")
 class KomeijiTavernPlugin(Star):
     def __init__(self, context: Context, config: dict[str, Any] | None = None):
         super().__init__(context)
@@ -35,12 +36,16 @@ class KomeijiTavernPlugin(Star):
         self.storage = TavernStorage(data_dir / "tavern.db")
         self.service = TavernService(self.storage, context, self.config)
         self.web = TavernWebApi(self.storage, self.service, context, Path(__file__).parent / "web" / "dist")
+        self.illustration = OmniDrawBridge(context, self.config)
 
     async def initialize(self) -> None:
         self.service.ensure_defaults()
         for path, methods, handler, description in self.web.routes():
             self.context.register_web_api(path, handler, methods, description)
         logger.info("[%s] initialized", DISPLAY_NAME)
+
+    async def terminate(self) -> None:
+        await self.illustration.terminate()
 
     @staticmethod
     def _session_id(event: AstrMessageEvent, req: ProviderRequest | None = None) -> str:
@@ -78,35 +83,38 @@ class KomeijiTavernPlugin(Star):
         if tool is not None and original is not None:
             tool.description = original
 
-        if not self.config.get("status_bar_enabled", False):
-            return
-        text = response.completion_text or ""
-        state_match = _STATE_JSON.search(text)
-        fields_match = _STATE_FIELDS.search(text)
-        if not state_match and not fields_match:
-            return
-        session_id = self._session_id(event)
-        state = self.storage.get_session(session_id)
-        variables = state.setdefault("variables", {})
-        status_content = ""
-        if state_match:
-            try:
-                payload = json.loads(state_match.group(1))
-                if isinstance(payload, dict):
-                    variables.update({str(key): value for key, value in payload.items()})
-                    status_content = " | ".join(f"{key}: {value}" for key, value in payload.items())
-                response.completion_text = text[:state_match.start()].rstrip()
-            except json.JSONDecodeError:
-                logger.warning("[%s] invalid state payload", DISPLAY_NAME)
-        elif fields_match:
-            parts = [part.strip() for part in fields_match.group(1).split("|")]
-            variables.update({f"state_{index + 1}": value for index, value in enumerate(parts)})
-            status_content = " | ".join(parts)
-            response.completion_text = text[:fields_match.start()].rstrip()
-        if status_content:
-            template = str(self.config.get("status_bar_template", "**Status**\n```\n{content}\n```"))
-            response.completion_text = (response.completion_text or "").rstrip() + "\n\n" + template.replace("{content}", status_content)
-        self.storage.save_session(session_id, state)
+        try:
+            if not self.config.get("status_bar_enabled", False):
+                return
+            text = response.completion_text or ""
+            state_match = _STATE_JSON.search(text)
+            fields_match = _STATE_FIELDS.search(text)
+            if not state_match and not fields_match:
+                return
+            session_id = self._session_id(event)
+            state = self.storage.get_session(session_id)
+            variables = state.setdefault("variables", {})
+            status_content = ""
+            if state_match:
+                try:
+                    payload = json.loads(state_match.group(1))
+                    if isinstance(payload, dict):
+                        variables.update({str(key): value for key, value in payload.items()})
+                        status_content = " | ".join(f"{key}: {value}" for key, value in payload.items())
+                    response.completion_text = text[:state_match.start()].rstrip()
+                except json.JSONDecodeError:
+                    logger.warning("[%s] invalid state payload", DISPLAY_NAME)
+            elif fields_match:
+                parts = [part.strip() for part in fields_match.group(1).split("|")]
+                variables.update({f"state_{index + 1}": value for index, value in enumerate(parts)})
+                status_content = " | ".join(parts)
+                response.completion_text = text[:fields_match.start()].rstrip()
+            if status_content:
+                template = str(self.config.get("status_bar_template", "**Status**\n```\n{content}\n```"))
+                response.completion_text = (response.completion_text or "").rstrip() + "\n\n" + template.replace("{content}", status_content)
+            self.storage.save_session(session_id, state)
+        finally:
+            await self.illustration.maybe_illustrate(event, response)
 
     @filter.on_decorating_result(priority=-1000)
     async def deliver_qq_long_reply(self, event: AstrMessageEvent):
@@ -216,7 +224,7 @@ class KomeijiTavernPlugin(Star):
         if action == "status":
             state = self.storage.get_session(session_id)
             event.set_result(event.plain_result(
-                f"Komeiji's Tavern 0.2.6\n会话：{session_id}\n轮次：{state.get('turn', 0)}\n"
+                f"Komeiji's Tavern 0.3.0\n会话：{session_id}\n轮次：{state.get('turn', 0)}\n"
                 f"生命周期记录：{len(state.get('effects', {}))}\n可在插件管理页查看绑定和最终 messages[]。"
             ))
             return

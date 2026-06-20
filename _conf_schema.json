@@ -98,5 +98,48 @@
     "hint": "使用 {content} 放置解析后的状态。",
     "type": "text",
     "default": "**Status**\n```\n{content}\n```"
+  },
+  "illustration_enabled": {
+    "description": "启用自动配图",
+    "hint": "开启后，每次 LLM 回复都会异步调用 omnidraw 生成一张配图并补发到当前会话。需同时安装并配置好 astrbot_plugin_omnidraw。",
+    "type": "bool",
+    "default": false
+  },
+  "illustration_plugin_id": {
+    "description": "生图插件 ID",
+    "hint": "要调用的生图插件 ID，默认为 astrbot_plugin_omnidraw。若该插件未安装或未激活，配图会自动跳过。",
+    "type": "string",
+    "default": "astrbot_plugin_omnidraw"
+  },
+  "illustration_mode": {
+    "description": "配图模式",
+    "type": "string",
+    "options": ["text2img", "selfie"],
+    "hint": "text2img 为普通文生图；selfie 使用 omnidraw 当前人设与参考图生成自拍。默认 text2img。",
+    "default": "text2img"
+  },
+  "illustration_max_text_chars": {
+    "description": "传入生图的回复最大字符数",
+    "hint": "LLM 回复文本会被截断到此长度后作为生图提示词传给 omnidraw 副脑优化。建议 200-800，过长可能导致副脑超时。",
+    "type": "int",
+    "default": 600
+  },
+  "illustration_size": {
+    "description": "配图默认尺寸",
+    "hint": "留空使用 omnidraw 节点默认尺寸；例如 1024x1024、1024x1536 等。",
+    "type": "string",
+    "default": ""
+  },
+  "illustration_consume_quota": {
+    "description": "配图是否消耗 omnidraw 用户额度",
+    "hint": "关闭时配图作为 bot 自动行为，绕过 omnidraw 白名单与每日额度限制；开启时每次配图都走 omnidraw 权限检查并计入用户额度。",
+    "type": "bool",
+    "default": false
+  },
+  "illustration_prompt_prefix": {
+    "description": "配图提示词前缀",
+    "hint": "可选。会拼接到回复文本前，再交给 omnidraw 副脑。例如 roleplay scene, cinematic still, ",
+    "type": "text",
+    "default": ""
   }
 }
