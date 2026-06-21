@@ -11,6 +11,8 @@ Komeiji's Tavern 是 AstrBot 的角色扮演提示词编排插件。它负责管
 - 优化 token 估算的中日韩文本系数，减少中文场景过早裁剪、更充分利用上下文。
 - 向量条目 embedding 增加 LRU 缓存与错误降级，避免重复 API 调用和 provider 异常阻断请求。
 - 配图新增 `illustration_max_concurrency` 配置项，限制并发生图任务数，防止打爆生图 Provider。
+- SQLite 存储调用全面异步化（`asyncio.to_thread`），不再阻塞事件循环。
+- 会话并发安全：per-session `asyncio.Lock` 保护 read-modify-write，并发请求不再覆盖轮次和生命周期状态。
 
 ### 0.3.1
 

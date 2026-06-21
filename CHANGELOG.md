@@ -6,6 +6,9 @@
 - 向量条目 embedding 增加 LRU 缓存（上限 512），避免每次请求对同一向量条目重复调用 embedding API。
 - 向量匹配增加错误降级：embedding provider 异常时记 warning 并跳过向量条目，不再阻断整个 LLM 请求。
 - 配图新增 `illustration_max_concurrency` 配置项，限制同时进行的后台配图任务数（默认 2），防止多会话并发打爆生图 Provider。
+- SQLite 存储调用全面异步化：`process`、`simulate`、`on_llm_response` 状态栏和 `/tavern` 命令中的存储 IO 均通过 `asyncio.to_thread` 卸载到线程池，不再阻塞事件循环。
+- 会话并发安全：`process` 的 session read-modify-write 段用 per-session `asyncio.Lock` 保护，并发请求不再互相覆盖轮次和生命周期状态。
+- `pending_generation` 消费从 `on_llm_request` 移入 `process` 锁内，消除锁重入问题，保证特殊生成模式不被重复消费。
 
 ## 0.3.1
 

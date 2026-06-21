@@ -158,54 +158,60 @@ class TavernService:
     async def process(self, event: Any, req: Any, *, mode: str = "normal", quiet_prompt: str = ""):
         scopes = self.scopes(event, req)
         session_id = str(getattr(event, "unified_msg_origin", "") or req.session_id or "default")
-        state = self.storage.get_session(session_id)
-        lore_documents = self.storage.resolve_bindings("lorebook", scopes)
-        entries: list[LoreEntry] = []
-        for document in lore_documents:
-            entries.extend(normalize_entries(document["data"]))
-        # Creative materials share the deterministic scanner and can therefore
-        # use constants, keywords, probability, ordering, and lifecycle fields.
-        for document in self.storage.resolve_bindings("material", scopes):
-            entries.extend(normalize_entries(document["data"]))
-        scan_messages = list(req.contexts or [])
-        if req.prompt:
-            scan_messages.append({"role": "user", "content": req.prompt})
-        scan = await self.scanner.scan(
-            entries, scan_messages, state,
-            vector_matcher=self._vector_matcher if self.config.get("vector_enabled", False) else None,
-        )
-        preset_doc = self._bound_one("preset", scopes)
-        character_doc = self._select_character(scopes, req.prompt or "", state)
-        persona_doc = self._bound_one("persona", scopes)
-        character = character_doc["data"] if character_doc else {}
-        char_data = character.get("data", character)
-        values = {
-            "user": event.get_sender_name() or str(event.get_sender_id()),
-            "char": char_data.get("name", "Assistant"),
-            "persona": (persona_doc or {}).get("name", ""),
-            "lastmessage": req.prompt or "",
-            "original_system": req.system_prompt or "",
-            "outlets": scan.outlets,
-            **state.get("variables", {}),
-        }
-        result = self.builder.build(
-            original_system=req.system_prompt or "", contexts=list(req.contexts or []),
-            current_prompt=req.prompt or "", preset=preset_doc["data"] if preset_doc else {},
-            character=character, persona=(persona_doc or {}).get("data", {}).get("content", ""),
-            lore=scan, values=values, mode=mode, quiet_prompt=quiet_prompt,
-        )
-        self.storage.save_session(session_id, state)
-        self.storage.save_preview(session_id, {
-            "messages": result.messages,
-            "blocks": [{"id": block.identifier, "name": block.name, "source": block.source,
-                        "role": block.role, "position": block.position, "depth": block.depth,
-                        "tokens": block.token_estimate} for block in result.blocks],
-            "dropped": result.dropped, "warnings": result.warnings,
-            "activated": [{"uid": item.entry.uid, "name": item.entry.comment,
-                           "reason": item.reason, "score": item.score,
-                           "step": item.recursion_step} for item in scan.activated],
-            "outlets": scan.outlets, "token_estimation": "approximate",
-        })
+        async with self._session_lock(session_id):
+            state = await asyncio.to_thread(self.storage.get_session, session_id)
+            pending = state.pop("pending_generation", {})
+            mode = str(event.get_extra("_kt_mode") or pending.get("mode") or mode)
+            quiet_prompt = str(event.get_extra("_kt_quiet_prompt") or pending.get("prompt") or quiet_prompt)
+            await asyncio.to_thread(self.storage.save_session, session_id, state)
+            lore_documents = await asyncio.to_thread(self.storage.resolve_bindings, "lorebook", scopes)
+            entries: list[LoreEntry] = []
+            for document in lore_documents:
+                entries.extend(normalize_entries(document["data"]))
+            # Creative materials share the deterministic scanner and can therefore
+            # use constants, keywords, probability, ordering, and lifecycle fields.
+            material_documents = await asyncio.to_thread(self.storage.resolve_bindings, "material", scopes)
+            for document in material_documents:
+                entries.extend(normalize_entries(document["data"]))
+            scan_messages = list(req.contexts or [])
+            if req.prompt:
+                scan_messages.append({"role": "user", "content": req.prompt})
+            scan = await self.scanner.scan(
+                entries, scan_messages, state,
+                vector_matcher=self._vector_matcher if self.config.get("vector_enabled", False) else None,
+            )
+            preset_doc = await asyncio.to_thread(self._bound_one, "preset", scopes)
+            character_doc = await asyncio.to_thread(self._select_character, scopes, req.prompt or "", state)
+            persona_doc = await asyncio.to_thread(self._bound_one, "persona", scopes)
+            character = character_doc["data"] if character_doc else {}
+            char_data = character.get("data", character)
+            values = {
+                "user": event.get_sender_name() or str(event.get_sender_id()),
+                "char": char_data.get("name", "Assistant"),
+                "persona": (persona_doc or {}).get("name", ""),
+                "lastmessage": req.prompt or "",
+                "original_system": req.system_prompt or "",
+                "outlets": scan.outlets,
+                **state.get("variables", {}),
+            }
+            result = self.builder.build(
+                original_system=req.system_prompt or "", contexts=list(req.contexts or []),
+                current_prompt=req.prompt or "", preset=preset_doc["data"] if preset_doc else {},
+                character=character, persona=(persona_doc or {}).get("data", {}).get("content", ""),
+                lore=scan, values=values, mode=mode, quiet_prompt=quiet_prompt,
+            )
+            await asyncio.to_thread(self.storage.save_session, session_id, state)
+            await asyncio.to_thread(self.storage.save_preview, session_id, {
+                "messages": result.messages,
+                "blocks": [{"id": block.identifier, "name": block.name, "source": block.source,
+                            "role": block.role, "position": block.position, "depth": block.depth,
+                            "tokens": block.token_estimate} for block in result.blocks],
+                "dropped": result.dropped, "warnings": result.warnings,
+                "activated": [{"uid": item.entry.uid, "name": item.entry.comment,
+                               "reason": item.reason, "score": item.score,
+                               "step": item.recursion_step} for item in scan.activated],
+                "outlets": scan.outlets, "token_estimation": "approximate",
+            })
         return result
 
     async def simulate(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -216,12 +222,12 @@ class TavernService:
             value = str(payload.get(key, "") or "")
             if value:
                 scopes.append((scope_type, value))
-        state = copy.deepcopy(self.storage.get_session(session_id))
+        state = copy.deepcopy(await asyncio.to_thread(self.storage.get_session, session_id))
         messages = [item for item in payload.get("contexts", []) if isinstance(item, dict)]
         prompt = str(payload.get("prompt", ""))
         scan_messages = messages + ([{"role": "user", "content": prompt}] if prompt else [])
         entries: list[LoreEntry] = []
-        lore_documents = self.storage.resolve_bindings("lorebook", scopes)
+        lore_documents = await asyncio.to_thread(self.storage.resolve_bindings, "lorebook", scopes)
         for document in lore_documents:
             entries.extend(normalize_entries(document["data"]))
         scan = await self.scanner.scan(
@@ -229,9 +235,9 @@ class TavernService:
             vector_matcher=self._vector_matcher if self.config.get("vector_enabled", False) else None,
             rng=random.Random(int(payload.get("seed", 1))),
         )
-        preset_doc = self._bound_one("preset", scopes)
-        character_doc = self._bound_one("character", scopes)
-        persona_doc = self._bound_one("persona", scopes)
+        preset_doc = await asyncio.to_thread(self._bound_one, "preset", scopes)
+        character_doc = await asyncio.to_thread(self._bound_one, "character", scopes)
+        persona_doc = await asyncio.to_thread(self._bound_one, "persona", scopes)
         char_data = (character_doc or {}).get("data", {})
         char_values = char_data.get("data", char_data)
         values = {
@@ -255,6 +261,7 @@ class TavernService:
             warnings.append("当前作用域没有绑定提示词预设；原始 System Prompt 为空时，最终请求只会包含历史和用户消息。")
         if not character_doc:
             warnings.append("当前作用域没有绑定角色卡。")
+        effective = await asyncio.to_thread(self.effective_bindings, scopes)
         return {
             "messages": result.messages,
             "blocks": [{"id": block.identifier, "name": block.name, "source": block.source,
@@ -266,6 +273,6 @@ class TavernService:
                            "reason": item.reason, "score": item.score,
                            "step": item.recursion_step, "content": item.entry.content}
                           for item in scan.activated],
-            "outlets": scan.outlets, "effective": self.effective_bindings(scopes),
+            "outlets": scan.outlets, "effective": effective,
             "state_after": state, "state_persisted": False, "token_estimation": "approximate",
         }

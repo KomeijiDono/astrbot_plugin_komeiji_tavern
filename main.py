@@ -55,14 +55,7 @@ class KomeijiTavernPlugin(Star):
     async def on_llm_request(self, event: AstrMessageEvent, req: ProviderRequest):
         if not self.config.get("enabled", True):
             return
-        session_id = self._session_id(event, req)
-        state = self.storage.get_session(session_id)
-        pending = state.pop("pending_generation", {})
-        self.storage.save_session(session_id, state)
-        mode = str(event.get_extra("_kt_mode") or pending.get("mode", "normal"))
-        quiet_prompt = str(event.get_extra("_kt_quiet_prompt") or pending.get("prompt", ""))
-
-        result = await self.service.process(event, req, mode=mode, quiet_prompt=quiet_prompt)
+        result = await self.service.process(event, req)
         req.system_prompt = result.system_prompt
         req.contexts = result.contexts
 
@@ -92,27 +85,28 @@ class KomeijiTavernPlugin(Star):
             if not state_match and not fields_match:
                 return
             session_id = self._session_id(event)
-            state = self.storage.get_session(session_id)
-            variables = state.setdefault("variables", {})
-            status_content = ""
-            if state_match:
-                try:
-                    payload = json.loads(state_match.group(1))
-                    if isinstance(payload, dict):
-                        variables.update({str(key): value for key, value in payload.items()})
-                        status_content = " | ".join(f"{key}: {value}" for key, value in payload.items())
-                    response.completion_text = text[:state_match.start()].rstrip()
-                except json.JSONDecodeError:
-                    logger.warning("[%s] invalid state payload", DISPLAY_NAME)
-            elif fields_match:
-                parts = [part.strip() for part in fields_match.group(1).split("|")]
-                variables.update({f"state_{index + 1}": value for index, value in enumerate(parts)})
-                status_content = " | ".join(parts)
-                response.completion_text = text[:fields_match.start()].rstrip()
-            if status_content:
-                template = str(self.config.get("status_bar_template", "**Status**\n```\n{content}\n```"))
-                response.completion_text = (response.completion_text or "").rstrip() + "\n\n" + template.replace("{content}", status_content)
-            self.storage.save_session(session_id, state)
+            async with self.service._session_lock(session_id):
+                state = await asyncio.to_thread(self.storage.get_session, session_id)
+                variables = state.setdefault("variables", {})
+                status_content = ""
+                if state_match:
+                    try:
+                        payload = json.loads(state_match.group(1))
+                        if isinstance(payload, dict):
+                            variables.update({str(key): value for key, value in payload.items()})
+                            status_content = " | ".join(f"{key}: {value}" for key, value in payload.items())
+                        response.completion_text = text[:state_match.start()].rstrip()
+                    except json.JSONDecodeError:
+                        logger.warning("[%s] invalid state payload", DISPLAY_NAME)
+                elif fields_match:
+                    parts = [part.strip() for part in fields_match.group(1).split("|")]
+                    variables.update({f"state_{index + 1}": value for index, value in enumerate(parts)})
+                    status_content = " | ".join(parts)
+                    response.completion_text = text[:fields_match.start()].rstrip()
+                if status_content:
+                    template = str(self.config.get("status_bar_template", "**Status**\n```\n{content}\n```"))
+                    response.completion_text = (response.completion_text or "").rstrip() + "\n\n" + template.replace("{content}", status_content)
+                await asyncio.to_thread(self.storage.save_session, session_id, state)
         finally:
             await self.illustration.maybe_illustrate(event, response)
 
@@ -214,15 +208,15 @@ class KomeijiTavernPlugin(Star):
         action = (action or "status").strip().lower()
         session_id = self._session_id(event)
         if action == "preview":
-            preview = self.storage.get_preview(session_id)
+            preview = await asyncio.to_thread(self.storage.get_preview, session_id)
             event.set_result(event.plain_result(json.dumps(preview or {}, ensure_ascii=False, indent=2)))
             return
         if action == "reset":
-            self.storage.reset_session(session_id)
+            await asyncio.to_thread(self.storage.reset_session, session_id)
             event.set_result(event.plain_result("当前会话的世界书生命周期和预览状态已清除。"))
             return
         if action == "status":
-            state = self.storage.get_session(session_id)
+            state = await asyncio.to_thread(self.storage.get_session, session_id)
             event.set_result(event.plain_result(
                 f"Komeiji's Tavern 0.3.2\n会话：{session_id}\n轮次：{state.get('turn', 0)}\n"
                 f"生命周期记录：{len(state.get('effects', {}))}\n可在插件管理页查看绑定和最终 messages[]。"

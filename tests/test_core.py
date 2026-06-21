@@ -531,5 +531,67 @@ class IllustrationConcurrencyTests(unittest.TestCase):
         self.assertGreaterEqual(tracker.max_concurrent, 1)
 
 
+class _MockReq:
+    def __init__(self):
+        self.contexts = []
+        self.prompt = "hello"
+        self.system_prompt = ""
+        self.session_id = "s1"
+        self.conversation = None
+
+
+class _MockEvent:
+    def __init__(self, session_id="s1"):
+        self.unified_msg_origin = session_id
+        self._extras = {}
+
+    def get_extra(self, key):
+        return self._extras.get(key)
+
+    def set_extra(self, key, value):
+        self._extras[key] = value
+
+    def get_sender_name(self):
+        return "TestUser"
+
+    def get_sender_id(self):
+        return "u1"
+
+    def get_group_id(self):
+        return ""
+
+
+class SessionConcurrencyTests(unittest.TestCase):
+    def test_concurrent_process_does_not_lose_turns(self):
+        with tempfile.TemporaryDirectory() as d:
+            storage = TavernStorage(Path(d) / "state.db")
+            preset_id = storage.put_document("preset", "Default", {"main_prompt": "base"})
+            storage.bind("global", "*", "preset", preset_id)
+            service = TavernService(storage, object(), {})
+
+            async def scenario():
+                await asyncio.gather(
+                    service.process(_MockEvent(), _MockReq()),
+                    service.process(_MockEvent(), _MockReq()),
+                )
+
+            run(scenario())
+            state = storage.get_session("s1")
+            self.assertEqual(state["turn"], 2)
+
+    def test_process_consumes_pending_generation(self):
+        with tempfile.TemporaryDirectory() as d:
+            storage = TavernStorage(Path(d) / "state.db")
+            preset_id = storage.put_document("preset", "Default", {"main_prompt": "base"})
+            storage.bind("global", "*", "preset", preset_id)
+            storage.save_session("s1", {"turn": 0, "effects": {}, "variables": {},
+                                        "pending_generation": {"mode": "continue", "prompt": "extra"}})
+            service = TavernService(storage, object(), {})
+            result = run(service.process(_MockEvent(), _MockReq()))
+            state = storage.get_session("s1")
+            self.assertNotIn("pending_generation", state)
+            self.assertTrue(any(block.identifier == "continue" for block in result.blocks))
+
+
 if __name__ == "__main__":
     unittest.main()
