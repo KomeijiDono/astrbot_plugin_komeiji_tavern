@@ -71,8 +71,8 @@
     "default": 3000
   },
   "qq_forward_split_enabled": {
-    "description": "拆分 QQ 合并转发节点",
-    "hint": "非流式纯文本回复超过触发字数时，拆成多个转发 Node。仅作用于 aiocqhttp。",
+    "description": "QQ 长回复使用合并转发",
+    "hint": "非流式纯文本回复超过触发字数时，按多个小型合并转发包发送。仅作用于 aiocqhttp。",
     "type": "bool",
     "default": true
   },
@@ -84,9 +84,27 @@
   },
   "qq_forward_node_chars": {
     "description": "每个 QQ 转发 Node 最大字数",
-    "hint": "推荐 2000-3000。优先按段落和句末拆分，无法找到边界时按此字数硬切。",
+    "hint": "推荐 800-1200。优先按段落和句末拆分，无法找到边界时按此字数硬切。",
     "type": "int",
-    "default": 2500
+    "default": 1000
+  },
+  "qq_forward_nodes_per_batch": {
+    "description": "每个 QQ 合并转发包最大节点数",
+    "hint": "推荐 6-8。超出后会拆成多个合并转发包，降低单次请求载荷。",
+    "type": "int",
+    "default": 6
+  },
+  "qq_forward_batch_interval_ms": {
+    "description": "QQ 合并转发包发送间隔（毫秒）",
+    "hint": "多个转发包之间的等待时间，推荐 1000-2000。",
+    "type": "int",
+    "default": 1500
+  },
+  "qq_forward_fallback_enabled": {
+    "description": "QQ 合并转发失败自动降级",
+    "hint": "合并转发失败时，将尚未成功发送的内容改为普通消息分片，避免整条回复丢失。",
+    "type": "bool",
+    "default": true
   },
   "status_bar_enabled": {
     "description": "启用状态栏解析",

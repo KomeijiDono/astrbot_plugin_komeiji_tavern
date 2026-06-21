@@ -2,9 +2,15 @@
 
 Komeiji's Tavern 是 AstrBot 的角色扮演提示词编排插件。它负责管理角色卡、用户设定、提示词预设、世界书和会话生命周期，并展示某次请求最终发送给模型的 `messages[]`。
 
-当前版本：`0.3.3`。仅支持 AstrBot Chat Completion 管线。
+当前版本：`0.3.4`。仅支持 AstrBot Chat Completion 管线。
 
 ## 版本更新记录
+
+### 0.3.4
+
+- QQ 长回复支持分包合并转发，每包默认最多 6 个 Node。
+- 合并转发失败时只将未发送内容自动降级为普通消息，避免回复整体丢失或重复。
+- 默认单 Node 调整为 1000 个 Unicode 字符，降低 OneBot 单次载荷。
 
 ### 0.3.3
 
@@ -276,7 +282,9 @@ tavern.db.v0.1.0.bak
 - `qq_direct_retry_delay_ms`：发送失败后的重试等待时间，单位为毫秒。
 - `qq_forward_split_enabled`：启用非流式 QQ 长回复的合并转发节点分片。
 - `qq_forward_trigger_chars`：回复超过多少 Unicode 字符后改用合并转发。
-- `qq_forward_node_chars`：每个 QQ 转发 Node 的最大 Unicode 字符数，建议设置为 2000-3000。
+- `qq_forward_node_chars`：每个 QQ 转发 Node 的最大 Unicode 字符数，建议设置为 800-1200。
+- `qq_forward_nodes_per_batch`：每个合并转发包的最大节点数，建议设置为 6-8。
+- `qq_forward_fallback_enabled`：转发失败后自动将尚未发送的内容降级为普通消息。
 - `status_bar_enabled`：解析回复中的状态变量。
 - `status_bar_template`：状态栏显示格式，使用 `{content}` 放置内容。
 - `illustration_enabled`：启用每次 LLM 回复后的自动配图（需安装 omnidraw）。

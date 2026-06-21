@@ -20,7 +20,7 @@ from astrbot_plugin_komeiji_tavern.service import TavernService
 from astrbot_plugin_komeiji_tavern.web import TavernWebApi
 from astrbot_plugin_komeiji_tavern.main import KomeijiTavernPlugin
 from astrbot_plugin_komeiji_tavern.illustration import OmniDrawBridge
-from astrbot.api.message_components import Plain
+from astrbot.api.message_components import Nodes, Plain
 
 
 def run(coro):
@@ -128,6 +128,109 @@ class CoreTests(unittest.TestCase):
     def test_qq_forward_text_split_counts_unicode_characters(self):
         chunks = split_forward_text("中" * 5001, 2500)
         self.assertEqual([len(chunk) for chunk in chunks], [2500, 2500, 1])
+
+    def test_qq_forward_sends_multiple_bounded_batches(self):
+        class Result:
+            chain = [Plain("中" * 750)]
+
+            @staticmethod
+            def is_llm_result():
+                return True
+
+        class Event:
+            def __init__(self):
+                self.result = Result()
+                self.sent = []
+
+            @staticmethod
+            def get_platform_name():
+                return "aiocqhttp"
+
+            @staticmethod
+            def get_self_id():
+                return "123"
+
+            def get_result(self):
+                return self.result
+
+            def clear_result(self):
+                self.result = None
+
+            async def send(self, chain):
+                self.sent.append(chain)
+
+        plugin = KomeijiTavernPlugin.__new__(KomeijiTavernPlugin)
+        plugin.config = {
+            "qq_forward_split_enabled": True,
+            "qq_forward_trigger_chars": 100,
+            "qq_forward_node_chars": 100,
+            "qq_forward_nodes_per_batch": 3,
+            "qq_forward_batch_interval_ms": 0,
+        }
+        event = Event()
+        run(plugin.deliver_qq_long_reply(event))
+        self.assertIsNone(event.result)
+        self.assertEqual(len(event.sent), 3)
+        self.assertEqual([len(chain.chain[0].nodes) for chain in event.sent], [3, 3, 2])
+        self.assertTrue(all(isinstance(chain.chain[0], Nodes) for chain in event.sent))
+
+    def test_qq_forward_failure_falls_back_without_repeating_sent_batch(self):
+        text = "中" * 700
+
+        class Result:
+            chain = [Plain(text)]
+
+            @staticmethod
+            def is_llm_result():
+                return True
+
+        class Event:
+            def __init__(self):
+                self.result = Result()
+                self.forward_attempts = 0
+                self.successful = []
+
+            @staticmethod
+            def get_platform_name():
+                return "aiocqhttp"
+
+            @staticmethod
+            def get_self_id():
+                return "123"
+
+            def get_result(self):
+                return self.result
+
+            def clear_result(self):
+                self.result = None
+
+            async def send(self, chain):
+                component = chain.chain[0]
+                if isinstance(component, Nodes):
+                    self.forward_attempts += 1
+                    if self.forward_attempts == 2:
+                        raise RuntimeError("forward failed")
+                self.successful.append(chain)
+
+        plugin = KomeijiTavernPlugin.__new__(KomeijiTavernPlugin)
+        plugin.config = {
+            "qq_forward_split_enabled": True,
+            "qq_forward_fallback_enabled": True,
+            "qq_forward_trigger_chars": 100,
+            "qq_forward_node_chars": 100,
+            "qq_forward_nodes_per_batch": 3,
+            "qq_forward_batch_interval_ms": 0,
+            "qq_direct_send_interval_ms": 0,
+            "qq_direct_retry_count": 0,
+        }
+        event = Event()
+        run(plugin.deliver_qq_long_reply(event))
+        self.assertIsNone(event.result)
+        self.assertEqual(event.forward_attempts, 2)
+        sent_forward = "".join(node.content[0].text for node in event.successful[0].chain[0].nodes)
+        fallback = "".join(chain.chain[0].text for chain in event.successful[1:])
+        self.assertEqual(sent_forward, text[:300])
+        self.assertEqual(fallback, text[300:])
 
     def test_selective_logic_and_recursion(self):
         data = {"entries": {

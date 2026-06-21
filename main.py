@@ -27,7 +27,7 @@ _STATE_JSON = re.compile(r"\[TAVERN_STATE\]\s*(\{.*?\})\s*$", re.DOTALL)
 _STATE_FIELDS = re.compile(r"\[LOVE_DATA\]\s*(.+)$", re.MULTILINE)
 
 
-@register(PLUGIN_ID, "KomeijiDono", DESCRIPTION, "0.3.3")
+@register(PLUGIN_ID, "KomeijiDono", DESCRIPTION, "0.3.4")
 class KomeijiTavernPlugin(Star):
     def __init__(self, context: Context, config: dict[str, Any] | None = None):
         super().__init__(context)
@@ -123,6 +123,59 @@ class KomeijiTavernPlugin(Star):
     async def after_message_sent(self, event: AstrMessageEvent) -> None:
         await self._dispatch_pending_illustration(event)
 
+    async def _send_qq_direct_chunks(
+        self,
+        event: AstrMessageEvent,
+        chunks: list[str],
+        *,
+        start_index: int = 0,
+        total_chunks: int | None = None,
+    ) -> None:
+        interval_ms = max(0, int(self.config.get("qq_direct_send_interval_ms", 2000)))
+        retry_count = max(0, int(self.config.get("qq_direct_retry_count", 2)))
+        retry_delay_ms = max(0, int(self.config.get("qq_direct_retry_delay_ms", 3000)))
+        total = total_chunks if total_chunks is not None else start_index + len(chunks)
+        for offset, chunk in enumerate(chunks):
+            index = start_index + offset
+            retry = 0
+            while True:
+                try:
+                    await event.send(MessageChain([Plain(chunk)]))
+                    logger.info(
+                        "[%s] QQ 普通消息分片 %d/%d 发送成功（%d 字符）",
+                        DISPLAY_NAME,
+                        index + 1,
+                        total,
+                        len(chunk),
+                    )
+                    break
+                except Exception as exc:
+                    if retry >= retry_count:
+                        logger.error(
+                            "[%s] QQ 普通消息分片 %d/%d 发送失败，已用尽 %d 次重试：%s",
+                            DISPLAY_NAME,
+                            index + 1,
+                            total,
+                            retry_count,
+                            exc,
+                        )
+                        raise
+                    retry += 1
+                    logger.warning(
+                        "[%s] QQ 普通消息分片 %d/%d 发送失败，%dms 后进行第 %d/%d 次重试：%s",
+                        DISPLAY_NAME,
+                        index + 1,
+                        total,
+                        retry_delay_ms,
+                        retry,
+                        retry_count,
+                        exc,
+                    )
+                    if retry_delay_ms:
+                        await asyncio.sleep(retry_delay_ms / 1000)
+            if interval_ms and offset + 1 < len(chunks):
+                await asyncio.sleep(interval_ms / 1000)
+
     @filter.on_decorating_result(priority=-1000)
     async def deliver_qq_long_reply(self, event: AstrMessageEvent):
         """Deliver long plain-text QQ replies as direct chunks or forward nodes."""
@@ -141,50 +194,9 @@ class KomeijiTavernPlugin(Star):
 
         if self.config.get("qq_direct_split_enabled", False):
             message_chars = max(100, int(self.config.get("qq_direct_message_chars", 1000)))
-            interval_ms = max(0, int(self.config.get("qq_direct_send_interval_ms", 2000)))
-            retry_count = max(0, int(self.config.get("qq_direct_retry_count", 2)))
-            retry_delay_ms = max(0, int(self.config.get("qq_direct_retry_delay_ms", 3000)))
             chunks = split_forward_text(text, message_chars)
             event.clear_result()
-            for index, chunk in enumerate(chunks):
-                retry = 0
-                while True:
-                    try:
-                        await event.send(MessageChain([Plain(chunk)]))
-                        logger.info(
-                            "[%s] QQ 普通消息分片 %d/%d 发送成功（%d 字符）",
-                            DISPLAY_NAME,
-                            index + 1,
-                            len(chunks),
-                            len(chunk),
-                        )
-                        break
-                    except Exception as exc:
-                        if retry >= retry_count:
-                            logger.error(
-                                "[%s] QQ 普通消息分片 %d/%d 发送失败，已用尽 %d 次重试：%s",
-                                DISPLAY_NAME,
-                                index + 1,
-                                len(chunks),
-                                retry_count,
-                                exc,
-                            )
-                            raise
-                        retry += 1
-                        logger.warning(
-                            "[%s] QQ 普通消息分片 %d/%d 发送失败，%dms 后进行第 %d/%d 次重试：%s",
-                            DISPLAY_NAME,
-                            index + 1,
-                            len(chunks),
-                            retry_delay_ms,
-                            retry,
-                            retry_count,
-                            exc,
-                        )
-                        if retry_delay_ms:
-                            await asyncio.sleep(retry_delay_ms / 1000)
-                if interval_ms and index + 1 < len(chunks):
-                    await asyncio.sleep(interval_ms / 1000)
+            await self._send_qq_direct_chunks(event, chunks)
             logger.info(
                 "[%s] QQ 长回复已按每条最多 %d 字符直接发送为 %d 条消息（共 %d 字符）",
                 DISPLAY_NAME,
@@ -197,24 +209,54 @@ class KomeijiTavernPlugin(Star):
 
         if not self.config.get("qq_forward_split_enabled", True):
             return
-        node_chars = max(100, int(self.config.get("qq_forward_node_chars", 2500)))
+        node_chars = max(100, int(self.config.get("qq_forward_node_chars", 1000)))
+        nodes_per_batch = max(1, int(self.config.get("qq_forward_nodes_per_batch", 6)))
+        batch_interval_ms = max(0, int(self.config.get("qq_forward_batch_interval_ms", 1500)))
+        fallback_enabled = bool(self.config.get("qq_forward_fallback_enabled", True))
         chunks = split_forward_text(text, node_chars)
-        nodes = [
-            Node(
-                uin=event.get_self_id(),
-                name="AstrBot",
-                content=[Plain(chunk)],
-            )
-            for chunk in chunks
-        ]
-        result.chain = [Nodes(nodes)]
-        logger.info(
-            "[%s] QQ 长回复已按每节点最多 %d 字符拆分为 %d 个 Node（共 %d 字符）",
-            DISPLAY_NAME,
-            node_chars,
-            len(nodes),
-            len(text),
-        )
+        event.clear_result()
+        batches = [chunks[index:index + nodes_per_batch] for index in range(0, len(chunks), nodes_per_batch)]
+        sent_chunks = 0
+        for batch_index, batch in enumerate(batches):
+            nodes = [
+                Node(uin=event.get_self_id(), name="AstrBot", content=[Plain(chunk)])
+                for chunk in batch
+            ]
+            try:
+                await event.send(MessageChain([Nodes(nodes)]))
+                sent_chunks += len(batch)
+                logger.info(
+                    "[%s] QQ 合并转发包 %d/%d 发送成功（%d 个 Node，%d 字符）",
+                    DISPLAY_NAME,
+                    batch_index + 1,
+                    len(batches),
+                    len(nodes),
+                    sum(len(chunk) for chunk in batch),
+                )
+            except Exception as exc:
+                if not fallback_enabled:
+                    logger.error("[%s] QQ 合并转发发送失败且未启用自动降级：%s", DISPLAY_NAME, exc)
+                    raise
+                remaining = chunks[sent_chunks:]
+                logger.warning(
+                    "[%s] QQ 合并转发包 %d/%d 发送失败，将剩余 %d 个分片降级为普通消息：%s",
+                    DISPLAY_NAME,
+                    batch_index + 1,
+                    len(batches),
+                    len(remaining),
+                    exc,
+                )
+                await self._send_qq_direct_chunks(
+                    event,
+                    remaining,
+                    start_index=sent_chunks,
+                    total_chunks=len(chunks),
+                )
+                await self._dispatch_pending_illustration(event)
+                return
+            if batch_interval_ms and batch_index + 1 < len(batches):
+                await asyncio.sleep(batch_interval_ms / 1000)
+        await self._dispatch_pending_illustration(event)
 
     @filter.command("tavern")
     async def tavern(self, event: AstrMessageEvent, action: str = "status", rest: GreedyStr = ""):
@@ -232,7 +274,7 @@ class KomeijiTavernPlugin(Star):
         if action == "status":
             state = await asyncio.to_thread(self.storage.get_session, session_id)
             event.set_result(event.plain_result(
-                f"Komeiji's Tavern 0.3.3\n会话：{session_id}\n轮次：{state.get('turn', 0)}\n"
+                f"Komeiji's Tavern 0.3.4\n会话：{session_id}\n轮次：{state.get('turn', 0)}\n"
                 f"生命周期记录：{len(state.get('effects', {}))}\n可在插件管理页查看绑定和最终 messages[]。"
             ))
             return

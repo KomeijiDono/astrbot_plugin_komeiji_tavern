@@ -1,9 +1,15 @@
 {
   "name": "komeiji-tavern-panel",
   "private": true,
-  "version": "0.3.3",
+  "version": "0.3.4",
   "type": "module",
-  "scripts": {"build": "vite build && node scripts/fix-index.mjs"},
-  "dependencies": {"@vitejs/plugin-vue": "latest", "vite": "latest", "vue": "latest"},
+  "scripts": {
+    "build": "vite build && node scripts/fix-index.mjs"
+  },
+  "dependencies": {
+    "@vitejs/plugin-vue": "latest",
+    "vite": "latest",
+    "vue": "latest"
+  },
   "devDependencies": {}
 }
