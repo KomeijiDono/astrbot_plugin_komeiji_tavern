@@ -38,6 +38,16 @@ class TavernService:
     def _session_lock(self, session_id: str) -> asyncio.Lock:
         return self._session_locks.setdefault(session_id, asyncio.Lock())
 
+    async def set_pending_generation(self, session_id: str, mode: str, prompt: str) -> None:
+        async with self._session_lock(session_id):
+            state = await asyncio.to_thread(self.storage.get_session, session_id)
+            state["pending_generation"] = {"mode": mode, "prompt": prompt}
+            await asyncio.to_thread(self.storage.save_session, session_id, state)
+
+    async def reset_session(self, session_id: str) -> None:
+        async with self._session_lock(session_id):
+            await asyncio.to_thread(self.storage.reset_session, session_id)
+
     def ensure_defaults(self) -> None:
         if not self.storage.list_documents("preset"):
             preset = {

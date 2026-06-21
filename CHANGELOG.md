@@ -1,5 +1,13 @@
 # 更新日志
 
+## 0.3.3
+
+- Web 特殊生成、Web 重置和 `/tavern reset` 统一使用 per-session 锁。
+- 自动配图延后到正文发送完成；QQ 普通消息分片在最后一片成功后才启动配图。
+- 调试器手输会话 ID 时同步刷新 Persona，避免模拟错误作用域。
+- `metadata.yaml` 增加 GitHub 仓库地址，恢复 AstrBot 内置更新能力。
+- 修复 data URL MIME 判断，并启用严格 Base64 校验。
+
 ## 0.3.2
 
 - 优化 token 估算：中日韩文本按 5/8 系数计 token（旧算法 1:1 高估），减少中文场景过早裁剪、更充分利用上下文。

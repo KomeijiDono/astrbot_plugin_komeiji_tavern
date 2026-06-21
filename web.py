@@ -214,7 +214,7 @@ class TavernWebApi:
         return self.ok(self.storage.get_session(session_id))
 
     async def reset_session(self, session_id: str):
-        self.storage.reset_session(session_id)
+        await self.service.reset_session(session_id)
         return self.ok()
 
     async def generation(self):
@@ -223,9 +223,11 @@ class TavernWebApi:
         mode = str(payload.get("mode", "normal"))
         if not session_id or mode not in {"normal", "continue", "impersonate", "quiet"}:
             return self.error("Invalid session_id or mode")
-        state = self.storage.get_session(session_id)
-        state["pending_generation"] = {"mode": mode, "prompt": str(payload.get("prompt", ""))}
-        self.storage.save_session(session_id, state)
+        await self.service.set_pending_generation(
+            session_id,
+            mode,
+            str(payload.get("prompt", "")),
+        )
         return self.ok()
 
     async def overview(self):
@@ -238,7 +240,7 @@ class TavernWebApi:
             tasks.append("把角色绑定到 Persona 或会话")
         if counts.get("lorebook") and not any(item["kind"] == "lorebook" for item in bindings):
             tasks.append("已有世界书尚未绑定")
-        return self.ok({"version": "0.3.2", "counts": counts, "bindings": len(bindings),
+        return self.ok({"version": "0.3.3", "counts": counts, "bindings": len(bindings),
                         "tasks": tasks, "ready": not tasks})
 
     async def personas(self):

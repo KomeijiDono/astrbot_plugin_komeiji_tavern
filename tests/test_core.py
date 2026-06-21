@@ -7,6 +7,7 @@ import base64
 import struct
 import zlib
 from pathlib import Path
+from unittest.mock import patch
 
 from astrbot_plugin_komeiji_tavern.importers import detect_kind, export_document, parse_binary_payload, parse_payload, preview_import
 from astrbot_plugin_komeiji_tavern.documents import validate_document
@@ -324,12 +325,19 @@ class _FakeResponse:
 class _FakeEvent:
     def __init__(self):
         self.sent = []
+        self.extras = {}
 
     async def send(self, chain):
         self.sent.append(chain)
 
     def chain_result(self, components):
         return type("R", (), {"chain": list(components)})()
+
+    def get_extra(self, key):
+        return self.extras.get(key)
+
+    def set_extra(self, key, value):
+        self.extras[key] = value
 
 
 class _FakeOmniDraw:
@@ -414,6 +422,42 @@ class IllustrationTests(unittest.TestCase):
         event = _FakeEvent()
         run(bridge._run(event, omni, "prompt", consume=False, semaphore=None))
         self.assertEqual(event.sent, [])
+
+    def test_data_url_uses_declared_mime_and_validates_base64(self):
+        bridge = OmniDrawBridge(_FakeContext(), {})
+        encoded = base64.b64encode(b"\xff\xd8\xffjpeg").decode()
+        with tempfile.TemporaryDirectory() as directory:
+            with patch(
+                "astrbot_plugin_komeiji_tavern.illustration.Path.home",
+                return_value=Path(directory),
+            ):
+                saved = bridge._save_data_url(f"data:image/jpeg;base64,{encoded}")
+                self.assertIsNotNone(saved)
+                self.assertEqual(Path(saved).suffix, ".jpg")
+                self.assertEqual(Path(saved).read_bytes(), b"\xff\xd8\xffjpeg")
+                self.assertIsNone(bridge._save_data_url("data:image/png;base64,not-valid!"))
+
+    def test_illustration_is_dispatched_after_message_sent(self):
+        class Illustration:
+            def __init__(self):
+                self.calls = []
+
+            async def maybe_illustrate_text(self, event, text):
+                self.calls.append((event, text))
+
+        plugin = KomeijiTavernPlugin.__new__(KomeijiTavernPlugin)
+        plugin.config = {"illustration_enabled": True, "status_bar_enabled": False}
+        plugin.illustration = Illustration()
+        event = _FakeEvent()
+        response = _FakeResponse("reply text for illustration")
+
+        run(plugin.on_llm_response(event, response))
+        self.assertEqual(plugin.illustration.calls, [])
+        self.assertEqual(event.get_extra("_kt_illustration_text"), response.completion_text)
+
+        run(plugin.after_message_sent(event))
+        self.assertEqual(plugin.illustration.calls, [(event, response.completion_text)])
+        self.assertEqual(event.get_extra("_kt_illustration_text"), "")
 
 
 class _FakeStar:
@@ -591,6 +635,35 @@ class SessionConcurrencyTests(unittest.TestCase):
             state = storage.get_session("s1")
             self.assertNotIn("pending_generation", state)
             self.assertTrue(any(block.identifier == "continue" for block in result.blocks))
+
+    def test_pending_generation_and_reset_share_session_lock(self):
+        with tempfile.TemporaryDirectory() as d:
+            storage = TavernStorage(Path(d) / "state.db")
+            storage.save_session("s1", {"turn": 7, "effects": {}, "variables": {}})
+            service = TavernService(storage, object(), {})
+
+            async def scenario():
+                async with service._session_lock("s1"):
+                    pending_task = asyncio.create_task(
+                        service.set_pending_generation("s1", "quiet", "extra")
+                    )
+                    await asyncio.sleep(0)
+                    self.assertFalse(pending_task.done())
+                await pending_task
+                self.assertEqual(storage.get_session("s1")["turn"], 7)
+                self.assertEqual(
+                    storage.get_session("s1")["pending_generation"],
+                    {"mode": "quiet", "prompt": "extra"},
+                )
+
+                async with service._session_lock("s1"):
+                    reset_task = asyncio.create_task(service.reset_session("s1"))
+                    await asyncio.sleep(0)
+                    self.assertFalse(reset_task.done())
+                await reset_task
+
+            run(scenario())
+            self.assertEqual(storage.get_session("s1")["turn"], 0)
 
 
 if __name__ == "__main__":

@@ -55,9 +55,13 @@ class OmniDrawBridge:
 
     async def maybe_illustrate(self, event: AstrMessageEvent, response: LLMResponse) -> None:
         """钩子入口：检查开关与文本长度后，派发后台生图任务。"""
+        await self.maybe_illustrate_text(event, str(response.completion_text or ""))
+
+    async def maybe_illustrate_text(self, event: AstrMessageEvent, text: str) -> None:
+        """在正文发送完成后，根据回复文本派发后台生图任务。"""
         if not bool(self._cfg("illustration_enabled", False)):
             return
-        text = str(response.completion_text or "").strip()
+        text = str(text or "").strip()
         if len(text) < 20:
             return
         omnidraw = self._get_omnidraw()
@@ -157,7 +161,7 @@ class OmniDrawBridge:
         except ValueError:
             return None
         mime = "image/png"
-        if ";base64," in header:
+        if header.lower().startswith("data:image/") and ";base64" in header.lower():
             mime_part = header.split(":", 1)[-1].split(";base64", 1)[0]
             if mime_part:
                 mime = mime_part
@@ -171,7 +175,7 @@ class OmniDrawBridge:
         }
         ext = ext_map.get(mime, ".png")
         try:
-            data = base64.b64decode(encoded)
+            data = base64.b64decode(encoded, validate=True)
         except (binascii.Error, ValueError):
             return None
         data_dir = Path.home() / ".astrbot" / "data" / "astrbot_plugin_komeiji_tavern" / "illustrations"

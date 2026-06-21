@@ -27,7 +27,7 @@ _STATE_JSON = re.compile(r"\[TAVERN_STATE\]\s*(\{.*?\})\s*$", re.DOTALL)
 _STATE_FIELDS = re.compile(r"\[LOVE_DATA\]\s*(.+)$", re.MULTILINE)
 
 
-@register(PLUGIN_ID, "KomeijiDono", DESCRIPTION, "0.3.2")
+@register(PLUGIN_ID, "KomeijiDono", DESCRIPTION, "0.3.3")
 class KomeijiTavernPlugin(Star):
     def __init__(self, context: Context, config: dict[str, Any] | None = None):
         super().__init__(context)
@@ -108,7 +108,20 @@ class KomeijiTavernPlugin(Star):
                     response.completion_text = (response.completion_text or "").rstrip() + "\n\n" + template.replace("{content}", status_content)
                 await asyncio.to_thread(self.storage.save_session, session_id, state)
         finally:
-            await self.illustration.maybe_illustrate(event, response)
+            if self.config.get("illustration_enabled", False):
+                event.set_extra("_kt_illustration_text", str(response.completion_text or ""))
+
+    async def _dispatch_pending_illustration(self, event: AstrMessageEvent) -> None:
+        get_extra = getattr(event, "get_extra", None)
+        text = str(get_extra("_kt_illustration_text") or "") if callable(get_extra) else ""
+        if not text:
+            return
+        event.set_extra("_kt_illustration_text", "")
+        await self.illustration.maybe_illustrate_text(event, text)
+
+    @filter.after_message_sent(priority=1000)
+    async def after_message_sent(self, event: AstrMessageEvent) -> None:
+        await self._dispatch_pending_illustration(event)
 
     @filter.on_decorating_result(priority=-1000)
     async def deliver_qq_long_reply(self, event: AstrMessageEvent):
@@ -179,6 +192,7 @@ class KomeijiTavernPlugin(Star):
                 len(chunks),
                 len(text),
             )
+            await self._dispatch_pending_illustration(event)
             return
 
         if not self.config.get("qq_forward_split_enabled", True):
@@ -212,13 +226,13 @@ class KomeijiTavernPlugin(Star):
             event.set_result(event.plain_result(json.dumps(preview or {}, ensure_ascii=False, indent=2)))
             return
         if action == "reset":
-            await asyncio.to_thread(self.storage.reset_session, session_id)
+            await self.service.reset_session(session_id)
             event.set_result(event.plain_result("当前会话的世界书生命周期和预览状态已清除。"))
             return
         if action == "status":
             state = await asyncio.to_thread(self.storage.get_session, session_id)
             event.set_result(event.plain_result(
-                f"Komeiji's Tavern 0.3.2\n会话：{session_id}\n轮次：{state.get('turn', 0)}\n"
+                f"Komeiji's Tavern 0.3.3\n会话：{session_id}\n轮次：{state.get('turn', 0)}\n"
                 f"生命周期记录：{len(state.get('effects', {}))}\n可在插件管理页查看绑定和最终 messages[]。"
             ))
             return
