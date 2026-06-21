@@ -7,7 +7,13 @@ const request = async (path, options = {}) => {
   const bridge = window.AstrBotPluginPage
   if (bridge) {
     await bridge.ready()
-    const endpoint = 'v1/' + path.replace(/^\/+/, '').replace(/\?.*$/, '')
+    const endpointPath = path.replace(/^\/+/, '').replace(/\?.*$/, '')
+      .split('/')
+      .map(segment => {
+        try { return decodeURIComponent(segment) } catch { return segment }
+      })
+      .join('/')
+    const endpoint = 'v1/' + endpointPath
     const params = Object.fromEntries(new URLSearchParams(path.includes('?') ? path.split('?')[1] : ''))
     const data = (options.method || 'GET') === 'GET'
       ? await bridge.apiGet(endpoint, params)
@@ -344,7 +350,7 @@ createApp({
       try {
         debugResult.value = (await request('/preview/' + encodeURIComponent(debug.value.session_id))).data
       } catch (e) {
-        error.value = '该会话还没有真实请求预览，请先发送消息或使用只读模拟。'
+        error.value = e.message || '读取真实请求预览失败。'
       }
     }
 
@@ -368,7 +374,7 @@ createApp({
     <div class="brand">
       <small>ASTRBOT 角色扮演工作台</small>
       <h1>Komeiji's<br>Tavern</h1>
-      <span>v0.3.5</span>
+      <span>v0.3.6</span>
     </div>
     <button v-for="t in tabs" :class="{active:tab===t[0]}" @click="tab=t[0];selected=null">{{t[1]}}</button>
   </aside>

@@ -27,7 +27,7 @@ _STATE_JSON = re.compile(r"\[TAVERN_STATE\]\s*(\{.*?\})\s*$", re.DOTALL)
 _STATE_FIELDS = re.compile(r"\[LOVE_DATA\]\s*(.+)$", re.MULTILINE)
 
 
-@register(PLUGIN_ID, "KomeijiDono", DESCRIPTION, "0.3.5")
+@register(PLUGIN_ID, "KomeijiDono", DESCRIPTION, "0.3.6")
 class KomeijiTavernPlugin(Star):
     def __init__(self, context: Context, config: dict[str, Any] | None = None):
         super().__init__(context)
@@ -182,7 +182,9 @@ class KomeijiTavernPlugin(Star):
         if event.get_platform_name() != "aiocqhttp":
             return
         result = event.get_result()
-        if result is None or not result.is_llm_result() or not result.chain:
+        get_extra = getattr(event, "get_extra", None)
+        force_long_delivery = bool(get_extra("_kt_force_long_delivery")) if callable(get_extra) else False
+        if result is None or (not result.is_llm_result() and not force_long_delivery) or not result.chain:
             return
         if not all(isinstance(component, Plain) for component in result.chain):
             return
@@ -265,6 +267,7 @@ class KomeijiTavernPlugin(Star):
         session_id = self._session_id(event)
         if action == "preview":
             preview = await asyncio.to_thread(self.storage.get_preview, session_id)
+            event.set_extra("_kt_force_long_delivery", True)
             yield event.plain_result(json.dumps(preview or {}, ensure_ascii=False, indent=2))
             return
         if action == "reset":
@@ -274,7 +277,7 @@ class KomeijiTavernPlugin(Star):
         if action == "status":
             state = await asyncio.to_thread(self.storage.get_session, session_id)
             yield event.plain_result(
-                f"Komeiji's Tavern 0.3.5\n会话：{session_id}\n轮次：{state.get('turn', 0)}\n"
+                f"Komeiji's Tavern 0.3.6\n会话：{session_id}\n轮次：{state.get('turn', 0)}\n"
                 f"生命周期记录：{len(state.get('effects', {}))}\n可在插件管理页查看绑定和最终 messages[]。"
             )
             return

@@ -240,9 +240,15 @@ class CoreTests(unittest.TestCase):
                 return {"session_id": session_id, "messages": [{"role": "user", "content": "hello"}]}
 
         class Event:
+            def __init__(self):
+                self.extras = {}
+
             @staticmethod
             def plain_result(text):
                 return MessageEventResult().message(text)
+
+            def set_extra(self, key, value):
+                self.extras[key] = value
 
             @staticmethod
             def request_llm(**_):
@@ -254,12 +260,66 @@ class CoreTests(unittest.TestCase):
         plugin = KomeijiTavernPlugin.__new__(KomeijiTavernPlugin)
         plugin.storage = Storage()
         plugin._session_id = lambda _event: "test-session"
-        results = run(collect(plugin.tavern(Event(), "preview", "")))
+        event = Event()
+        results = run(collect(plugin.tavern(event, "preview", "")))
         self.assertEqual(len(results), 1)
         self.assertIsInstance(results[0], MessageEventResult)
+        self.assertTrue(event.extras["_kt_force_long_delivery"])
         payload = json.loads(results[0].chain[0].text)
         self.assertEqual(payload["session_id"], "test-session")
         self.assertEqual(payload["messages"][0]["content"], "hello")
+
+    def test_forced_preview_result_uses_long_delivery_without_llm_result_type(self):
+        class Result:
+            chain = [Plain("中" * 250)]
+
+            @staticmethod
+            def is_llm_result():
+                return False
+
+        class Event:
+            def __init__(self):
+                self.result = Result()
+                self.sent = []
+                self.extras = {"_kt_force_long_delivery": True}
+
+            @staticmethod
+            def get_platform_name():
+                return "aiocqhttp"
+
+            @staticmethod
+            def get_self_id():
+                return "123"
+
+            def get_extra(self, key):
+                return self.extras.get(key)
+
+            def set_extra(self, key, value):
+                self.extras[key] = value
+
+            def get_result(self):
+                return self.result
+
+            def clear_result(self):
+                self.result = None
+
+            async def send(self, chain):
+                self.sent.append(chain)
+
+        plugin = KomeijiTavernPlugin.__new__(KomeijiTavernPlugin)
+        plugin.config = {
+            "qq_forward_split_enabled": True,
+            "qq_forward_trigger_chars": 100,
+            "qq_forward_node_chars": 100,
+            "qq_forward_nodes_per_batch": 6,
+            "qq_forward_batch_interval_ms": 0,
+        }
+        event = Event()
+        run(plugin.deliver_qq_long_reply(event))
+        self.assertIsNone(event.result)
+        self.assertEqual(len(event.sent), 1)
+        self.assertIsInstance(event.sent[0].chain[0], Nodes)
+        self.assertEqual([len(node.content[0].text) for node in event.sent[0].chain[0].nodes], [100, 100, 50])
 
     def test_selective_logic_and_recursion(self):
         data = {"entries": {
