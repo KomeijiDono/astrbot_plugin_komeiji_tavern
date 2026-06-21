@@ -141,5 +141,11 @@
     "hint": "可选。会拼接到回复文本前，再交给 omnidraw 副脑。例如 roleplay scene, cinematic still, ",
     "type": "text",
     "default": ""
+  },
+  "illustration_max_concurrency": {
+    "description": "配图最大并发数",
+    "hint": "同时进行的后台配图任务上限，防止多会话并发打爆生图 Provider。推荐 1-3。",
+    "type": "int",
+    "default": 2
   }
 }

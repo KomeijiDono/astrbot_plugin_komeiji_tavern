@@ -12,7 +12,7 @@ from astrbot_plugin_komeiji_tavern.importers import detect_kind, export_document
 from astrbot_plugin_komeiji_tavern.documents import validate_document
 from astrbot_plugin_komeiji_tavern.lore import LoreScanner, normalize_entries
 from astrbot_plugin_komeiji_tavern.models import Position, ScanResult
-from astrbot_plugin_komeiji_tavern.prompt_builder import PromptBuilder
+from astrbot_plugin_komeiji_tavern.prompt_builder import PromptBuilder, estimate_tokens
 from astrbot_plugin_komeiji_tavern.qq_delivery import split_forward_text
 from astrbot_plugin_komeiji_tavern.storage import TavernStorage
 from astrbot_plugin_komeiji_tavern.service import TavernService
@@ -384,7 +384,7 @@ class IllustrationTests(unittest.TestCase):
             omni = _FakeOmniDraw({"success": True, "images": [{"file_path": str(img_path)}]})
             bridge = OmniDrawBridge(_FakeContext(), {"illustration_enabled": True, "illustration_mode": "text2img"})
             event = _FakeEvent()
-            run(bridge._run(event, omni, "prompt", consume=False))
+            run(bridge._run(event, omni, "prompt", consume=False, semaphore=None))
             self.assertEqual(len(event.sent), 1)
             self.assertEqual(omni.calls[0]["prompt"], "prompt")
             self.assertEqual(omni.calls[0]["event"], None)
@@ -397,7 +397,7 @@ class IllustrationTests(unittest.TestCase):
             omni = _FakeOmniDraw({"success": True, "images": [{"file_path": str(img_path)}]})
             bridge = OmniDrawBridge(_FakeContext(), {"illustration_enabled": True})
             event = _FakeEvent()
-            run(bridge._run(event, omni, "prompt", consume=True))
+            run(bridge._run(event, omni, "prompt", consume=True, semaphore=None))
             self.assertIs(omni.calls[0]["event"], event)
             self.assertTrue(omni.calls[0]["record_usage"])
 
@@ -405,15 +405,130 @@ class IllustrationTests(unittest.TestCase):
         omni = _FakeOmniDraw({"success": False, "message": "boom"})
         bridge = OmniDrawBridge(_FakeContext(), {"illustration_enabled": True})
         event = _FakeEvent()
-        run(bridge._run(event, omni, "prompt", consume=False))
+        run(bridge._run(event, omni, "prompt", consume=False, semaphore=None))
         self.assertEqual(event.sent, [])
 
     def test_run_silent_when_no_images(self):
         omni = _FakeOmniDraw({"success": True, "images": []})
         bridge = OmniDrawBridge(_FakeContext(), {"illustration_enabled": True})
         event = _FakeEvent()
-        run(bridge._run(event, omni, "prompt", consume=False))
+        run(bridge._run(event, omni, "prompt", consume=False, semaphore=None))
         self.assertEqual(event.sent, [])
+
+
+class _FakeStar:
+    def __init__(self, inst):
+        self.star_cls = inst
+
+
+class _FakeEmbeddingContext:
+    def __init__(self, providers):
+        self._providers = providers
+
+    def get_all_embedding_providers(self):
+        return self._providers
+
+
+class _FakeEmbeddingProvider:
+    def __init__(self, pid, vectors):
+        self.provider_config = {"id": pid}
+        self._vectors = vectors
+        self.calls = []
+
+    async def get_embedding(self, text):
+        self.calls.append(text)
+        return self._vectors.get(text, [0.0, 0.0])
+
+
+class _BoomEmbeddingProvider:
+    provider_config = {"id": "emb"}
+
+    async def get_embedding(self, text):
+        raise RuntimeError("provider down")
+
+
+class _ConcurrencyTracker:
+    def __init__(self):
+        self.entered = 0
+        self.max_concurrent = 0
+        self._lock = asyncio.Lock()
+
+    async def enter(self):
+        async with self._lock:
+            self.entered += 1
+            self.max_concurrent = max(self.max_concurrent, self.entered)
+
+    async def exit(self):
+        async with self._lock:
+            self.entered -= 1
+
+
+class _SlowOmniDraw:
+    def __init__(self, tracker):
+        self.tracker = tracker
+
+    async def generate_images_for_plugin(self, **kwargs):
+        await self.tracker.enter()
+        await asyncio.sleep(0.05)
+        await self.tracker.exit()
+        return {"success": False, "message": "tracked"}
+
+
+class EstimateTokensTests(unittest.TestCase):
+    def test_english_four_chars_per_token(self):
+        self.assertEqual(estimate_tokens("abcdefgh" * 10), 20)
+
+    def test_chinese_lower_than_char_count(self):
+        text = "中" * 160
+        self.assertEqual(estimate_tokens(text), 100)
+        self.assertLess(estimate_tokens(text), 160)
+
+    def test_mixed_english_and_chinese(self):
+        self.assertEqual(estimate_tokens("hello世界"), 2)
+
+    def test_empty_returns_zero(self):
+        self.assertEqual(estimate_tokens(""), 0)
+
+
+class VectorMatcherTests(unittest.TestCase):
+    def test_degrades_on_provider_error(self):
+        with tempfile.TemporaryDirectory() as d:
+            storage = TavernStorage(Path(d) / "state.db")
+            ctx = _FakeEmbeddingContext([_BoomEmbeddingProvider()])
+            service = TavernService(storage, ctx, {"vector_enabled": True, "embedding_provider_id": "emb"})
+            entries = normalize_entries({"entries": [entry("v", ["k"], "hello", vectorized=True)]})
+            self.assertEqual(run(service._vector_matcher("query", entries)), {})
+
+    def test_caches_entry_embeddings_across_calls(self):
+        provider = _FakeEmbeddingProvider("emb", {"query": [1.0, 0.0], "hello": [0.0, 1.0]})
+        ctx = _FakeEmbeddingContext([provider])
+        with tempfile.TemporaryDirectory() as d:
+            storage = TavernStorage(Path(d) / "state.db")
+            service = TavernService(storage, ctx, {"vector_enabled": True, "embedding_provider_id": "emb"})
+            entries = normalize_entries({"entries": [entry("v", ["k"], "hello", vectorized=True)]})
+            run(service._vector_matcher("query", entries))
+            run(service._vector_matcher("query", entries))
+            self.assertEqual(provider.calls.count("hello"), 1)
+            self.assertEqual(provider.calls.count("query"), 2)
+
+
+class IllustrationConcurrencyTests(unittest.TestCase):
+    def test_concurrency_limits_simultaneous_illustrations(self):
+        tracker = _ConcurrencyTracker()
+        bridge = OmniDrawBridge(_FakeContext(_FakeStar(_SlowOmniDraw(tracker))), {
+            "illustration_enabled": True,
+            "illustration_max_concurrency": 2,
+            "illustration_mode": "text2img",
+        })
+
+        async def scenario():
+            for _ in range(5):
+                await bridge.maybe_illustrate(_FakeEvent(), _FakeResponse("a" * 100))
+            await asyncio.gather(*bridge._tasks)
+
+        run(scenario())
+        self.assertLessEqual(tracker.max_concurrent, 2)
+        self.assertGreaterEqual(tracker.max_concurrent, 1)
 
 
 if __name__ == "__main__":

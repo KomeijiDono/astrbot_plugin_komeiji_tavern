@@ -17,8 +17,18 @@ DEFAULT_ORDER = [
 def estimate_tokens(text: str) -> int:
     if not text:
         return 0
-    ascii_count = sum(ord(char) < 128 for char in text)
-    return max(1, (ascii_count + 1) // 4 + (len(text) - ascii_count))
+    ascii_count = 0
+    cjk_count = 0
+    other = 0
+    for char in text:
+        cp = ord(char)
+        if cp < 128:
+            ascii_count += 1
+        elif 0x4E00 <= cp <= 0x9FFF or 0x3040 <= cp <= 0x30FF or 0xAC00 <= cp <= 0xD7AF:
+            cjk_count += 1
+        else:
+            other += 1
+    return max(1, (ascii_count + 1) // 4 + cjk_count * 5 // 8 + other)
 
 
 class PromptBuilder:

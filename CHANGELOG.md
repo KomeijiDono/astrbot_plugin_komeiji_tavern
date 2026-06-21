@@ -1,5 +1,12 @@
 # 更新日志
 
+## 0.3.2
+
+- 优化 token 估算：中日韩文本按 5/8 系数计 token（旧算法 1:1 高估），减少中文场景过早裁剪、更充分利用上下文。
+- 向量条目 embedding 增加 LRU 缓存（上限 512），避免每次请求对同一向量条目重复调用 embedding API。
+- 向量匹配增加错误降级：embedding provider 异常时记 warning 并跳过向量条目，不再阻断整个 LLM 请求。
+- 配图新增 `illustration_max_concurrency` 配置项，限制同时进行的后台配图任务数（默认 2），防止多会话并发打爆生图 Provider。
+
 ## 0.3.1
 
 - 绑定管理与调试器的会话选择改为可输入 combobox，支持搜索已有会话或直接输入任意会话 ID 绑定。

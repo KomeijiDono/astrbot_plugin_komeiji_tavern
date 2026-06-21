@@ -2,9 +2,15 @@
 
 Komeiji's Tavern 是 AstrBot 的角色扮演提示词编排插件。它负责管理角色卡、用户设定、提示词预设、世界书和会话生命周期，并展示某次请求最终发送给模型的 `messages[]`。
 
-当前版本：`0.3.1`。仅支持 AstrBot Chat Completion 管线。
+当前版本：`0.3.2`。仅支持 AstrBot Chat Completion 管线。
 
 ## 版本更新记录
+
+### 0.3.2
+
+- 优化 token 估算的中日韩文本系数，减少中文场景过早裁剪、更充分利用上下文。
+- 向量条目 embedding 增加 LRU 缓存与错误降级，避免重复 API 调用和 provider 异常阻断请求。
+- 配图新增 `illustration_max_concurrency` 配置项，限制并发生图任务数，防止打爆生图 Provider。
 
 ### 0.3.1
 
@@ -198,6 +204,7 @@ http://127.0.0.1:6185/api/plug/astrbot_plugin_komeiji_tavern/v1/panel
 | `illustration_size` | `""` | 配图默认尺寸，留空用 omnidraw 节点默认。 |
 | `illustration_consume_quota` | `false` | 是否走 omnidraw 权限检查并消耗用户每日额度。默认关闭，配图作为 bot 自动行为不扣额度。 |
 | `illustration_prompt_prefix` | `""` | 可选提示词前缀，会拼接到回复文本前再交给 omnidraw 副脑。 |
+| `illustration_max_concurrency` | `2` | 同时进行的后台配图任务上限，防止多会话并发打爆生图 Provider。推荐 1-3。 |
 
 ### 注意事项
 
@@ -269,5 +276,6 @@ tavern.db.v0.1.0.bak
 - `illustration_size`：配图默认尺寸，留空用 omnidraw 节点默认。
 - `illustration_consume_quota`：配图是否消耗 omnidraw 用户额度，默认 false。
 - `illustration_prompt_prefix`：配图提示词前缀，可选。
+- `illustration_max_concurrency`：配图最大并发数，默认 2，防止多会话并发打爆生图 Provider。
 
 向量条目未配置有效 Embedding Provider 时会跳过，并在请求调试结果中显示警告。

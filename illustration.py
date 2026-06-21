@@ -27,9 +27,11 @@ class OmniDrawBridge:
         self.context = context
         self.config = config
         self._tasks: set[asyncio.Task] = set()
+        self._semaphore: asyncio.Semaphore | None = None
 
     def update_config(self, config: dict[str, Any]) -> None:
         self.config = config
+        self._semaphore = None
 
     def _cfg(self, key: str, default: Any) -> Any:
         return self.config.get(key, default)
@@ -66,7 +68,9 @@ class OmniDrawBridge:
         if not prompt:
             return
         consume = bool(self._cfg("illustration_consume_quota", False))
-        task = asyncio.create_task(self._run(event, omnidraw, prompt, consume))
+        if self._semaphore is None:
+            self._semaphore = asyncio.Semaphore(max(1, int(self._cfg("illustration_max_concurrency", 2))))
+        task = asyncio.create_task(self._run(event, omnidraw, prompt, consume, self._semaphore))
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
 
@@ -84,33 +88,41 @@ class OmniDrawBridge:
         omnidraw: Any,
         prompt: str,
         consume: bool,
+        semaphore: asyncio.Semaphore | None,
     ) -> None:
         """后台生图 runner：调用 omnidraw 并补发图片，失败静默。"""
         try:
-            size = str(self._cfg("illustration_size", "") or "").strip()
-            mode = str(self._cfg("illustration_mode", "text2img") or "text2img").strip().lower()
-            kwargs: dict[str, Any] = {
-                "prompt": prompt,
-                "count": 1,
-                "mode": mode,
-                "event": event if consume else None,
-                "record_usage": consume,
-            }
-            if size:
-                kwargs["size"] = size
-            result = await omnidraw.generate_images_for_plugin(**kwargs)
-            if not isinstance(result, dict) or not result.get("success"):
-                message = result.get("message") if isinstance(result, dict) else "无返回"
-                logger.debug("%s 配图生成未成功: %s", PLUGIN_TAG, message)
-                return
-            images = result.get("images") or []
-            if not images:
-                return
-            component = self._image_component(images[0])
-            if component is None:
-                logger.debug("%s 配图结果无可发送的图片组件。", PLUGIN_TAG)
-                return
-            await event.send(event.chain_result([component]))
+            async def _core() -> None:
+                size = str(self._cfg("illustration_size", "") or "").strip()
+                mode = str(self._cfg("illustration_mode", "text2img") or "text2img").strip().lower()
+                kwargs: dict[str, Any] = {
+                    "prompt": prompt,
+                    "count": 1,
+                    "mode": mode,
+                    "event": event if consume else None,
+                    "record_usage": consume,
+                }
+                if size:
+                    kwargs["size"] = size
+                result = await omnidraw.generate_images_for_plugin(**kwargs)
+                if not isinstance(result, dict) or not result.get("success"):
+                    message = result.get("message") if isinstance(result, dict) else "无返回"
+                    logger.debug("%s 配图生成未成功: %s", PLUGIN_TAG, message)
+                    return
+                images = result.get("images") or []
+                if not images:
+                    return
+                component = self._image_component(images[0])
+                if component is None:
+                    logger.debug("%s 配图结果无可发送的图片组件。", PLUGIN_TAG)
+                    return
+                await event.send(event.chain_result([component]))
+
+            if semaphore is None:
+                await _core()
+            else:
+                async with semaphore:
+                    await _core()
         except Exception as exc:
             logger.warning("%s 配图任务异常: %s", PLUGIN_TAG, exc)
 

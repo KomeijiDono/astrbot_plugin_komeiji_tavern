@@ -1,14 +1,21 @@
 from __future__ import annotations
 
-import math
+import asyncio
 import copy
+import hashlib
+import math
 import random
+from collections import OrderedDict
 from typing import Any
+
+from astrbot.api import logger
 
 from .lore import LoreScanner, normalize_entries
 from .models import LoreEntry
 from .prompt_builder import PromptBuilder
 from .storage import TavernStorage
+
+PLUGIN_TAG = "[Komeiji's Tavern]"
 
 
 class TavernService:
@@ -24,6 +31,12 @@ class TavernService:
             context_budget=int(config.get("context_budget", 32768)),
             output_reserve=int(config.get("output_reserve", 2048)),
         )
+        self._embedding_cache: OrderedDict[str, list[float]] = OrderedDict()
+        self._embedding_cache_limit = 512
+        self._session_locks: dict[str, asyncio.Lock] = {}
+
+    def _session_lock(self, session_id: str) -> asyncio.Lock:
+        return self._session_locks.setdefault(session_id, asyncio.Lock())
 
     def ensure_defaults(self) -> None:
         if not self.storage.list_documents("preset"):
@@ -103,24 +116,44 @@ class TavernService:
                 state["group_index"] = (index + 1) % len(members)
         return selected
 
+    def _cache_get(self, key: str) -> list[float] | None:
+        value = self._embedding_cache.get(key)
+        if value is not None:
+            self._embedding_cache.move_to_end(key)
+        return value
+
+    def _cache_put(self, key: str, value: list[float]) -> None:
+        self._embedding_cache[key] = value
+        self._embedding_cache.move_to_end(key)
+        while len(self._embedding_cache) > self._embedding_cache_limit:
+            self._embedding_cache.popitem(last=False)
+
     async def _vector_matcher(self, text: str, entries: list[LoreEntry]) -> dict[str, float]:
         if not self.config.get("vector_enabled", False):
             return {}
-        provider_id = str(self.config.get("embedding_provider_id", ""))
-        providers = list(self.context.get_all_embedding_providers())
-        provider = next((item for item in providers if str(item.provider_config.get("id", "")) == provider_id), None)
-        if provider is None:
+        try:
+            provider_id = str(self.config.get("embedding_provider_id", ""))
+            providers = list(self.context.get_all_embedding_providers())
+            provider = next((item for item in providers if str(item.provider_config.get("id", "")) == provider_id), None)
+            if provider is None:
+                return {}
+            query = await provider.get_embedding(text)
+            result: dict[str, float] = {}
+            for entry in entries:
+                key = hashlib.sha1(entry.content.encode("utf-8")).hexdigest()
+                vector = self._cache_get(key)
+                if vector is None:
+                    vector = await provider.get_embedding(entry.content)
+                    self._cache_put(key, vector)
+                norm = math.sqrt(sum(x * x for x in query)) * math.sqrt(sum(x * x for x in vector))
+                score = sum(a * b for a, b in zip(query, vector)) / norm if norm else 0.0
+                threshold = float(entry.raw.get("vector_threshold", 0.35))
+                if score >= threshold:
+                    result[entry.uid] = score
+            return result
+        except Exception as exc:
+            logger.warning("%s 向量匹配失败，已降级跳过向量条目: %s", PLUGIN_TAG, exc)
             return {}
-        query = await provider.get_embedding(text)
-        result: dict[str, float] = {}
-        for entry in entries:
-            vector = await provider.get_embedding(entry.content)
-            norm = math.sqrt(sum(x * x for x in query)) * math.sqrt(sum(x * x for x in vector))
-            score = sum(a * b for a, b in zip(query, vector)) / norm if norm else 0.0
-            threshold = float(entry.raw.get("vector_threshold", 0.35))
-            if score >= threshold:
-                result[entry.uid] = score
-        return result
 
     async def process(self, event: Any, req: Any, *, mode: str = "normal", quiet_prompt: str = ""):
         scopes = self.scopes(event, req)
