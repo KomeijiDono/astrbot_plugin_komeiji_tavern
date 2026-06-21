@@ -2,9 +2,14 @@
 
 Komeiji's Tavern 是 AstrBot 的角色扮演提示词编排插件。它负责管理角色卡、用户设定、提示词预设、世界书和会话生命周期，并展示某次请求最终发送给模型的 `messages[]`。
 
-当前版本：`0.3.4`。仅支持 AstrBot Chat Completion 管线。
+当前版本：`0.3.5`。仅支持 AstrBot Chat Completion 管线。
 
 ## 版本更新记录
+
+### 0.3.5
+
+- 修复 `/tavern preview|status|reset` 返回本地结果后仍继续调用 LLM 的问题。
+- 未知 `/tavern` 子命令只显示用法，不再进入默认生成管线。
 
 ### 0.3.4
 

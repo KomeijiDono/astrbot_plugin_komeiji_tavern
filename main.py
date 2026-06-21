@@ -27,7 +27,7 @@ _STATE_JSON = re.compile(r"\[TAVERN_STATE\]\s*(\{.*?\})\s*$", re.DOTALL)
 _STATE_FIELDS = re.compile(r"\[LOVE_DATA\]\s*(.+)$", re.MULTILINE)
 
 
-@register(PLUGIN_ID, "KomeijiDono", DESCRIPTION, "0.3.4")
+@register(PLUGIN_ID, "KomeijiDono", DESCRIPTION, "0.3.5")
 class KomeijiTavernPlugin(Star):
     def __init__(self, context: Context, config: dict[str, Any] | None = None):
         super().__init__(context)
@@ -265,21 +265,21 @@ class KomeijiTavernPlugin(Star):
         session_id = self._session_id(event)
         if action == "preview":
             preview = await asyncio.to_thread(self.storage.get_preview, session_id)
-            event.set_result(event.plain_result(json.dumps(preview or {}, ensure_ascii=False, indent=2)))
+            yield event.plain_result(json.dumps(preview or {}, ensure_ascii=False, indent=2))
             return
         if action == "reset":
             await self.service.reset_session(session_id)
-            event.set_result(event.plain_result("当前会话的世界书生命周期和预览状态已清除。"))
+            yield event.plain_result("当前会话的世界书生命周期和预览状态已清除。")
             return
         if action == "status":
             state = await asyncio.to_thread(self.storage.get_session, session_id)
-            event.set_result(event.plain_result(
-                f"Komeiji's Tavern 0.3.4\n会话：{session_id}\n轮次：{state.get('turn', 0)}\n"
+            yield event.plain_result(
+                f"Komeiji's Tavern 0.3.5\n会话：{session_id}\n轮次：{state.get('turn', 0)}\n"
                 f"生命周期记录：{len(state.get('effects', {}))}\n可在插件管理页查看绑定和最终 messages[]。"
-            ))
+            )
             return
         if action not in {"continue", "impersonate", "quiet"}:
-            event.set_result(event.plain_result("用法：/tavern status|preview|reset|continue|impersonate|quiet [补充提示]"))
+            yield event.plain_result("用法：/tavern status|preview|reset|continue|impersonate|quiet [补充提示]")
             return
         event.set_extra("_kt_mode", action)
         event.set_extra("_kt_quiet_prompt", str(rest) if action == "quiet" else "")

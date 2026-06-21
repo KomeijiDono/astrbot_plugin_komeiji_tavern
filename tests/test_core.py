@@ -21,6 +21,7 @@ from astrbot_plugin_komeiji_tavern.web import TavernWebApi
 from astrbot_plugin_komeiji_tavern.main import KomeijiTavernPlugin
 from astrbot_plugin_komeiji_tavern.illustration import OmniDrawBridge
 from astrbot.api.message_components import Nodes, Plain
+from astrbot.core.message.message_event_result import MessageEventResult
 
 
 def run(coro):
@@ -231,6 +232,34 @@ class CoreTests(unittest.TestCase):
         fallback = "".join(chain.chain[0].text for chain in event.successful[1:])
         self.assertEqual(sent_forward, text[:300])
         self.assertEqual(fallback, text[300:])
+
+    def test_tavern_preview_yields_local_result_without_requesting_llm(self):
+        class Storage:
+            @staticmethod
+            def get_preview(session_id):
+                return {"session_id": session_id, "messages": [{"role": "user", "content": "hello"}]}
+
+        class Event:
+            @staticmethod
+            def plain_result(text):
+                return MessageEventResult().message(text)
+
+            @staticmethod
+            def request_llm(**_):
+                raise AssertionError("preview must not request the LLM")
+
+        async def collect(generator):
+            return [item async for item in generator]
+
+        plugin = KomeijiTavernPlugin.__new__(KomeijiTavernPlugin)
+        plugin.storage = Storage()
+        plugin._session_id = lambda _event: "test-session"
+        results = run(collect(plugin.tavern(Event(), "preview", "")))
+        self.assertEqual(len(results), 1)
+        self.assertIsInstance(results[0], MessageEventResult)
+        payload = json.loads(results[0].chain[0].text)
+        self.assertEqual(payload["session_id"], "test-session")
+        self.assertEqual(payload["messages"][0]["content"], "hello")
 
     def test_selective_logic_and_recursion(self):
         data = {"entries": {

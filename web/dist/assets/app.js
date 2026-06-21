@@ -13,7 +13,7 @@
     <div class="brand">
       <small>ASTRBOT 角色扮演工作台</small>
       <h1>Komeiji's<br>Tavern</h1>
-      <span>v0.3.4</span>
+      <span>v0.3.5</span>
     </div>
     <button v-for="t in tabs" :class="{active:tab===t[0]}" @click="tab=t[0];selected=null">{{t[1]}}</button>
   </aside>

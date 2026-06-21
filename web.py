@@ -240,7 +240,7 @@ class TavernWebApi:
             tasks.append("把角色绑定到 Persona 或会话")
         if counts.get("lorebook") and not any(item["kind"] == "lorebook" for item in bindings):
             tasks.append("已有世界书尚未绑定")
-        return self.ok({"version": "0.3.4", "counts": counts, "bindings": len(bindings),
+        return self.ok({"version": "0.3.5", "counts": counts, "bindings": len(bindings),
                         "tasks": tasks, "ready": not tasks})
 
     async def personas(self):
