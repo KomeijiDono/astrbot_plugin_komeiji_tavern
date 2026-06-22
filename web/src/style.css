@@ -170,6 +170,14 @@ header p {
   padding:13px;
   border-right:1px solid #392f3d;
 }
+.library-actions {
+  display:grid;
+  gap:8px;
+  margin-bottom:12px;
+}
+.library-actions button {
+  width:100%;
+}
 .library>button {
   width:100%;
   margin-bottom:8px;

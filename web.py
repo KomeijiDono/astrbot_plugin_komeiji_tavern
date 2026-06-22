@@ -10,6 +10,13 @@ from quart import Response, jsonify, request
 from .constants import API_PREFIX, PLUGIN_VERSION
 from .importers import export_document, parse_binary_payload, parse_payload, preview_import, read_material_sqlite
 from .documents import normalize_document, validate_document
+from .export_utils import (
+    build_document_archive,
+    build_session_backup,
+    document_download,
+    download_payload,
+    safe_filename,
+)
 from .service import TavernService
 from .storage import TavernStorage
 
@@ -46,9 +53,12 @@ class TavernWebApi:
             (f"{self.PREFIX}/import/commit", ["POST"], self.import_commit, "Commit import"),
             (f"{self.PREFIX}/import/sqlite", ["POST"], self.import_sqlite, "Import material database"),
             (f"{self.PREFIX}/export/<document_id>", ["GET"], self.export, "Export document"),
+            (f"{self.PREFIX}/export/document", ["POST"], self.export_document_download, "Export document download"),
+            (f"{self.PREFIX}/export/archive", ["POST"], self.export_archive, "Export document archive"),
             (f"{self.PREFIX}/preview/<session_id>", ["GET"], self.preview, "Last request preview"),
             (f"{self.PREFIX}/session/<session_id>", ["GET"], self.session, "Session state"),
             (f"{self.PREFIX}/session/<session_id>/reset", ["POST"], self.reset_session, "Reset session"),
+            (f"{self.PREFIX}/session/<session_id>/backup", ["POST"], self.backup_session, "Backup session"),
             (f"{self.PREFIX}/generation", ["POST"], self.generation, "Set next generation mode"),
             (f"{self.PREFIX}/overview", ["GET"], self.overview, "Configuration overview"),
             (f"{self.PREFIX}/catalog/personas", ["GET"], self.personas, "AstrBot personas"),
@@ -207,6 +217,27 @@ class TavernWebApi:
         return Response(body, content_type="application/json",
                         headers={"Content-Disposition": f'attachment; filename="{document_id}.json"'})
 
+    async def export_document_download(self):
+        payload = await request.get_json(force=True)
+        document = self.storage.get_document(str((payload or {}).get("id", "")))
+        return self.ok(document_download(document)) if document else self.error("资料不存在", 404)
+
+    async def export_archive(self):
+        payload = await request.get_json(force=True)
+        payload = payload if isinstance(payload, dict) else {}
+        kinds = {str(value) for value in payload.get("kinds", []) if value}
+        ids = {str(value) for value in payload.get("ids", []) if value}
+        documents = self.storage.list_documents()
+        if kinds:
+            documents = [item for item in documents if item.get("kind") in kinds]
+        if ids:
+            documents = [item for item in documents if item.get("id") in ids]
+        if not documents:
+            return self.error("没有可导出的资料", 404)
+        name = safe_filename(payload.get("name"), "komeiji-tavern-documents")
+        content = build_document_archive(documents)
+        return self.ok(download_payload(f"{name}.zip", "application/zip", content))
+
     async def preview(self, session_id: str):
         payload = self.storage.get_preview(session_id)
         return self.ok(payload) if payload else self.error("Preview not found", 404)
@@ -217,6 +248,15 @@ class TavernWebApi:
     async def reset_session(self, session_id: str):
         await self.service.reset_session(session_id)
         return self.ok()
+
+    async def backup_session(self, session_id: str):
+        content = build_session_backup(
+            session_id,
+            self.storage.get_session(session_id),
+            self.storage.get_preview(session_id),
+        )
+        filename = f"tavern-session-{safe_filename(session_id, 'session')}.zip"
+        return self.ok(download_payload(filename, "application/zip", content))
 
     async def generation(self):
         payload = await request.get_json(force=True)

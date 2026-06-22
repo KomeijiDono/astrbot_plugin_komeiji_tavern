@@ -7,6 +7,8 @@ import unittest
 import base64
 import struct
 import zlib
+import io
+import zipfile
 from pathlib import Path
 from unittest.mock import patch
 
@@ -22,6 +24,12 @@ from astrbot_plugin_komeiji_tavern.service import TavernService
 from astrbot_plugin_komeiji_tavern.web import TavernWebApi
 from astrbot_plugin_komeiji_tavern.main import KomeijiTavernPlugin, _flatten_config
 from astrbot_plugin_komeiji_tavern.illustration import OmniDrawBridge
+from astrbot_plugin_komeiji_tavern.export_utils import (
+    build_document_archive,
+    build_session_backup,
+    document_download,
+    safe_filename,
+)
 from astrbot.api.message_components import Nodes, Plain
 from astrbot.core.message.message_event_result import MessageEventResult
 
@@ -32,6 +40,51 @@ def run(coro):
 
 def entry(uid, keys, content, **extra):
     return {"uid": uid, "key": keys, "content": content, **extra}
+
+
+class ExportTests(unittest.TestCase):
+    @staticmethod
+    def read_zip(content):
+        return zipfile.ZipFile(io.BytesIO(content))
+
+    def test_safe_filename_removes_windows_invalid_characters(self):
+        self.assertEqual(safe_filename('a<b>:c/'), 'a_b__c_')
+        self.assertEqual(safe_filename('... ', 'fallback'), 'fallback')
+
+    def test_individual_download_preserves_unknown_fields(self):
+        document = {
+            "id": "doc-1", "kind": "character", "name": "Alice",
+            "raw": {"name": "old", "unknown": {"keep": True}},
+            "data": {"name": "Alice"},
+        }
+        payload = document_download(document)
+        decoded = json.loads(base64.b64decode(payload["base64"]))
+        self.assertEqual(payload["filename"], "Alice.json")
+        self.assertTrue(decoded["unknown"]["keep"])
+        self.assertEqual(decoded["name"], "Alice")
+
+    def test_document_archive_groups_documents_and_writes_manifest(self):
+        content = build_document_archive([
+            {"id": "char-123456", "kind": "character", "name": "Alice", "raw": {}, "data": {"name": "Alice"}},
+            {"id": "book-123456", "kind": "lorebook", "name": "World", "raw": {}, "data": {"entries": []}},
+        ])
+        with self.read_zip(content) as archive:
+            names = archive.namelist()
+            self.assertIn("角色卡/Alice-char-123.json", names)
+            self.assertIn("世界书/World-book-123.json", names)
+            manifest = json.loads(archive.read("manifest.json"))
+            self.assertEqual(manifest["count"], 2)
+            self.assertEqual(manifest["version"], PLUGIN_VERSION)
+
+    def test_session_backup_keeps_exact_messages_preview_and_state(self):
+        messages = [{"role": "system", "content": "rules"}, {"role": "user", "content": "hello"}]
+        preview = {"messages": messages, "warnings": ["test"]}
+        state = {"turn": 7, "history_summary": {"content": "summary"}}
+        with self.read_zip(build_session_backup("s1", state, preview)) as archive:
+            self.assertEqual(json.loads(archive.read("messages.json")), messages)
+            self.assertEqual(json.loads(archive.read("preview.json")), preview)
+            self.assertEqual(json.loads(archive.read("session-state.json")), state)
+            self.assertEqual(json.loads(archive.read("manifest.json"))["message_count"], 2)
 
 
 class CoreTests(unittest.TestCase):

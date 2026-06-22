@@ -2,7 +2,7 @@
 
 # Komeiji's Tavern
 
-[![Version](https://img.shields.io/badge/version-0.4.0-7c5cff?style=for-the-badge)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.4.1-7c5cff?style=for-the-badge)](CHANGELOG.md)
 [![AstrBot](https://img.shields.io/badge/AstrBot-4.25%2B-4f9cff?style=for-the-badge)](https://github.com/AstrBotDevs/AstrBot)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-42b883?style=for-the-badge)](LICENSE)
 
@@ -18,6 +18,7 @@
 - 上下文管理：固定历史条数、token 预算、近期消息保护和核心提示块保护。
 - 完整调试器：查看最终 `messages[]`、提示块、世界书激活原因、裁剪项、摘要状态和警告。
 - 资料管理：角色卡、提示词预设、世界书、用户设定、创作素材及会话绑定。
+- 备份导出：单份资料 JSON、分类或全部资料 ZIP、最终 `messages[]` 和重置前会话备份。
 - QQ 长回复：普通消息分片、分包合并转发、失败重试及自动降级。
 - 会话生命周期：自动清理过期插件状态和真实请求预览，不影响 AstrBot 聊天和资料。
 
@@ -101,6 +102,9 @@ http://127.0.0.1:6185/api/plug/astrbot_plugin_komeiji_tavern/v1/panel
 
 - 支持 JSON、YAML、PNG 角色卡以及纯文本提示词预设。
 - 导入时保留未知原始字段，导出时与已编辑字段合并。
+- 资料编辑页可分别导出当前资料 JSON，也可按类别或一键导出全部资料 ZIP。
+- 调试器可导出当前显示的纯 `messages[]` JSON；“重置前备份 ZIP”还会保存完整请求预览与插件会话状态。
+- 会话备份不包含 AstrBot 原始聊天记录；`/tavern reset` 本身也不会删除这些聊天记录。
 - SQLite 文件位于 `data/astrbot_plugin_komeiji_tavern/tavern.db`。
 - 自动清理仅删除 `sessions` 和 `previews` 中的过期行，不删除 documents、bindings 或聊天数据。
 - SQLite 页面会被后续数据复用，插件不会在运行时自动执行 `VACUUM`。
