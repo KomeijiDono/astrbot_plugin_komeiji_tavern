@@ -7,6 +7,7 @@ from typing import Any, Awaitable, Callable
 
 from quart import Response, jsonify, request
 
+from .constants import API_PREFIX
 from .importers import export_document, parse_binary_payload, parse_payload, preview_import, read_material_sqlite
 from .documents import normalize_document, validate_document
 from .service import TavernService
@@ -17,7 +18,7 @@ Handler = Callable[..., Awaitable[Any]]
 
 
 class TavernWebApi:
-    PREFIX = "/astrbot_plugin_komeiji_tavern/v1"
+    PREFIX = API_PREFIX
 
     def __init__(self, storage: TavernStorage, service: TavernService, context: Any, static_dir: str | Path):
         self.storage = storage

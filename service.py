@@ -11,7 +11,7 @@ from typing import Any
 from astrbot.api import logger
 
 from .lore import LoreScanner, normalize_entries
-from .models import LoreEntry
+from .models import BuildResult, LoreEntry, ScanResult
 from .prompt_builder import PromptBuilder
 from .storage import TavernStorage
 
@@ -168,6 +168,59 @@ class TavernService:
             logger.warning("%s 向量匹配失败，已降级跳过向量条目: %s", PLUGIN_TAG, exc)
             return {}
 
+    async def _collect_entries(self, scopes: list[tuple[str, str]]) -> list[LoreEntry]:
+        entries: list[LoreEntry] = []
+        for kind in ("lorebook", "material"):
+            documents = await asyncio.to_thread(self.storage.resolve_bindings, kind, scopes)
+            for document in documents:
+                entries.extend(normalize_entries(document["data"]))
+        return entries
+
+    @staticmethod
+    def _serialize_result(
+        result: BuildResult,
+        scan: ScanResult,
+        *,
+        include_content: bool = False,
+    ) -> dict[str, Any]:
+        blocks = []
+        for block in result.blocks:
+            item = {
+                "id": block.identifier,
+                "name": block.name,
+                "source": block.source,
+                "role": block.role,
+                "position": block.position,
+                "depth": block.depth,
+                "tokens": block.token_estimate,
+            }
+            if include_content:
+                item["content"] = block.content
+            blocks.append(item)
+
+        activated = []
+        for match in scan.activated:
+            item = {
+                "uid": match.entry.uid,
+                "name": match.entry.comment,
+                "reason": match.reason,
+                "score": match.score,
+                "step": match.recursion_step,
+            }
+            if include_content:
+                item["content"] = match.entry.content
+            activated.append(item)
+
+        return {
+            "messages": result.messages,
+            "blocks": blocks,
+            "dropped": result.dropped,
+            "warnings": list(result.warnings),
+            "activated": activated,
+            "outlets": scan.outlets,
+            "token_estimation": "approximate",
+        }
+
     async def process(self, event: Any, req: Any, *, mode: str = "normal", quiet_prompt: str = ""):
         scopes = self.scopes(event, req)
         session_id = str(getattr(event, "unified_msg_origin", "") or req.session_id or "default")
@@ -177,15 +230,7 @@ class TavernService:
             mode = str(event.get_extra("_kt_mode") or pending.get("mode") or mode)
             quiet_prompt = str(event.get_extra("_kt_quiet_prompt") or pending.get("prompt") or quiet_prompt)
             await asyncio.to_thread(self.storage.save_session, session_id, state)
-            lore_documents = await asyncio.to_thread(self.storage.resolve_bindings, "lorebook", scopes)
-            entries: list[LoreEntry] = []
-            for document in lore_documents:
-                entries.extend(normalize_entries(document["data"]))
-            # Creative materials share the deterministic scanner and can therefore
-            # use constants, keywords, probability, ordering, and lifecycle fields.
-            material_documents = await asyncio.to_thread(self.storage.resolve_bindings, "material", scopes)
-            for document in material_documents:
-                entries.extend(normalize_entries(document["data"]))
+            entries = await self._collect_entries(scopes)
             scan_messages = list(req.contexts or [])
             if req.prompt:
                 scan_messages.append({"role": "user", "content": req.prompt})
@@ -214,17 +259,8 @@ class TavernService:
                 lore=scan, values=values, mode=mode, quiet_prompt=quiet_prompt,
             )
             await asyncio.to_thread(self.storage.save_session, session_id, state)
-            await asyncio.to_thread(self.storage.save_preview, session_id, {
-                "messages": result.messages,
-                "blocks": [{"id": block.identifier, "name": block.name, "source": block.source,
-                            "role": block.role, "position": block.position, "depth": block.depth,
-                            "tokens": block.token_estimate} for block in result.blocks],
-                "dropped": result.dropped, "warnings": result.warnings,
-                "activated": [{"uid": item.entry.uid, "name": item.entry.comment,
-                               "reason": item.reason, "score": item.score,
-                               "step": item.recursion_step} for item in scan.activated],
-                "outlets": scan.outlets, "token_estimation": "approximate",
-            })
+            preview = self._serialize_result(result, scan)
+            await asyncio.to_thread(self.storage.save_preview, session_id, preview)
         return result
 
     async def simulate(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -239,10 +275,7 @@ class TavernService:
         messages = [item for item in payload.get("contexts", []) if isinstance(item, dict)]
         prompt = str(payload.get("prompt", ""))
         scan_messages = messages + ([{"role": "user", "content": prompt}] if prompt else [])
-        entries: list[LoreEntry] = []
-        lore_documents = await asyncio.to_thread(self.storage.resolve_bindings, "lorebook", scopes)
-        for document in lore_documents:
-            entries.extend(normalize_entries(document["data"]))
+        entries = await self._collect_entries(scopes)
         scan = await self.scanner.scan(
             entries, scan_messages, state,
             vector_matcher=self._vector_matcher if self.config.get("vector_enabled", False) else None,
@@ -275,17 +308,11 @@ class TavernService:
         if not character_doc:
             warnings.append("当前作用域没有绑定角色卡。")
         effective = await asyncio.to_thread(self.effective_bindings, scopes)
-        return {
-            "messages": result.messages,
-            "blocks": [{"id": block.identifier, "name": block.name, "source": block.source,
-                        "role": block.role, "position": block.position, "depth": block.depth,
-                        "tokens": block.token_estimate, "content": block.content}
-                       for block in result.blocks],
-            "dropped": result.dropped, "warnings": warnings,
-            "activated": [{"uid": item.entry.uid, "name": item.entry.comment,
-                           "reason": item.reason, "score": item.score,
-                           "step": item.recursion_step, "content": item.entry.content}
-                          for item in scan.activated],
-            "outlets": scan.outlets, "effective": effective,
-            "state_after": state, "state_persisted": False, "token_estimation": "approximate",
-        }
+        serialized = self._serialize_result(result, scan, include_content=True)
+        serialized.update({
+            "warnings": warnings,
+            "effective": effective,
+            "state_after": state,
+            "state_persisted": False,
+        })
+        return serialized

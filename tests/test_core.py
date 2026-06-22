@@ -9,6 +9,7 @@ import zlib
 from pathlib import Path
 from unittest.mock import patch
 
+from astrbot_plugin_komeiji_tavern.constants import API_PREFIX, PLUGIN_ID, PLUGIN_VERSION
 from astrbot_plugin_komeiji_tavern.importers import detect_kind, export_document, parse_binary_payload, parse_payload, preview_import
 from astrbot_plugin_komeiji_tavern.documents import validate_document
 from astrbot_plugin_komeiji_tavern.lore import LoreScanner, normalize_entries
@@ -505,6 +506,21 @@ class CoreTests(unittest.TestCase):
             self.assertFalse(result["state_persisted"])
             self.assertEqual(storage.get_session("s1"), before)
 
+    def test_simulation_collects_bound_materials_like_real_requests(self):
+        with tempfile.TemporaryDirectory() as directory:
+            storage = TavernStorage(Path(directory) / "state.db")
+            preset_id = storage.put_document("preset", "Default", {"main_prompt": "base"})
+            material_id = storage.put_document("material", "Material", {
+                "entries": [entry("material-x", ["spark"], "material content")]
+            })
+            storage.bind("global", "*", "preset", preset_id)
+            storage.bind("session", "s1", "material", material_id)
+            result = run(TavernService(storage, object(), {}).simulate({
+                "session_id": "s1", "prompt": "spark", "system_prompt": "system"
+            }))
+            self.assertEqual(result["activated"][0]["uid"], "material-x")
+            self.assertEqual(result["activated"][0]["content"], "material content")
+
     def test_simulation_warns_when_scope_has_no_preset(self):
         with tempfile.TemporaryDirectory() as directory:
             storage = TavernStorage(Path(directory) / "state.db")
@@ -523,6 +539,13 @@ class CoreTests(unittest.TestCase):
             items = api._merge_bound_conversations([])
             self.assertEqual(items[0]["id"], session_id)
             self.assertEqual(items[0]["source"], "binding")
+
+    def test_runtime_constants_match_public_metadata(self):
+        metadata = (Path(__file__).parents[1] / "metadata.yaml").read_text(encoding="utf-8")
+        self.assertIn(f"name: {PLUGIN_ID}", metadata)
+        self.assertIn(f"version: {PLUGIN_VERSION}", metadata)
+        self.assertEqual(API_PREFIX, f"/{PLUGIN_ID}/v1")
+        self.assertEqual(TavernWebApi.PREFIX, API_PREFIX)
 
 
     def test_import_round_trip(self):

@@ -13,7 +13,7 @@ from astrbot.api.event import AstrMessageEvent
 from astrbot.api.message_components import Image
 from astrbot.api.provider import LLMResponse
 
-PLUGIN_TAG = "[Komeiji's Tavern]"
+from .constants import PLUGIN_ID, PLUGIN_TAG
 
 
 class OmniDrawBridge:
@@ -178,7 +178,7 @@ class OmniDrawBridge:
             data = base64.b64decode(encoded, validate=True)
         except (binascii.Error, ValueError):
             return None
-        data_dir = Path.home() / ".astrbot" / "data" / "astrbot_plugin_komeiji_tavern" / "illustrations"
+        data_dir = Path.home() / ".astrbot" / "data" / PLUGIN_ID / "illustrations"
         data_dir.mkdir(parents=True, exist_ok=True)
         file_path = data_dir / f"{uuid.uuid4().hex}{ext}"
         file_path.write_bytes(data)

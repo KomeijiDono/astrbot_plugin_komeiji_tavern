@@ -13,6 +13,7 @@ from astrbot.api.provider import LLMResponse, ProviderRequest
 from astrbot.api.star import Context, Star, register
 from astrbot.core.star.filter.command import GreedyStr
 
+from .constants import DESCRIPTION, DISPLAY_NAME, PLUGIN_ID, PLUGIN_VERSION
 from .illustration import OmniDrawBridge
 from .service import TavernService
 from .qq_delivery import split_forward_text
@@ -20,9 +21,6 @@ from .storage import TavernStorage
 from .web import TavernWebApi
 
 
-PLUGIN_ID = "astrbot_plugin_komeiji_tavern"
-DISPLAY_NAME = "Komeiji's Tavern"
-DESCRIPTION = "为 AstrBot 提供角色卡、提示词编排、世界书、创作素材与最终请求预览的一体化角色扮演工具。"
 _STATE_JSON = re.compile(r"\[TAVERN_STATE\]\s*(\{.*?\})\s*$", re.DOTALL)
 _STATE_FIELDS = re.compile(r"\[LOVE_DATA\]\s*(.+)$", re.MULTILINE)
 _CONFIG_GROUPS = (
@@ -41,7 +39,7 @@ def _flatten_config(config: dict[str, Any] | None) -> dict[str, Any]:
     return flattened
 
 
-@register(PLUGIN_ID, "KomeijiDono", DESCRIPTION, "0.3.9")
+@register(PLUGIN_ID, "KomeijiDono", DESCRIPTION, PLUGIN_VERSION)
 class KomeijiTavernPlugin(Star):
     def __init__(self, context: Context, config: dict[str, Any] | None = None):
         super().__init__(context)
@@ -291,7 +289,7 @@ class KomeijiTavernPlugin(Star):
         if action == "status":
             state = await asyncio.to_thread(self.storage.get_session, session_id)
             yield event.plain_result(
-                f"Komeiji's Tavern 0.3.9\n会话：{session_id}\n轮次：{state.get('turn', 0)}\n"
+                f"{DISPLAY_NAME} {PLUGIN_VERSION}\n会话：{session_id}\n轮次：{state.get('turn', 0)}\n"
                 f"生命周期记录：{len(state.get('effects', {}))}\n可在插件管理页查看绑定和最终 messages[]。"
             )
             return
