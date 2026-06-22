@@ -1,169 +1,227 @@
 {
-  "enabled": {
-    "description": "启用提示词编排",
-    "type": "bool",
-    "default": true
+  "basic_config": {
+    "description": "基础功能",
+    "hint": "控制插件总开关及模型发送工具引导。",
+    "type": "object",
+    "items": {
+      "enabled": {
+        "description": "启用提示词编排",
+        "type": "bool",
+        "default": true
+      },
+      "tool_delivery_enabled": {
+        "description": "启用发送工具引导",
+        "hint": "仅适用于需要模型主动调用 send_message_to_user 的 Agent 场景。开启后会临时引导模型把正文放入工具调用，可能造成普通回复为空或重复发送；普通聊天建议关闭。",
+        "type": "bool",
+        "default": false
+      }
+    }
   },
-  "context_budget": {
-    "description": "默认上下文预算（token）",
-    "hint": "无法从模型元数据取得上限时使用。",
-    "type": "int",
-    "default": 32768
+  "context_config": {
+    "description": "上下文与裁剪",
+    "hint": "控制 token 预算、输出预留和发送给模型的聊天历史范围。",
+    "type": "object",
+    "items": {
+      "context_budget": {
+        "description": "默认上下文预算（token）",
+        "hint": "无法从模型元数据取得上限时使用。",
+        "type": "int",
+        "default": 32768
+      },
+      "output_reserve": {
+        "description": "输出预留（token）",
+        "type": "int",
+        "default": 2048
+      },
+      "history_max_messages": {
+        "description": "最多发送聊天历史消息数",
+        "hint": "只发送最近 N 条聊天记录；不计算本次用户消息和插件注入消息。0 表示不限制，12 通常约为 6 轮。",
+        "type": "int",
+        "default": 0
+      },
+      "history_first_trimming": {
+        "description": "优先裁剪旧聊天历史",
+        "hint": "超出 token 预算时先裁剪旧历史，再裁剪可选提示块。",
+        "type": "bool",
+        "default": true
+      },
+      "history_keep_recent_messages": {
+        "description": "预算裁剪时优先保留的最近消息数",
+        "hint": "第一阶段不会删除这些最近消息；若仍超出硬上限则继续裁剪。建议 4-10。",
+        "type": "int",
+        "default": 6
+      }
+    }
   },
-  "output_reserve": {
-    "description": "输出预留（token）",
-    "type": "int",
-    "default": 2048
+  "worldbook_config": {
+    "description": "世界书与向量",
+    "hint": "控制世界书扫描、递归激活及可选向量匹配。",
+    "type": "object",
+    "items": {
+      "scan_depth": {
+        "description": "默认世界书扫描深度",
+        "type": "int",
+        "default": 4
+      },
+      "max_recursion_steps": {
+        "description": "最大递归扫描次数",
+        "type": "int",
+        "default": 3
+      },
+      "vector_enabled": {
+        "description": "启用向量条目",
+        "type": "bool",
+        "default": false
+      },
+      "embedding_provider_id": {
+        "description": "Embedding Provider ID",
+        "type": "string",
+        "default": ""
+      }
+    }
   },
-  "scan_depth": {
-    "description": "默认世界书扫描深度",
-    "type": "int",
-    "default": 4
+  "qq_direct_config": {
+    "description": "QQ 普通消息分片",
+    "hint": "长回复直接拆成多条普通 QQ 消息发送；开启后优先于合并转发。",
+    "type": "object",
+    "items": {
+      "qq_direct_split_enabled": {
+        "description": "启用逐条直接发送",
+        "type": "bool",
+        "default": false
+      },
+      "qq_direct_message_chars": {
+        "description": "每条最大字符数",
+        "hint": "按 Unicode 字符计数，推荐 1000-2000。",
+        "type": "int",
+        "default": 1000
+      },
+      "qq_direct_send_interval_ms": {
+        "description": "发送间隔（毫秒）",
+        "hint": "避免连续发送过快触发限流，推荐 500-1500。",
+        "type": "int",
+        "default": 2000
+      },
+      "qq_direct_retry_count": {
+        "description": "失败重试次数",
+        "type": "int",
+        "default": 2
+      },
+      "qq_direct_retry_delay_ms": {
+        "description": "重试等待（毫秒）",
+        "type": "int",
+        "default": 3000
+      }
+    }
   },
-  "max_recursion_steps": {
-    "description": "最大递归扫描次数",
-    "type": "int",
-    "default": 3
+  "qq_forward_config": {
+    "description": "QQ 合并转发",
+    "hint": "将长回复拆成多个 Node 和多个小型合并转发包，仅作用于 aiocqhttp。",
+    "type": "object",
+    "items": {
+      "qq_forward_split_enabled": {
+        "description": "启用合并转发",
+        "type": "bool",
+        "default": true
+      },
+      "qq_forward_trigger_chars": {
+        "description": "触发字符数",
+        "hint": "中文、英文、标点和换行均按 Unicode 字符计数。",
+        "type": "int",
+        "default": 1500
+      },
+      "qq_forward_node_chars": {
+        "description": "每个 Node 最大字符数",
+        "hint": "推荐 800-1200，优先按段落和句末拆分。",
+        "type": "int",
+        "default": 1000
+      },
+      "qq_forward_nodes_per_batch": {
+        "description": "每个转发包最大节点数",
+        "hint": "推荐 6-8，超出后拆成多个转发包。",
+        "type": "int",
+        "default": 6
+      },
+      "qq_forward_batch_interval_ms": {
+        "description": "转发包发送间隔（毫秒）",
+        "type": "int",
+        "default": 1500
+      },
+      "qq_forward_fallback_enabled": {
+        "description": "失败时自动降级",
+        "hint": "将尚未成功发送的内容改为普通消息分片。",
+        "type": "bool",
+        "default": true
+      }
+    }
   },
-  "vector_enabled": {
-    "description": "启用向量条目",
-    "type": "bool",
-    "default": false
+  "status_config": {
+    "description": "状态栏",
+    "hint": "解析模型回复中的状态数据并按模板附加显示。",
+    "type": "object",
+    "items": {
+      "status_bar_enabled": {
+        "description": "启用状态栏解析",
+        "type": "bool",
+        "default": false
+      },
+      "status_bar_template": {
+        "description": "状态栏格式",
+        "hint": "使用 {content} 放置解析后的状态。",
+        "type": "text",
+        "default": "**Status**\n```\n{content}\n```"
+      }
+    }
   },
-  "embedding_provider_id": {
-    "description": "Embedding Provider ID",
-    "type": "string",
-    "default": ""
-  },
-  "tool_delivery_enabled": {
-    "description": "启用发送工具引导",
-    "type": "bool",
-    "default": false
-  },
-  "qq_direct_split_enabled": {
-    "description": "QQ 长回复逐条直接发送",
-    "hint": "开启后优先于合并转发：长回复会拆成多条普通 QQ 消息依次发送，便于排查合并转发失败。",
-    "type": "bool",
-    "default": false
-  },
-  "qq_direct_message_chars": {
-    "description": "QQ 直接发送每条最大字数",
-    "hint": "按 Unicode 字符计数，推荐 1000-2000。优先在段落和句末切分。",
-    "type": "int",
-    "default": 1000
-  },
-  "qq_direct_send_interval_ms": {
-    "description": "QQ 逐条发送间隔（毫秒）",
-    "hint": "避免连续发送过快触发限流，推荐 500-1500。",
-    "type": "int",
-    "default": 2000
-  },
-  "qq_direct_retry_count": {
-    "description": "QQ 直接发送失败重试次数",
-    "hint": "单片普通消息发送失败后的最大重试次数。",
-    "type": "int",
-    "default": 2
-  },
-  "qq_direct_retry_delay_ms": {
-    "description": "QQ 直接发送重试等待（毫秒）",
-    "hint": "发送失败后等待多久再重试，推荐 2000-5000。",
-    "type": "int",
-    "default": 3000
-  },
-  "qq_forward_split_enabled": {
-    "description": "QQ 长回复使用合并转发",
-    "hint": "非流式纯文本回复超过触发字数时，按多个小型合并转发包发送。仅作用于 aiocqhttp。",
-    "type": "bool",
-    "default": true
-  },
-  "qq_forward_trigger_chars": {
-    "description": "QQ 合并转发触发字数",
-    "hint": "回复总字符数超过此值后改用合并转发。中文、英文、标点和换行均按 Unicode 字符计数。",
-    "type": "int",
-    "default": 1500
-  },
-  "qq_forward_node_chars": {
-    "description": "每个 QQ 转发 Node 最大字数",
-    "hint": "推荐 800-1200。优先按段落和句末拆分，无法找到边界时按此字数硬切。",
-    "type": "int",
-    "default": 1000
-  },
-  "qq_forward_nodes_per_batch": {
-    "description": "每个 QQ 合并转发包最大节点数",
-    "hint": "推荐 6-8。超出后会拆成多个合并转发包，降低单次请求载荷。",
-    "type": "int",
-    "default": 6
-  },
-  "qq_forward_batch_interval_ms": {
-    "description": "QQ 合并转发包发送间隔（毫秒）",
-    "hint": "多个转发包之间的等待时间，推荐 1000-2000。",
-    "type": "int",
-    "default": 1500
-  },
-  "qq_forward_fallback_enabled": {
-    "description": "QQ 合并转发失败自动降级",
-    "hint": "合并转发失败时，将尚未成功发送的内容改为普通消息分片，避免整条回复丢失。",
-    "type": "bool",
-    "default": true
-  },
-  "status_bar_enabled": {
-    "description": "启用状态栏解析",
-    "type": "bool",
-    "default": false
-  },
-  "status_bar_template": {
-    "description": "状态栏格式",
-    "hint": "使用 {content} 放置解析后的状态。",
-    "type": "text",
-    "default": "**Status**\n```\n{content}\n```"
-  },
-  "illustration_enabled": {
-    "description": "启用自动配图",
-    "hint": "开启后，每次 LLM 回复都会异步调用 omnidraw 生成一张配图并补发到当前会话。需同时安装并配置好 astrbot_plugin_omnidraw。",
-    "type": "bool",
-    "default": false
-  },
-  "illustration_plugin_id": {
-    "description": "生图插件 ID",
-    "hint": "要调用的生图插件 ID，默认为 astrbot_plugin_omnidraw。若该插件未安装或未激活，配图会自动跳过。",
-    "type": "string",
-    "default": "astrbot_plugin_omnidraw"
-  },
-  "illustration_mode": {
-    "description": "配图模式",
-    "type": "string",
-    "options": ["text2img", "selfie"],
-    "hint": "text2img 为普通文生图；selfie 使用 omnidraw 当前人设与参考图生成自拍。默认 text2img。",
-    "default": "text2img"
-  },
-  "illustration_max_text_chars": {
-    "description": "传入生图的回复最大字符数",
-    "hint": "LLM 回复文本会被截断到此长度后作为生图提示词传给 omnidraw 副脑优化。建议 200-800，过长可能导致副脑超时。",
-    "type": "int",
-    "default": 600
-  },
-  "illustration_size": {
-    "description": "配图默认尺寸",
-    "hint": "留空使用 omnidraw 节点默认尺寸；例如 1024x1024、1024x1536 等。",
-    "type": "string",
-    "default": ""
-  },
-  "illustration_consume_quota": {
-    "description": "配图是否消耗 omnidraw 用户额度",
-    "hint": "关闭时配图作为 bot 自动行为，绕过 omnidraw 白名单与每日额度限制；开启时每次配图都走 omnidraw 权限检查并计入用户额度。",
-    "type": "bool",
-    "default": false
-  },
-  "illustration_prompt_prefix": {
-    "description": "配图提示词前缀",
-    "hint": "可选。会拼接到回复文本前，再交给 omnidraw 副脑。例如 roleplay scene, cinematic still, ",
-    "type": "text",
-    "default": ""
-  },
-  "illustration_max_concurrency": {
-    "description": "配图最大并发数",
-    "hint": "同时进行的后台配图任务上限，防止多会话并发打爆生图 Provider。推荐 1-3。",
-    "type": "int",
-    "default": 2
+  "illustration_config": {
+    "description": "自动配图",
+    "hint": "每次 LLM 回复后可异步调用生图插件补发一张图片。",
+    "type": "object",
+    "items": {
+      "illustration_enabled": {
+        "description": "启用自动配图",
+        "type": "bool",
+        "default": false
+      },
+      "illustration_plugin_id": {
+        "description": "生图插件 ID",
+        "type": "string",
+        "default": "astrbot_plugin_omnidraw"
+      },
+      "illustration_mode": {
+        "description": "配图模式",
+        "type": "string",
+        "options": ["text2img", "selfie"],
+        "default": "text2img"
+      },
+      "illustration_max_text_chars": {
+        "description": "传入生图的回复最大字符数",
+        "hint": "建议 200-800，过长可能导致副脑超时。",
+        "type": "int",
+        "default": 600
+      },
+      "illustration_size": {
+        "description": "配图默认尺寸",
+        "hint": "留空使用生图插件默认尺寸，例如 1024x1024。",
+        "type": "string",
+        "default": ""
+      },
+      "illustration_consume_quota": {
+        "description": "是否消耗用户额度",
+        "type": "bool",
+        "default": false
+      },
+      "illustration_prompt_prefix": {
+        "description": "配图提示词前缀",
+        "type": "text",
+        "default": ""
+      },
+      "illustration_max_concurrency": {
+        "description": "配图最大并发数",
+        "hint": "推荐 1-3。",
+        "type": "int",
+        "default": 2
+      }
+    }
   }
 }

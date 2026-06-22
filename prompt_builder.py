@@ -32,9 +32,25 @@ def estimate_tokens(text: str) -> int:
 
 
 class PromptBuilder:
-    def __init__(self, context_budget: int = 32768, output_reserve: int = 2048):
+    CORE_BLOCKS = {
+        "main", "astrbot_system", "character", "personality", "scenario",
+        "persona", "summary", "memory", "post_history", "continue",
+        "impersonate", "quiet",
+    }
+
+    def __init__(
+        self,
+        context_budget: int = 32768,
+        output_reserve: int = 2048,
+        history_first_trimming: bool = True,
+        history_keep_recent_messages: int = 6,
+        history_max_messages: int = 0,
+    ):
         self.context_budget = max(2048, context_budget)
         self.output_reserve = max(256, output_reserve)
+        self.history_first_trimming = bool(history_first_trimming)
+        self.history_keep_recent_messages = max(0, int(history_keep_recent_messages))
+        self.history_max_messages = max(0, int(history_max_messages))
         self.macros = MacroResolver()
 
     @staticmethod
@@ -161,11 +177,24 @@ class PromptBuilder:
 
         active = [block for block in blocks if block.enabled and block.content]
         history = copy.deepcopy(contexts or [])
+        dropped: list[str] = []
+        if self.history_max_messages and len(history) > self.history_max_messages:
+            removed_count = len(history) - self.history_max_messages
+            history = history[-self.history_max_messages:]
+            dropped.extend(["history:max_messages"] * removed_count)
         available = self.context_budget - self.output_reserve - estimate_tokens(current_prompt)
         total = sum(block.token_estimate for block in active) + sum(estimate_tokens(str(m.get("content", ""))) for m in history)
-        dropped: list[str] = []
 
-        for block in sorted(active, key=lambda value: value.priority, reverse=True):
+        # Preserve role identity and recent continuity. Older history is normally
+        # less valuable than deleting an entire character/persona/memory block.
+        if self.history_first_trimming:
+            while len(history) > self.history_keep_recent_messages and total > available:
+                removed = history.pop(0)
+                total -= estimate_tokens(str(removed.get("content", "")))
+                dropped.append("history:oldest")
+
+        optional_blocks = [block for block in active if block.identifier not in self.CORE_BLOCKS]
+        for block in sorted(optional_blocks, key=lambda value: value.priority, reverse=True):
             if total <= available:
                 break
             if block.priority <= 10:
@@ -173,10 +202,26 @@ class PromptBuilder:
             active.remove(block)
             total -= block.token_estimate
             dropped.append(block.identifier)
+
+        # If optional blocks were insufficient, history may be reduced below the
+        # preferred recent-message floor. Core prompt blocks remain intact.
         while history and total > available:
             removed = history.pop(0)
             total -= estimate_tokens(str(removed.get("content", "")))
             dropped.append("history:oldest")
+
+        # Hard-limit fallback for abnormally large core data. Main Prompt and
+        # blocks explicitly protected with priority <= 10 are never removed.
+        if total > available:
+            core_fallback = [block for block in active if block.identifier in self.CORE_BLOCKS]
+            for block in sorted(core_fallback, key=lambda value: value.priority, reverse=True):
+                if total <= available:
+                    break
+                if block.priority <= 10 or block.identifier in {"main", "astrbot_system"}:
+                    continue
+                active.remove(block)
+                total -= block.token_estimate
+                dropped.append(block.identifier)
 
         system_blocks = [block for block in active if block.position == "system" and block.role == "system"]
         system_prompt = "\n\n".join(block.content for block in system_blocks)

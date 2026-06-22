@@ -18,7 +18,7 @@ from astrbot_plugin_komeiji_tavern.qq_delivery import split_forward_text
 from astrbot_plugin_komeiji_tavern.storage import TavernStorage
 from astrbot_plugin_komeiji_tavern.service import TavernService
 from astrbot_plugin_komeiji_tavern.web import TavernWebApi
-from astrbot_plugin_komeiji_tavern.main import KomeijiTavernPlugin
+from astrbot_plugin_komeiji_tavern.main import KomeijiTavernPlugin, _flatten_config
 from astrbot_plugin_komeiji_tavern.illustration import OmniDrawBridge
 from astrbot.api.message_components import Nodes, Plain
 from astrbot.core.message.message_event_result import MessageEventResult
@@ -33,6 +33,15 @@ def entry(uid, keys, content, **extra):
 
 
 class CoreTests(unittest.TestCase):
+    def test_grouped_config_flattens_without_losing_values(self):
+        grouped = {
+            "context_config": {"history_max_messages": 12},
+            "qq_forward_config": {"qq_forward_nodes_per_batch": 12},
+        }
+        flattened = _flatten_config(grouped)
+        self.assertEqual(flattened["history_max_messages"], 12)
+        self.assertEqual(flattened["qq_forward_nodes_per_batch"], 12)
+
     def test_qq_direct_split_sends_plain_messages_and_clears_result(self):
         class Result:
             def __init__(self):
@@ -378,6 +387,52 @@ class CoreTests(unittest.TestCase):
         self.assertTrue(any(item.get("_kt_example") for item in result.contexts))
         self.assertEqual(result.messages[-1], {"role": "user", "content": "now"})
 
+
+    def test_budget_trims_old_history_before_character(self):
+        builder = PromptBuilder(
+            context_budget=2048,
+            output_reserve=256,
+            history_first_trimming=True,
+            history_keep_recent_messages=2,
+        )
+        history = [
+            {"role": "user" if index % 2 == 0 else "assistant", "content": "old " * 300}
+            for index in range(8)
+        ]
+        result = builder.build(
+            original_system="main",
+            contexts=history,
+            current_prompt="now",
+            preset={},
+            character={"description": "character identity " * 40},
+            persona="persona identity",
+            lore=ScanResult(),
+            values={"user": "User", "char": "Character"},
+        )
+        self.assertIn("history:oldest", result.dropped)
+        self.assertNotIn("character", result.dropped)
+        self.assertIn("character identity", result.system_prompt)
+        self.assertGreaterEqual(len(result.contexts), 2)
+
+    def test_history_message_limit_keeps_latest_messages(self):
+        builder = PromptBuilder(history_max_messages=4)
+        history = [
+            {"role": "user", "content": f"message-{index}"}
+            for index in range(10)
+        ]
+        result = builder.build(
+            original_system="main",
+            contexts=history,
+            current_prompt="now",
+            preset={},
+            character=None,
+            persona="",
+            lore=ScanResult(),
+            values={"user": "User", "char": "Character"},
+        )
+        sent_history = [item["content"] for item in result.contexts]
+        self.assertEqual(sent_history, ["message-6", "message-7", "message-8", "message-9"])
+        self.assertEqual(result.dropped.count("history:max_messages"), 6)
 
     def test_storage_persistence_and_bindings(self):
         with tempfile.TemporaryDirectory() as directory:

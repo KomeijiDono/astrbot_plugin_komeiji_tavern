@@ -30,6 +30,9 @@ class TavernService:
         self.builder = PromptBuilder(
             context_budget=int(config.get("context_budget", 32768)),
             output_reserve=int(config.get("output_reserve", 2048)),
+            history_first_trimming=bool(config.get("history_first_trimming", True)),
+            history_keep_recent_messages=int(config.get("history_keep_recent_messages", 6)),
+            history_max_messages=int(config.get("history_max_messages", 0)),
         )
         self._embedding_cache: OrderedDict[str, list[float]] = OrderedDict()
         self._embedding_cache_limit = 512

@@ -25,13 +25,27 @@ DISPLAY_NAME = "Komeiji's Tavern"
 DESCRIPTION = "为 AstrBot 提供角色卡、提示词编排、世界书、创作素材与最终请求预览的一体化角色扮演工具。"
 _STATE_JSON = re.compile(r"\[TAVERN_STATE\]\s*(\{.*?\})\s*$", re.DOTALL)
 _STATE_FIELDS = re.compile(r"\[LOVE_DATA\]\s*(.+)$", re.MULTILINE)
+_CONFIG_GROUPS = (
+    "basic_config", "context_config", "worldbook_config", "qq_direct_config",
+    "qq_forward_config", "status_config", "illustration_config",
+)
 
 
-@register(PLUGIN_ID, "KomeijiDono", DESCRIPTION, "0.3.6")
+def _flatten_config(config: dict[str, Any] | None) -> dict[str, Any]:
+    """Accept both legacy flat config and Dashboard grouped config."""
+    flattened = dict(config or {})
+    for group in _CONFIG_GROUPS:
+        values = flattened.get(group)
+        if isinstance(values, dict):
+            flattened.update(values)
+    return flattened
+
+
+@register(PLUGIN_ID, "KomeijiDono", DESCRIPTION, "0.3.9")
 class KomeijiTavernPlugin(Star):
     def __init__(self, context: Context, config: dict[str, Any] | None = None):
         super().__init__(context)
-        self.config = config or {}
+        self.config = _flatten_config(config)
         data_dir = Path.home() / ".astrbot" / "data" / PLUGIN_ID
         self.storage = TavernStorage(data_dir / "tavern.db")
         self.service = TavernService(self.storage, context, self.config)
@@ -277,7 +291,7 @@ class KomeijiTavernPlugin(Star):
         if action == "status":
             state = await asyncio.to_thread(self.storage.get_session, session_id)
             yield event.plain_result(
-                f"Komeiji's Tavern 0.3.6\n会话：{session_id}\n轮次：{state.get('turn', 0)}\n"
+                f"Komeiji's Tavern 0.3.9\n会话：{session_id}\n轮次：{state.get('turn', 0)}\n"
                 f"生命周期记录：{len(state.get('effects', {}))}\n可在插件管理页查看绑定和最终 messages[]。"
             )
             return

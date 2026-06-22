@@ -2,9 +2,25 @@
 
 Komeiji's Tavern 是 AstrBot 的角色扮演提示词编排插件。它负责管理角色卡、用户设定、提示词预设、世界书和会话生命周期，并展示某次请求最终发送给模型的 `messages[]`。
 
-当前版本：`0.3.6`。仅支持 AstrBot Chat Completion 管线。
+当前版本：`0.3.9`。仅支持 AstrBot Chat Completion 管线。
 
 ## 版本更新记录
+
+### 0.3.9
+
+- Dashboard 插件配置改为深色层次分组，按上下文、世界书、QQ 发送、状态栏和自动配图分类。
+- 自动兼容旧版平铺配置；现有配置值迁移到分组结构后保持不变。
+
+### 0.3.8
+
+- 新增 `history_max_messages`，可限制每次请求只发送最近 N 条聊天历史；`0` 表示不限制。
+- 条数限制先于 token 预算裁剪执行，调试器会以 `history:max_messages` 标记因此移除的旧消息。
+
+### 0.3.7
+
+- 调整上下文裁剪顺序：默认先裁剪较旧聊天历史，同时优先保留最近 6 条消息。
+- 角色卡、性格、场景、Persona、摘要、记忆和 PHI 改为核心块；仅在历史已全部裁完仍超出硬上限时才作最终兜底裁剪。
+- 新增 `history_first_trimming` 和 `history_keep_recent_messages` 配置，可切换策略并调整近期消息保留数量。
 
 ### 0.3.6
 
@@ -285,7 +301,7 @@ tavern.db.v0.1.0.bak
 - `max_recursion_steps`：世界书最大递归次数。
 - `vector_enabled`：启用向量条目，默认关闭。
 - `embedding_provider_id`：向量条目使用的 AstrBot Embedding Provider。
-- `tool_delivery_enabled`：临时调整发送工具说明，引导模型通过工具发送正文。
+- `tool_delivery_enabled`：仅用于需要模型主动调用 `send_message_to_user` 的 Agent 场景。开启后会临时调整工具说明，引导模型把角色扮演正文放入工具调用；普通聊天可能出现正文为空或重复发送，建议保持关闭。
 - `qq_direct_split_enabled`：将 QQ 长回复拆成多条普通消息直接发送；开启时优先于合并转发。
 - `qq_direct_message_chars`：每条普通 QQ 消息的最大 Unicode 字符数。
 - `qq_direct_send_interval_ms`：相邻普通 QQ 消息的发送间隔，单位为毫秒。
