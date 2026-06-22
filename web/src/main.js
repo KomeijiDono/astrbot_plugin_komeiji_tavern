@@ -117,6 +117,7 @@ createApp({
     const binding = ref({ scope_type: 'session', scope_id: '', kind: 'character', target_id: '', priority: 0 })
     const debug = ref({ session_id: '', persona_id: '', prompt: '', system_prompt: '', mode: 'normal', quiet_prompt: '', seed: 1 })
     const debugResult = ref(null)
+    const formatTimestamp = value => value ? new Date(Number(value) * 1000).toLocaleString() : '无'
 
     const docsForTab = computed(() => documents.value.filter(x => x.kind === tab.value))
     const bindDocs = computed(() => documents.value.filter(x => x.kind === binding.value.kind))
@@ -365,7 +366,7 @@ createApp({
       setFile: e => file.value = e.target.files[0],
       updateScope, addBinding, unbind, scopeName, move, addBlock, keyText, setKeys,
       addEntry: () => selected.value.data.entries.push(newEntry()),
-      selectConversation, simulate, actual,
+      selectConversation, simulate, actual, formatTimestamp,
     }
   },
   template: `
@@ -374,7 +375,7 @@ createApp({
     <div class="brand">
       <small>ASTRBOT 角色扮演工作台</small>
       <h1>Komeiji's<br>Tavern</h1>
-      <span>v0.3.6</span>
+      <span>v0.4.0</span>
     </div>
     <button v-for="t in tabs" :class="{active:tab===t[0]}" @click="tab=t[0];selected=null">{{t[1]}}</button>
   </aside>
@@ -534,6 +535,21 @@ createApp({
           <span>角色：{{debugResult.effective.single?.character?.name||'无'}}</span>
           <span>世界书：{{debugResult.effective.additive?.lorebook?.map(x=>x.name).join('、')||'无'}}</span>
         </div>
+        <details v-if="debugResult.summary" open><summary>自动摘要状态</summary>
+          <div class="effective">
+            <span>状态：{{debugResult.summary.enabled?'已启用':'未启用'}}</span>
+            <span>来源：{{debugResult.summary.source}}</span>
+            <span>已覆盖：{{debugResult.summary.covered_messages||0}} 条</span>
+            <span>待处理：{{debugResult.summary.pending_messages||0}} 条</span>
+            <span>本轮生成：{{debugResult.summary.generated_this_request?'是':'否'}}</span>
+            <span>将触发：{{debugResult.summary.would_generate?'是':'否'}}</span>
+            <span>Provider：{{debugResult.summary.provider_id||'未指定'}}</span>
+            <span>已注入：{{debugResult.summary.included?'是':'否'}}</span>
+            <span>更新时间：{{formatTimestamp(debugResult.summary.updated_at)}}</span>
+          </div>
+          <pre v-if="debugResult.summary.content">{{debugResult.summary.content}}</pre>
+          <div class="alert error" v-if="debugResult.summary.error">{{debugResult.summary.error}}</div>
+        </details>
         <div class="alert error" v-for="w in debugResult.warnings">{{w}}</div>
         <div class="message" v-for="(m,i) in debugResult.messages"><b>{{i}} · {{m.role}}</b><pre>{{m.content}}</pre></div>
         <details open><summary>提示词块（{{debugResult.blocks?.length||0}}）</summary>

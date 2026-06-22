@@ -5,6 +5,8 @@ import copy
 import hashlib
 import math
 import random
+import json
+import time
 from collections import OrderedDict
 from typing import Any
 
@@ -16,6 +18,16 @@ from .prompt_builder import PromptBuilder
 from .storage import TavernStorage
 
 PLUGIN_TAG = "[Komeiji's Tavern]"
+DEFAULT_SUMMARY_PROMPT = """请把以下旧聊天记录压缩成可供后续角色扮演继续使用的会话摘要。
+保留人物关系、重要事实、事件顺序、承诺、状态变化、未解决事项和持续有效的偏好。
+不要续写剧情，不要添加原文没有的信息，不要输出标题之外的解释。
+
+已有摘要：
+{previous_summary}
+
+新增旧聊天记录：
+{history}
+"""
 
 
 class TavernService:
@@ -32,7 +44,7 @@ class TavernService:
             output_reserve=int(config.get("output_reserve", 2048)),
             history_first_trimming=bool(config.get("history_first_trimming", True)),
             history_keep_recent_messages=int(config.get("history_keep_recent_messages", 6)),
-            history_max_messages=int(config.get("history_max_messages", 0)),
+            history_max_messages=int(config.get("history_max_messages", 12)),
         )
         self._embedding_cache: OrderedDict[str, list[float]] = OrderedDict()
         self._embedding_cache_limit = 512
@@ -177,11 +189,152 @@ class TavernService:
         return entries
 
     @staticmethod
+    def _message_text(message: dict[str, Any]) -> str:
+        content = message.get("content", "")
+        if isinstance(content, list):
+            return "".join(
+                str(item.get("text", item.get("content", ""))) if isinstance(item, dict) else str(item)
+                for item in content
+            )
+        return str(content)
+
+    @classmethod
+    def _message_fingerprint(cls, message: dict[str, Any]) -> str:
+        payload = json.dumps(
+            {"role": str(message.get("role", "")), "content": cls._message_text(message)},
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def _unsummarized_history(
+        self, messages: list[dict[str, Any]], state: dict[str, Any]
+    ) -> list[dict[str, Any]]:
+        marker = str(state.get("history_summary", {}).get("covered_until", ""))
+        if not marker:
+            return list(messages)
+        marker_index = -1
+        for index, message in enumerate(messages):
+            if self._message_fingerprint(message) == marker:
+                marker_index = index
+        return list(messages[marker_index + 1:]) if marker_index >= 0 else list(messages)
+
+    async def _generate_history_summary(
+        self,
+        *,
+        session_id: str,
+        previous_summary: str,
+        messages: list[dict[str, Any]],
+    ) -> tuple[str, str]:
+        configured_id = str(self.config.get("summary_provider_id", "") or "").strip()
+        if configured_id:
+            provider = self.context.get_provider_by_id(configured_id)
+            if provider is None:
+                raise RuntimeError(f"找不到摘要 Provider: {configured_id}")
+            provider_id = configured_id
+        else:
+            provider = self.context.get_using_provider(session_id)
+            if provider is None:
+                raise RuntimeError("当前会话没有可用的摘要 Provider")
+            provider_id = str(getattr(provider, "provider_config", {}).get("id", "current"))
+
+        transcript = "\n".join(
+            f"{str(message.get('role', 'unknown')).upper()}: {self._message_text(message)}"
+            for message in messages
+        )
+        template = str(self.config.get("summary_prompt", DEFAULT_SUMMARY_PROMPT) or DEFAULT_SUMMARY_PROMPT)
+        prompt = template.replace("{previous_summary}", previous_summary or "（无）").replace("{history}", transcript)
+        timeout = max(1, int(self.config.get("summary_timeout_seconds", 60)))
+        response = await asyncio.wait_for(
+            provider.text_chat(
+                prompt=prompt,
+                max_tokens=max(128, int(self.config.get("summary_max_tokens", 1024))),
+                temperature=0.2,
+            ),
+            timeout=timeout,
+        )
+        summary = str(getattr(response, "completion_text", "") or "").strip()
+        if not summary:
+            raise RuntimeError("摘要 Provider 返回空内容")
+        return summary, provider_id
+
+    async def _prepare_history(
+        self,
+        messages: list[dict[str, Any]],
+        state: dict[str, Any],
+        *,
+        session_id: str,
+        generate: bool,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any], list[str], bool]:
+        enabled = bool(self.config.get("summary_enabled", False))
+        saved = state.get("history_summary", {}) if isinstance(state.get("history_summary"), dict) else {}
+        previous_summary = str(saved.get("content", "") or "")
+        unseen = self._unsummarized_history(messages, state) if enabled else list(messages)
+        keep = max(1, int(self.config.get("history_max_messages", 12) or 12))
+        trigger = max(keep + 1, int(self.config.get("summary_trigger_messages", 18)))
+        should_generate = enabled and len(unseen) >= trigger
+        warnings: list[str] = []
+        generated = False
+        failed = False
+        error = ""
+        provider_id = str(saved.get("provider_id", "") or "")
+        covered_count = int(saved.get("covered_messages", 0) or 0)
+
+        if should_generate and generate:
+            batch = unseen[:-keep]
+            try:
+                summary, provider_id = await self._generate_history_summary(
+                    session_id=session_id,
+                    previous_summary=previous_summary,
+                    messages=batch,
+                )
+                covered_count += len(batch)
+                saved = {
+                    "content": summary,
+                    "covered_until": self._message_fingerprint(batch[-1]),
+                    "covered_messages": covered_count,
+                    "updated_at": time.time(),
+                    "provider_id": provider_id,
+                }
+                state["history_summary"] = saved
+                previous_summary = summary
+                unseen = unseen[-keep:]
+                generated = True
+            except Exception as exc:
+                failed = True
+                error = str(exc) or type(exc).__name__
+                warnings.append(f"自动摘要失败，已按普通裁剪继续：{error}")
+                logger.warning("%s 自动摘要失败，已降级: %s", PLUGIN_TAG, error)
+        elif should_generate:
+            warnings.append("当前历史已达到自动摘要阈值；只读模拟不会调用摘要模型或推进摘要状态。")
+
+        metadata = {
+            "enabled": enabled,
+            "source": "session" if previous_summary else "none",
+            "content": previous_summary,
+            "covered_messages": covered_count,
+            "updated_at": saved.get("updated_at"),
+            "generated_this_request": generated,
+            "would_generate": should_generate and not generate,
+            "pending_messages": len(unseen),
+            "trigger_messages": trigger,
+            "keep_messages": keep,
+            "provider_id": provider_id,
+            "error": error,
+        }
+        # Once summary mode has a valid rolling state, covered history is already
+        # excluded. Before the first successful summary, retain legacy hard limits
+        # on failure and in read-only simulations.
+        skip_hard_limit = enabled and not failed and not (should_generate and not generate)
+        return unseen, metadata, warnings, not skip_hard_limit
+
+    @staticmethod
     def _serialize_result(
         result: BuildResult,
         scan: ScanResult,
         *,
         include_content: bool = False,
+        summary: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         blocks = []
         for block in result.blocks:
@@ -211,7 +364,7 @@ class TavernService:
                 item["content"] = match.entry.content
             activated.append(item)
 
-        return {
+        payload = {
             "messages": result.messages,
             "blocks": blocks,
             "dropped": result.dropped,
@@ -220,6 +373,12 @@ class TavernService:
             "outlets": scan.outlets,
             "token_estimation": "approximate",
         }
+        if summary is not None:
+            summary_payload = dict(summary)
+            if not include_content:
+                summary_payload.pop("content", None)
+            payload["summary"] = summary_payload
+        return payload
 
     async def process(self, event: Any, req: Any, *, mode: str = "normal", quiet_prompt: str = ""):
         scopes = self.scopes(event, req)
@@ -241,6 +400,9 @@ class TavernService:
             preset_doc = await asyncio.to_thread(self._bound_one, "preset", scopes)
             character_doc = await asyncio.to_thread(self._select_character, scopes, req.prompt or "", state)
             persona_doc = await asyncio.to_thread(self._bound_one, "persona", scopes)
+            history, summary_meta, summary_warnings, apply_history_limit = await self._prepare_history(
+                list(req.contexts or []), state, session_id=session_id, generate=True
+            )
             character = character_doc["data"] if character_doc else {}
             char_data = character.get("data", character)
             values = {
@@ -253,13 +415,20 @@ class TavernService:
                 **state.get("variables", {}),
             }
             result = self.builder.build(
-                original_system=req.system_prompt or "", contexts=list(req.contexts or []),
+                original_system=req.system_prompt or "", contexts=history,
                 current_prompt=req.prompt or "", preset=preset_doc["data"] if preset_doc else {},
                 character=character, persona=(persona_doc or {}).get("data", {}).get("content", ""),
                 lore=scan, values=values, mode=mode, quiet_prompt=quiet_prompt,
+                session_summary=str(summary_meta.get("content", "")),
+                apply_history_limit=apply_history_limit,
+            )
+            result.warnings.extend(summary_warnings)
+            summary_meta["included"] = bool(summary_meta.get("content")) and any(
+                block.identifier == "summary" and block.enabled and bool(block.content)
+                for block in result.blocks
             )
             await asyncio.to_thread(self.storage.save_session, session_id, state)
-            preview = self._serialize_result(result, scan)
+            preview = self._serialize_result(result, scan, summary=summary_meta)
             await asyncio.to_thread(self.storage.save_preview, session_id, preview)
         return result
 
@@ -273,6 +442,9 @@ class TavernService:
                 scopes.append((scope_type, value))
         state = copy.deepcopy(await asyncio.to_thread(self.storage.get_session, session_id))
         messages = [item for item in payload.get("contexts", []) if isinstance(item, dict)]
+        history, summary_meta, summary_warnings, apply_history_limit = await self._prepare_history(
+            messages, state, session_id=session_id, generate=False
+        )
         prompt = str(payload.get("prompt", ""))
         scan_messages = messages + ([{"role": "user", "content": prompt}] if prompt else [])
         entries = await self._collect_entries(scopes)
@@ -296,19 +468,25 @@ class TavernService:
             **state.get("variables", {}),
         }
         result = self.builder.build(
-            original_system=str(payload.get("system_prompt", "")), contexts=messages,
+            original_system=str(payload.get("system_prompt", "")), contexts=history,
             current_prompt=prompt, preset=(preset_doc or {}).get("data", {}),
             character=char_data, persona=(persona_doc or {}).get("data", {}).get("content", ""),
             lore=scan, values=values, mode=str(payload.get("mode", "normal")),
             quiet_prompt=str(payload.get("quiet_prompt", "")),
+            session_summary=str(summary_meta.get("content", "")),
+            apply_history_limit=apply_history_limit,
         )
-        warnings = list(result.warnings)
+        warnings = list(result.warnings) + summary_warnings
+        summary_meta["included"] = bool(summary_meta.get("content")) and any(
+            block.identifier == "summary" and block.enabled and bool(block.content)
+            for block in result.blocks
+        )
         if not preset_doc:
             warnings.append("当前作用域没有绑定提示词预设；原始 System Prompt 为空时，最终请求只会包含历史和用户消息。")
         if not character_doc:
             warnings.append("当前作用域没有绑定角色卡。")
         effective = await asyncio.to_thread(self.effective_bindings, scopes)
-        serialized = self._serialize_result(result, scan, include_content=True)
+        serialized = self._serialize_result(result, scan, include_content=True, summary=summary_meta)
         serialized.update({
             "warnings": warnings,
             "effective": effective,

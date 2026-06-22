@@ -1,6 +1,7 @@
 import asyncio
 import json
 import random
+import sqlite3
 import tempfile
 import unittest
 import base64
@@ -38,10 +39,14 @@ class CoreTests(unittest.TestCase):
         grouped = {
             "context_config": {"history_max_messages": 12},
             "qq_forward_config": {"qq_forward_nodes_per_batch": 12},
+            "summary_config": {"summary_enabled": True},
+            "lifecycle_config": {"session_retention_days": 30},
         }
         flattened = _flatten_config(grouped)
         self.assertEqual(flattened["history_max_messages"], 12)
         self.assertEqual(flattened["qq_forward_nodes_per_batch"], 12)
+        self.assertTrue(flattened["summary_enabled"])
+        self.assertEqual(flattened["session_retention_days"], 30)
 
     def test_qq_direct_split_sends_plain_messages_and_clears_result(self):
         class Result:
@@ -435,6 +440,16 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(sent_history, ["message-6", "message-7", "message-8", "message-9"])
         self.assertEqual(result.dropped.count("history:max_messages"), 6)
 
+    def test_session_summary_appends_to_static_summary_block(self):
+        result = PromptBuilder().build(
+            original_system="main", contexts=[], current_prompt="now",
+            preset={"summary": "static summary"}, character=None, persona="",
+            lore=ScanResult(), values={}, session_summary="rolling summary",
+        )
+        summary = next(block for block in result.blocks if block.identifier == "summary")
+        self.assertIn("static summary", summary.content)
+        self.assertIn("rolling summary", summary.content)
+
     def test_storage_persistence_and_bindings(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "state.db"
@@ -445,6 +460,35 @@ class CoreTests(unittest.TestCase):
             second = TavernStorage(path)
             self.assertEqual(second.get_session("s1")["turn"], 7)
             self.assertEqual(second.resolve_bindings("lorebook", [("session", "s1")])[0]["id"], document_id)
+
+    def test_storage_cleanup_uses_independent_cutoffs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            storage = TavernStorage(Path(directory) / "state.db")
+            document_id = storage.put_document("preset", "Keep", {})
+            storage.bind("global", "*", "preset", document_id)
+            with patch("astrbot_plugin_komeiji_tavern.storage.time.time", return_value=100.0):
+                storage.save_session("old", {"turn": 1})
+                storage.save_preview("old", {"messages": []})
+            with patch("astrbot_plugin_komeiji_tavern.storage.time.time", return_value=300.0):
+                storage.save_session("new", {"turn": 2})
+                storage.save_preview("new", {"messages": []})
+            with patch("astrbot_plugin_komeiji_tavern.storage.time.time", return_value=200.0):
+                storage.save_session("boundary", {"turn": 3})
+            with patch("astrbot_plugin_komeiji_tavern.storage.time.time", return_value=350.0):
+                storage.save_preview("boundary", {"messages": ["keep"]})
+            deleted = storage.cleanup_expired(session_cutoff=200.0, preview_cutoff=350.0)
+            self.assertEqual(deleted, {"sessions": 1, "previews": 2})
+            self.assertEqual(storage.get_session("new")["turn"], 2)
+            self.assertEqual(storage.get_session("boundary")["turn"], 3)
+            self.assertIsNotNone(storage.get_preview("boundary"))
+            self.assertIsNotNone(storage.get_document(document_id))
+            self.assertEqual(len(storage.list_bindings()), 1)
+            conn = sqlite3.connect(storage.path)
+            try:
+                indexes = {row[1] for row in conn.execute("pragma index_list(sessions)")}
+            finally:
+                conn.close()
+            self.assertIn("idx_sessions_updated_at", indexes)
 
     def test_binding_precedence(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -542,8 +586,14 @@ class CoreTests(unittest.TestCase):
 
     def test_runtime_constants_match_public_metadata(self):
         metadata = (Path(__file__).parents[1] / "metadata.yaml").read_text(encoding="utf-8")
+        readme = (Path(__file__).parents[1] / "README.md").read_text(encoding="utf-8")
+        changelog = (Path(__file__).parents[1] / "CHANGELOG.md").read_text(encoding="utf-8")
+        package = json.loads((Path(__file__).parents[1] / "web" / "package.json").read_text(encoding="utf-8"))
         self.assertIn(f"name: {PLUGIN_ID}", metadata)
         self.assertIn(f"version: {PLUGIN_VERSION}", metadata)
+        self.assertIn(f"version-{PLUGIN_VERSION}", readme)
+        self.assertIn(f"## {PLUGIN_VERSION}：", changelog)
+        self.assertEqual(package["version"], PLUGIN_VERSION)
         self.assertEqual(API_PREFIX, f"/{PLUGIN_ID}/v1")
         self.assertEqual(TavernWebApi.PREFIX, API_PREFIX)
 
@@ -754,6 +804,163 @@ class _FakeEmbeddingProvider:
         return self._vectors.get(text, [0.0, 0.0])
 
 
+class _FakeSummaryResponse:
+    def __init__(self, text):
+        self.completion_text = text
+
+
+class _FakeSummaryProvider:
+    def __init__(self, pid="summary", *, error=None):
+        self.provider_config = {"id": pid}
+        self.error = error
+        self.calls = []
+
+    async def text_chat(self, **kwargs):
+        self.calls.append(kwargs)
+        if self.error:
+            raise self.error
+        return _FakeSummaryResponse(f"summary-{len(self.calls)}")
+
+
+class _SlowSummaryProvider(_FakeSummaryProvider):
+    async def text_chat(self, **kwargs):
+        self.calls.append(kwargs)
+        await asyncio.sleep(2)
+        return _FakeSummaryResponse("late")
+
+
+class _FakeSummaryContext:
+    def __init__(self, provider):
+        self.provider = provider
+
+    def get_provider_by_id(self, provider_id):
+        return self.provider if self.provider.provider_config["id"] == provider_id else None
+
+    def get_using_provider(self, _session_id):
+        return self.provider
+
+
+class SummaryCompressionTests(unittest.TestCase):
+    @staticmethod
+    def messages(count):
+        return [
+            {"role": "user" if index % 2 == 0 else "assistant", "content": f"message-{index}"}
+            for index in range(count)
+        ]
+
+    def test_does_not_trigger_before_threshold(self):
+        provider = _FakeSummaryProvider()
+        with tempfile.TemporaryDirectory() as directory:
+            service = TavernService(TavernStorage(Path(directory) / "state.db"), _FakeSummaryContext(provider), {
+                "summary_enabled": True, "summary_trigger_messages": 18, "history_max_messages": 12,
+            })
+            history, meta, warnings, apply_limit = run(service._prepare_history(
+                self.messages(17), {}, session_id="s1", generate=True
+            ))
+            self.assertEqual(len(history), 17)
+            self.assertFalse(meta["generated_this_request"])
+            self.assertFalse(apply_limit)
+            self.assertFalse(warnings)
+            self.assertFalse(provider.calls)
+
+    def test_incremental_summary_updates_boundary_without_duplicates(self):
+        provider = _FakeSummaryProvider()
+        with tempfile.TemporaryDirectory() as directory:
+            service = TavernService(TavernStorage(Path(directory) / "state.db"), _FakeSummaryContext(provider), {
+                "summary_enabled": True, "summary_trigger_messages": 18, "history_max_messages": 12,
+                "summary_provider_id": "summary",
+            })
+            state = {}
+            first = self.messages(18)
+            history, meta, _, apply_limit = run(service._prepare_history(
+                first, state, session_id="s1", generate=True
+            ))
+            self.assertEqual(len(history), 12)
+            self.assertEqual(meta["covered_messages"], 6)
+            self.assertFalse(apply_limit)
+            second = first + self.messages(6)
+            for index, message in enumerate(second[18:], start=18):
+                message["content"] = f"message-{index}"
+            history, meta, _, _ = run(service._prepare_history(
+                second, state, session_id="s1", generate=True
+            ))
+            self.assertEqual(len(history), 12)
+            self.assertEqual(meta["covered_messages"], 12)
+            self.assertEqual(len(provider.calls), 2)
+            self.assertIn("summary-1", provider.calls[1]["prompt"])
+
+    def test_summary_failure_preserves_progress_and_uses_legacy_limit(self):
+        provider = _FakeSummaryProvider(error=RuntimeError("down"))
+        with tempfile.TemporaryDirectory() as directory:
+            service = TavernService(TavernStorage(Path(directory) / "state.db"), _FakeSummaryContext(provider), {
+                "summary_enabled": True, "summary_trigger_messages": 18, "history_max_messages": 12,
+            })
+            state = {}
+            history, meta, warnings, apply_limit = run(service._prepare_history(
+                self.messages(18), state, session_id="s1", generate=True
+            ))
+            self.assertEqual(len(history), 18)
+            self.assertTrue(apply_limit)
+            self.assertNotIn("history_summary", state)
+            self.assertIn("down", meta["error"])
+            self.assertTrue(warnings)
+
+    def test_configured_provider_missing_does_not_fallback(self):
+        provider = _FakeSummaryProvider("current")
+        with tempfile.TemporaryDirectory() as directory:
+            service = TavernService(TavernStorage(Path(directory) / "state.db"), _FakeSummaryContext(provider), {
+                "summary_enabled": True, "summary_trigger_messages": 18, "history_max_messages": 12,
+                "summary_provider_id": "missing",
+            })
+            _, meta, warnings, apply_limit = run(service._prepare_history(
+                self.messages(18), {}, session_id="s1", generate=True
+            ))
+            self.assertFalse(provider.calls)
+            self.assertIn("missing", meta["error"])
+            self.assertTrue(warnings)
+            self.assertTrue(apply_limit)
+
+    def test_summary_timeout_degrades(self):
+        provider = _SlowSummaryProvider()
+        with tempfile.TemporaryDirectory() as directory:
+            service = TavernService(TavernStorage(Path(directory) / "state.db"), _FakeSummaryContext(provider), {
+                "summary_enabled": True, "summary_trigger_messages": 18, "history_max_messages": 12,
+                "summary_timeout_seconds": 1,
+            })
+            state = {}
+            _, meta, warnings, apply_limit = run(service._prepare_history(
+                self.messages(18), state, session_id="s1", generate=True
+            ))
+            self.assertTrue(apply_limit)
+            self.assertTrue(warnings)
+            self.assertFalse(meta["generated_this_request"])
+            self.assertNotIn("history_summary", state)
+
+    def test_simulation_never_calls_summary_provider_or_persists_state(self):
+        provider = _FakeSummaryProvider()
+        with tempfile.TemporaryDirectory() as directory:
+            storage = TavernStorage(Path(directory) / "state.db")
+            preset_id = storage.put_document("preset", "Default", {"main_prompt": "base", "summary": "static"})
+            storage.bind("global", "*", "preset", preset_id)
+            messages = self.messages(20)
+            state = {
+                "turn": 0, "effects": {}, "variables": {},
+                "history_summary": {
+                    "content": "existing", "covered_until": TavernService._message_fingerprint(messages[0]),
+                    "covered_messages": 1, "updated_at": 100.0, "provider_id": "summary",
+                },
+            }
+            storage.save_session("s1", state)
+            service = TavernService(storage, _FakeSummaryContext(provider), {
+                "summary_enabled": True, "summary_trigger_messages": 18, "history_max_messages": 12,
+            })
+            result = run(service.simulate({"session_id": "s1", "contexts": messages, "prompt": "now"}))
+            self.assertFalse(provider.calls)
+            self.assertTrue(result["summary"]["would_generate"])
+            self.assertEqual(result["summary"]["content"], "existing")
+            self.assertEqual(storage.get_session("s1"), state)
+
+
 class _BoomEmbeddingProvider:
     provider_config = {"id": "emb"}
 
@@ -876,6 +1083,27 @@ class _MockEvent:
 
 
 class SessionConcurrencyTests(unittest.TestCase):
+    def test_process_persists_and_injects_generated_summary(self):
+        provider = _FakeSummaryProvider()
+        with tempfile.TemporaryDirectory() as d:
+            storage = TavernStorage(Path(d) / "state.db")
+            preset_id = storage.put_document("preset", "Default", {"main_prompt": "base", "summary": "static"})
+            storage.bind("global", "*", "preset", preset_id)
+            service = TavernService(storage, _FakeSummaryContext(provider), {
+                "summary_enabled": True, "summary_trigger_messages": 18, "history_max_messages": 12,
+            })
+            req = _MockReq()
+            req.contexts = SummaryCompressionTests.messages(18)
+            result = run(service.process(_MockEvent(), req))
+            state = storage.get_session("s1")
+            self.assertEqual(state["history_summary"]["content"], "summary-1")
+            summary = next(block for block in result.blocks if block.identifier == "summary")
+            self.assertIn("static", summary.content)
+            self.assertIn("summary-1", summary.content)
+            preview = storage.get_preview("s1")
+            self.assertTrue(preview["summary"]["generated_this_request"])
+            self.assertNotIn("content", preview["summary"])
+
     def test_concurrent_process_does_not_lose_turns(self):
         with tempfile.TemporaryDirectory() as d:
             storage = TavernStorage(Path(d) / "state.db")

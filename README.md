@@ -1,331 +1,141 @@
+<div align="center">
+
 # Komeiji's Tavern
 
-Komeiji's Tavern 是 AstrBot 的角色扮演提示词编排插件。它负责管理角色卡、用户设定、提示词预设、世界书和会话生命周期，并展示某次请求最终发送给模型的 `messages[]`。
+[![Version](https://img.shields.io/badge/version-0.4.0-7c5cff?style=for-the-badge)](CHANGELOG.md)
+[![AstrBot](https://img.shields.io/badge/AstrBot-4.25%2B-4f9cff?style=for-the-badge)](https://github.com/AstrBotDevs/AstrBot)
+[![License](https://img.shields.io/badge/license-AGPL--3.0-42b883?style=for-the-badge)](LICENSE)
 
-当前版本：`0.3.10`。仅支持 AstrBot Chat Completion 管线。
+面向 AstrBot Chat Completion 的角色扮演提示词编排、世界书和请求调试插件。
 
-## 版本更新记录
+</div>
 
-### 0.3.10
+## 功能特色
 
-- 统一真实生成与只读模拟的资料收集和调试结果序列化，模拟现已与真实请求一致地加载创作素材。
-- 集中管理插件 ID、显示名、运行时版本和 API 前缀，避免路径与状态信息发生漂移。
+- 可排序 Prompt Manager：角色卡、Persona、世界书、示例、作者注、摘要、记忆、PHI、Bias 和自定义块。
+- 世界书扫描：主次关键词、正则、递归、概率、Sticky、Cooldown、Delay、Outlet 和深度注入。
+- 会话级自动摘要：使用可选小模型压缩旧历史，将滚动摘要注入 Summary 块。
+- 上下文管理：固定历史条数、token 预算、近期消息保护和核心提示块保护。
+- 完整调试器：查看最终 `messages[]`、提示块、世界书激活原因、裁剪项、摘要状态和警告。
+- 资料管理：角色卡、提示词预设、世界书、用户设定、创作素材及会话绑定。
+- QQ 长回复：普通消息分片、分包合并转发、失败重试及自动降级。
+- 会话生命周期：自动清理过期插件状态和真实请求预览，不影响 AstrBot 聊天和资料。
 
-### 0.3.9
+完整版本记录见 [CHANGELOG.md](CHANGELOG.md)。
 
-- Dashboard 插件配置改为深色层次分组，按上下文、世界书、QQ 发送、状态栏和自动配图分类。
-- 自动兼容旧版平铺配置；现有配置值迁移到分组结构后保持不变。
+## 快速开始
 
-### 0.3.8
+1. 在 AstrBot 插件管理中安装并启用本插件。
+2. 打开管理页，创建或导入角色卡、提示词预设和世界书。
+3. 在“绑定管理”中把资料绑定到具体会话、Persona、用户、群组或全局。
+4. 使用调试器执行只读模拟，确认最终 `messages[]` 和世界书激活结果。
+5. 返回对应会话正常发送消息。
 
-- 新增 `history_max_messages`，可限制每次请求只发送最近 N 条聊天历史；`0` 表示不限制。
-- 条数限制先于 token 预算裁剪执行，调试器会以 `history:max_messages` 标记因此移除的旧消息。
-
-### 0.3.7
-
-- 调整上下文裁剪顺序：默认先裁剪较旧聊天历史，同时优先保留最近 6 条消息。
-- 角色卡、性格、场景、Persona、摘要、记忆和 PHI 改为核心块；仅在历史已全部裁完仍超出硬上限时才作最终兜底裁剪。
-- 新增 `history_first_trimming` 和 `history_keep_recent_messages` 配置，可切换策略并调整近期消息保留数量。
-
-### 0.3.6
-
-- `/tavern preview` 的大型本地 JSON 结果改走插件分包转发，避免 AstrBot 单 Node 转发失败。
-- 预览转发失败时自动降级为普通消息分片，且仍不会调用 LLM。
-- 修复 Dashboard 桥接层重复编码会话 ID，导致“最近真实请求”误报不存在的问题。
-
-### 0.3.5
-
-- 修复 `/tavern preview|status|reset` 返回本地结果后仍继续调用 LLM 的问题。
-- 未知 `/tavern` 子命令只显示用法，不再进入默认生成管线。
-
-### 0.3.4
-
-- QQ 长回复支持分包合并转发，每包默认最多 6 个 Node。
-- 合并转发失败时只将未发送内容自动降级为普通消息，避免回复整体丢失或重复。
-- 默认单 Node 调整为 1000 个 Unicode 字符，降低 OneBot 单次载荷。
-
-### 0.3.3
-
-- 修复 Web 特殊生成和会话重置绕过 session 锁导致的状态覆盖。
-- 自动配图改为正文发送完成后启动，避免图片先于正文或插入 QQ 分片中间。
-- 修复调试器手输会话 ID 后残留旧 Persona 的问题。
-- 补充仓库地址，使 AstrBot 内置插件更新功能可用。
-- 修复配图 data URL 的 MIME 类型和 Base64 校验。
-
-### 0.3.2
-
-- 优化 token 估算的中日韩文本系数，减少中文场景过早裁剪、更充分利用上下文。
-- 向量条目 embedding 增加 LRU 缓存与错误降级，避免重复 API 调用和 provider 异常阻断请求。
-- 配图新增 `illustration_max_concurrency` 配置项，限制并发生图任务数，防止打爆生图 Provider。
-- SQLite 存储调用全面异步化（`asyncio.to_thread`），不再阻塞事件循环。
-- 会话并发安全：per-session `asyncio.Lock` 保护 read-modify-write，并发请求不再覆盖轮次和生命周期状态。
-
-### 0.3.1
-
-- 绑定管理与调试器的会话选择改为可输入 combobox，支持搜索已有会话或直接输入任意会话 ID 绑定。
-- 补齐遗漏的版本号标注。
-
-### 0.3.0
-
-- 新增自动配图：每次 LLM 回复后可异步调用 `astrbot_plugin_omnidraw` 生成一张配图并补发到当前会话。
-- 软依赖 omnidraw，未安装或未激活时自动跳过；不修改文本回复流程。
-- 新增 7 个 `illustration_*` 配置项，支持开关、模式、尺寸、额度策略与提示词前缀。
-
-### 0.2.6
-
-- 支持将 `.txt` 和 `.md` 纯文本文件导入为提示词预设。
-- 自动去掉纯文本提示词首尾匹配的单层引号。
-- 导入后的文本作为 Main Prompt，并继续使用默认角色、世界书和 Persona 提示块。
-
-### 0.2.5
-
-- QQ 普通消息分片增加逐片日志和失败重试。
-- 支持配置重试次数与重试等待时间。
-- 当前测试参数调整为每片 1000 字、发送间隔 2000ms。
-
-### 0.2.4
-
-- 新增 QQ 长回复逐条普通消息发送模式，可通过插件配置与合并转发切换。
-- 支持设置每条普通消息的最大字符数和发送间隔。
-- 调整长回复发送钩子顺序，使 token 统计等附加文本一并参与分片。
-
-### 0.2.3
-
-- 新增非流式 QQ 长回复合并转发分片。
-- 支持配置合并转发触发字数和每个 Node 的最大字符数。
-- 分片优先使用段落、换行和句末边界，并保证正文字符不丢失。
-
-### 0.2.2
-
-- 调试器直接从绑定记录生成会话选项，不再完全依赖 AstrBot 会话目录响应。
-- 更新页面缓存版本，确保 Dashboard 加载最新脚本。
-
-### 0.2.1
-
-- 修复已绑定会话未出现在调试器下拉框的问题。
-- AstrBot 会话目录为空或读取失败时，使用插件绑定记录作为兜底。
-- 调试器自动选择已有绑定的会话，并显示当前有效配置。
-- 页面资源增加版本参数，避免 Dashboard 缓存旧脚本。
-
-### 0.2.0
-
-- 新增中文首次使用向导和配置状态概览。
-- 新增角色卡、提示词预设、世界书和用户设定专用编辑器。
-- 新增 AstrBot Persona、会话选择及完整绑定管理。
-- 新增只读扫描模拟、最终 `messages[]` 调试和真实请求查看。
-- 新增文档规范化、中文校验、复制以及未知导入字段合并导出。
-- 数据库增加版本记录，首次升级自动创建 `0.1.0` 备份。
-- 修复未绑定单选资料隐式使用资料库第一项的问题。
-- 增加角色卡 Main Prompt 和 PHI 覆盖策略。
-
-### 0.1.0
-
-- 首个可用版本。
-- 加入角色卡、角色组、提示词预设和世界书管理。
-- 加入递归扫描、生命周期、概率和聊天深度注入。
-- 加入创作素材、状态栏、特殊生成模式和最终请求预览。
-- 加入 AstrBot 原生 Dashboard 管理页面。
-
-更详细的版本变更同时记录在 `CHANGELOG.md`。
-
-## QQ 长回复分片
-
-插件设置提供“拆分 QQ 合并转发节点”“QQ 合并转发触发字数”和“每个 QQ 转发 Node 最大字数”。非流式纯文本回复超过触发值后，会在 AstrBot 自动包装前拆为多个 Node。默认每个 Node 最多 2500 个 Unicode 字符，中文、英文、标点和换行通常都各计 1 个字符。建议设置在 2000-3000；过高仍可能被 QQ 拒绝，内容审核导致的拒绝也无法靠分片解决。
-
-开启“QQ 长回复逐条直接发送”后，该模式优先于合并转发。插件会按“QQ 直接发送每条最大字数”拆分正文，通过普通 QQ 消息接口逐条发送，并按配置的毫秒间隔限速。关闭此开关后恢复合并转发 Node 模式。
-
-## 打开管理页
-
-登录 AstrBot 管理面板后进入：
-
-```text
-插件 → Komeiji's Tavern → Pages → dashboard
-```
-
-管理页使用 AstrBot Dashboard 的登录状态，不提供匿名入口。插件或页面升级后，需要在插件管理中重载一次插件。
-
-本机也可以在已经登录 Dashboard 的浏览器中直接访问：
+管理页地址：
 
 ```text
 http://127.0.0.1:6185/api/plug/astrbot_plugin_komeiji_tavern/v1/panel
 ```
 
-插件不单独监听网络端口。是否能从局域网或公网访问完全取决于 AstrBot Dashboard 的监听地址、防火墙和反向代理配置；所有页面和接口仍要求 Dashboard 身份认证，不提供匿名外部地址。
+端口以 AstrBot Dashboard 实际配置为准。管理接口复用 Dashboard 鉴权，不建议直接暴露到公网。
 
-## 第一次使用
+## 管理页工作流
 
-### 1. 准备角色
+- **角色卡**：编辑名称、描述、性格、场景、开场白、示例、Main Prompt 和 PHI。
+- **提示词预设**：调整块顺序、角色、注入位置、深度、裁剪优先级及覆盖规则。
+- **世界书**：配置关键词、扫描深度、递归、概率、生命周期和注入位置。
+- **用户设定**：维护 Persona 内容并映射 AstrBot Persona。
+- **绑定管理**：单选资料按“会话 > Persona > 用户 > 群组 > 全局”覆盖，世界书和素材叠加去重。
+- **调试器**：只读模拟不会推进轮次或生命周期；“最近真实请求”展示实际发送结果。
 
-打开“角色卡”，点击“新建角色卡”，或在页面右上角导入 JSON、YAML、YML、带角色卡元数据的 PNG。纯文本 `.txt` 和 `.md` 文件会作为提示词预设导入。
+## 自动摘要
 
-角色卡可以设置：
+自动摘要默认关闭。建议先在插件配置中选择成本较低、上下文足够的 Chat Completion Provider，再开启该功能。
 
-- 角色名称、描述、性格、场景和开场白
-- 示例对话
-- 角色 Main Prompt
-- 历史后指令（PHI）
+- 默认累计到 18 条未压缩历史时触发。
+- 生成摘要后保留最近 12 条历史，其余内容合并进会话滚动摘要。
+- 摘要与预设中的静态 Summary 内容合并，注入 Prompt Manager 的 `summary` 块。
+- 摘要 Provider 留空时使用当前会话 Provider；指定 Provider 不可用时不会静默换模型。
+- 摘要失败不会阻断聊天，也不会推进摘要边界；本轮退回普通历史裁剪。
+- 只读模拟不会调用摘要模型，只显示已有摘要并提示真实请求是否将触发摘要。
 
-导入操作只保存资料，不会立即影响聊天。导入完成后页面会进入绑定向导。
-
-### 2. 检查提示词预设
-
-“Default”预设会自动绑定到全局。提示词块可排序、启用或禁用，并可设置：
-
-- 消息角色：`system`、`user`、`assistant`
-- 注入位置：系统提示词、示例区、聊天深度
-- 聊天深度和裁剪优先级
-- 是否允许角色卡覆盖 Main Prompt 或 PHI
-
-优先级数值越高，超过上下文预算时越早被裁剪。主提示词等核心块默认受到保护。
-
-### 3. 创建世界书
-
-世界书条目支持：
-
-- 主关键词和次关键词的四种组合逻辑
-- 常驻、禁用、概率和排列顺序
-- 角色前、角色后、作者注、示例、聊天深度及 Outlet
-- 递归扫描、扫描深度和消息角色
-- Sticky、Cooldown、Delay 生命周期
-
-`Sticky` 表示激活后继续保持的轮数。`Cooldown` 从保持结束后开始计算，在此期间不能再次触发。`Delay` 表示会话开始后的前若干轮不允许触发。
-
-### 4. 绑定资料
-
-资料只有绑定后才生效。绑定页会直接列出 AstrBot 当前 Persona 和会话，不需要手工查找会话 ID。
-
-单选资源的覆盖顺序为：
-
-```text
-具体会话 > AstrBot Persona > 用户 > 群组 > 全局
-```
-
-角色卡、角色组、用户设定和提示词预设属于单选资源。世界书和创作素材会收集所有匹配作用域并叠加，同一文档只注入一次。
-
-未绑定的角色卡或用户设定不会因为排在资料库第一位而意外生效。默认提示词预设仍保持全局绑定。
-
-### 5. 调试最终请求
-
-打开“调试器”，选择真实会话并输入一条测试消息：
-
-- “只读模拟”使用固定随机种子构造请求，不写入会话状态。
-- “最近真实请求”显示该会话上一次实际发送给模型的请求。
-- 结果会列出最终 `messages[]`、每个提示词块、世界书激活原因、递归轮次、Outlet、裁剪项和警告。
-
-当前 token 数标记为近似估算；上下文超限时会先按块的裁剪优先级移除非核心块，再从最旧的聊天历史开始裁剪。
+如果预设禁用了 `summary` 块，摘要仍可保存，但不会发送给模型。可在调试器查看“已注入”状态。
 
 ## 特殊生成模式
 
 ```text
-/tavern continue [补充要求]       续写上一条助手回复
-/tavern impersonate [补充要求]    生成用户下一句话草稿
-/tavern quiet [静默提示词]         执行 Quiet Prompt
+/tavern continue [补充要求]
+/tavern impersonate [补充要求]
+/tavern quiet [静默提示词]
 ```
 
-管理页调试器也可以只读模拟这些模式。
+- `continue`：续写上一条 assistant 回复，不重复已有内容。
+- `impersonate`：以用户口吻草拟下一条用户消息。
+- `quiet`：在深度 0 注入临时提示词，不改变长期预设。
 
-## 自动配图
-
-0.3.0 起，插件可在每次 LLM 回复后自动生成一张配图并补发到当前会话，适合角色扮演场景的"每句话配一张图"。
-
-### 前置条件
-
-1. 安装并配置好 [`astrbot_plugin_omnidraw`](https://github.com/diaomin66/astrbot_plugin_omnidraw)（万象画卷）。
-2. 在 omnidraw 中至少配置一个可用的图像 Provider 节点，并确认 `/画 一只猫` 能正常出图。
-3. 建议开启 omnidraw 的副脑（`enable_optimizer`），它会把中文回复全文优化成更适合画图模型的英文提示词。
-
-### 工作方式
-
-- 文本回复照常走原 pipeline 发送（含 QQ 长回复分片）。
-- 同时在后台异步调用 omnidraw 的 `generate_images_for_plugin()` 生图，不阻塞文本。
-- 生图完成（几秒到两分钟）后，用 `event.send()` 单独补发一张图片，自然落在所有文本之后。
-- 配图失败时静默记日志，不打扰聊天。
-
-### 配置项
-
-| 配置项 | 默认 | 说明 |
-| :--- | :--- | :--- |
-| `illustration_enabled` | `false` | 启用自动配图。默认关闭，需显式开启。 |
-| `illustration_plugin_id` | `astrbot_plugin_omnidraw` | 要调用的生图插件 ID。 |
-| `illustration_mode` | `text2img` | 配图模式：`text2img` 文生图 / `selfie` 人设自拍。 |
-| `illustration_max_text_chars` | `600` | 传给生图的回复文本最大字符数，过长会被截断。 |
-| `illustration_size` | `""` | 配图默认尺寸，留空用 omnidraw 节点默认。 |
-| `illustration_consume_quota` | `false` | 是否走 omnidraw 权限检查并消耗用户每日额度。默认关闭，配图作为 bot 自动行为不扣额度。 |
-| `illustration_prompt_prefix` | `""` | 可选提示词前缀，会拼接到回复文本前再交给 omnidraw 副脑。 |
-| `illustration_max_concurrency` | `2` | 同时进行的后台配图任务上限，防止多会话并发打爆生图 Provider。推荐 1-3。 |
-
-### 注意事项
-
-- 每轮都生图会显著增加 API 调用量与成本，建议配合较便宜的图像模型。
-- `illustration_consume_quota=false` 时绕过 omnidraw 白名单与额度，适合 bot 自动行为；若希望统一计数则改为 `true`。
-- `selfie` 模式会使用 omnidraw 当前激活人设的参考图，适合固定角色的日常场景配图。
-- 配图输入为去掉状态栏标记后的纯叙事文本，按 `illustration_max_text_chars` 截断后送入副脑。
-
-## 状态和排错命令
+状态与调试命令：
 
 ```text
-/tavern status     查看当前会话轮次和生命周期记录
-/tavern preview    查看最近一次最终 messages[]
-/tavern reset      清除当前会话生命周期和预览状态
+/tavern status
+/tavern preview
+/tavern reset
 ```
 
-如果 `preview` 为空，请先确认：
-
-1. 插件已经启用并重载。
-2. 资料已经绑定到当前会话、Persona 或全局。
-3. 当前会话已实际触发过一次 LLM 请求。
-
-## 高级 JSON
-
-各编辑器底部保留折叠的“高级 JSON”区域，用于查看和修改未出现在普通表单中的扩展字段。
-
-点击“应用 JSON”只会把内容应用到当前表单，仍需点击“保存”。导出时插件以原始导入数据为基础合并已编辑字段，未知字段不会被普通表单主动删除。
-
-## 数据与备份
-
-数据库位于：
-
-```text
-data/astrbot_plugin_komeiji_tavern/tavern.db
-```
-
-从 `0.1.0` 首次升级时会在同目录生成：
-
-```text
-tavern.db.v0.1.0.bak
-```
-
-数据库保存资料、绑定、会话生命周期和请求预览。导入操作不会修改源文件，也不会读取其他插件目录。
+`reset` 只清除当前会话的插件生命周期、状态变量、滚动摘要和请求预览，不删除 AstrBot 聊天或绑定资料。
 
 ## 插件配置
 
-- `enabled`：启用提示词编排。
-- `context_budget`：无法取得模型上下文上限时使用的预算。
-- `output_reserve`：为模型回复预留的 token。
-- `scan_depth`：默认世界书扫描消息深度。
-- `max_recursion_steps`：世界书最大递归次数。
-- `vector_enabled`：启用向量条目，默认关闭。
-- `embedding_provider_id`：向量条目使用的 AstrBot Embedding Provider。
-- `tool_delivery_enabled`：仅用于需要模型主动调用 `send_message_to_user` 的 Agent 场景。开启后会临时调整工具说明，引导模型把角色扮演正文放入工具调用；普通聊天可能出现正文为空或重复发送，建议保持关闭。
-- `qq_direct_split_enabled`：将 QQ 长回复拆成多条普通消息直接发送；开启时优先于合并转发。
-- `qq_direct_message_chars`：每条普通 QQ 消息的最大 Unicode 字符数。
-- `qq_direct_send_interval_ms`：相邻普通 QQ 消息的发送间隔，单位为毫秒。
-- `qq_direct_retry_count`：单片普通消息发送失败后的重试次数。
-- `qq_direct_retry_delay_ms`：发送失败后的重试等待时间，单位为毫秒。
-- `qq_forward_split_enabled`：启用非流式 QQ 长回复的合并转发节点分片。
-- `qq_forward_trigger_chars`：回复超过多少 Unicode 字符后改用合并转发。
-- `qq_forward_node_chars`：每个 QQ 转发 Node 的最大 Unicode 字符数，建议设置为 800-1200。
-- `qq_forward_nodes_per_batch`：每个合并转发包的最大节点数，建议设置为 6-8。
-- `qq_forward_fallback_enabled`：转发失败后自动将尚未发送的内容降级为普通消息。
-- `status_bar_enabled`：解析回复中的状态变量。
-- `status_bar_template`：状态栏显示格式，使用 `{content}` 放置内容。
-- `illustration_enabled`：启用每次 LLM 回复后的自动配图（需安装 omnidraw）。
-- `illustration_plugin_id`：生图插件 ID，默认 `astrbot_plugin_omnidraw`。
-- `illustration_mode`：配图模式，`text2img` 或 `selfie`。
-- `illustration_max_text_chars`：传入生图的回复最大字符数，默认 600。
-- `illustration_size`：配图默认尺寸，留空用 omnidraw 节点默认。
-- `illustration_consume_quota`：配图是否消耗 omnidraw 用户额度，默认 false。
-- `illustration_prompt_prefix`：配图提示词前缀，可选。
-- `illustration_max_concurrency`：配图最大并发数，默认 2，防止多会话并发打爆生图 Provider。
+配置页按功能分组：
 
-向量条目未配置有效 Embedding Provider 时会跳过，并在请求调试结果中显示警告。
+- **基础功能**：插件开关、发送工具引导。普通聊天建议关闭发送工具引导。
+- **上下文与裁剪**：上下文预算、输出预留、历史条数与裁剪顺序。
+- **自动摘要与历史压缩**：Provider、触发条数、输出上限、超时和提示词。
+- **会话数据生命周期**：自动清理、状态保留天数、预览保留天数和检查间隔。
+- **世界书与向量**：扫描深度、递归和 Embedding Provider。
+- **QQ 普通消息分片 / 合并转发**：长回复发送策略。
+- **状态栏 / 自动配图**：可选创作扩展。
+
+默认生命周期策略：会话状态保留 30 天，请求预览保留 7 天，每 24 小时检查一次。
+
+## 导入与数据
+
+- 支持 JSON、YAML、PNG 角色卡以及纯文本提示词预设。
+- 导入时保留未知原始字段，导出时与已编辑字段合并。
+- SQLite 文件位于 `data/astrbot_plugin_komeiji_tavern/tavern.db`。
+- 自动清理仅删除 `sessions` 和 `previews` 中的过期行，不删除 documents、bindings 或聊天数据。
+- SQLite 页面会被后续数据复用，插件不会在运行时自动执行 `VACUUM`。
+
+## 常见问题
+
+### 最终请求只有用户消息
+
+检查会话是否绑定了提示词预设和角色卡，并在调试器中确认“有效绑定”。未绑定时插件不会任意选择资料库第一项。
+
+### 模型不遵守尾部格式
+
+先检查调试器中的 system 指令是否存在，再减少历史消息条数或启用自动摘要。上下文未超限也可能因注意力稀释而漏遵循格式。
+
+### 自动摘要没有运行
+
+确认已开启功能、未压缩历史达到触发条数，并且摘要 Provider 可用。调试器会显示是否将触发及最近错误。
+
+### QQ 长回复发送失败
+
+降低每个 Node 或普通消息分片字符数；合并转发失败时可启用自动降级，或改用逐条普通消息发送。
+
+## 开发与验证
+
+```powershell
+$env:PYTHONPATH='E:\AstrBot_plugin;E:\AstrBot\backend\app'
+E:\AstrBot\backend\python\python.exe -m unittest discover -s tests -v
+
+cd web
+npm ci
+npm run build
+```
+
+发布前应校验 Python 语法、配置 JSON、前端构建、版本一致性和完整测试。
+
+## 许可证
+
+本项目使用 [GNU AGPL v3](LICENSE)。

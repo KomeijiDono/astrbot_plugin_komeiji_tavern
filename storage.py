@@ -11,7 +11,7 @@ from typing import Any, Iterable
 
 
 class TavernStorage:
-    SCHEMA_VERSION = 2
+    SCHEMA_VERSION = 3
 
     def __init__(self, path: str | Path):
         self.path = Path(path)
@@ -58,6 +58,8 @@ class TavernStorage:
             session_id TEXT PRIMARY KEY, payload TEXT NOT NULL,
             updated_at REAL NOT NULL
         );
+        CREATE INDEX IF NOT EXISTS idx_sessions_updated_at ON sessions(updated_at);
+        CREATE INDEX IF NOT EXISTS idx_previews_updated_at ON previews(updated_at);
         CREATE TABLE IF NOT EXISTS schema_meta (
             key TEXT PRIMARY KEY, value TEXT NOT NULL
         );
@@ -227,3 +229,19 @@ class TavernStorage:
         with self._connection() as conn:
             row = conn.execute("SELECT payload FROM previews WHERE session_id=?", (session_id,)).fetchone()
         return json.loads(row["payload"]) if row else None
+
+    def cleanup_expired(
+        self,
+        *,
+        session_cutoff: float | None = None,
+        preview_cutoff: float | None = None,
+    ) -> dict[str, int]:
+        deleted = {"sessions": 0, "previews": 0}
+        with self._lock, self._connection() as conn:
+            if session_cutoff is not None:
+                result = conn.execute("DELETE FROM sessions WHERE updated_at < ?", (session_cutoff,))
+                deleted["sessions"] = int(result.rowcount)
+            if preview_cutoff is not None:
+                result = conn.execute("DELETE FROM previews WHERE updated_at < ?", (preview_cutoff,))
+                deleted["previews"] = int(result.rowcount)
+        return deleted

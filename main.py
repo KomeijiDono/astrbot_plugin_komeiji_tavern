@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import time
 from pathlib import Path
 from typing import Any
 
@@ -25,7 +26,8 @@ _STATE_JSON = re.compile(r"\[TAVERN_STATE\]\s*(\{.*?\})\s*$", re.DOTALL)
 _STATE_FIELDS = re.compile(r"\[LOVE_DATA\]\s*(.+)$", re.MULTILINE)
 _CONFIG_GROUPS = (
     "basic_config", "context_config", "worldbook_config", "qq_direct_config",
-    "qq_forward_config", "status_config", "illustration_config",
+    "qq_forward_config", "status_config", "illustration_config", "summary_config",
+    "lifecycle_config",
 )
 
 
@@ -49,15 +51,52 @@ class KomeijiTavernPlugin(Star):
         self.service = TavernService(self.storage, context, self.config)
         self.web = TavernWebApi(self.storage, self.service, context, Path(__file__).parent / "web" / "dist")
         self.illustration = OmniDrawBridge(context, self.config)
+        self._cleanup_task: asyncio.Task | None = None
 
     async def initialize(self) -> None:
         self.service.ensure_defaults()
+        if self.config.get("cleanup_enabled", True):
+            await self._cleanup_expired()
+            self._cleanup_task = asyncio.create_task(self._cleanup_loop())
         for path, methods, handler, description in self.web.routes():
             self.context.register_web_api(path, handler, methods, description)
         logger.info("[%s] initialized", DISPLAY_NAME)
 
     async def terminate(self) -> None:
+        if self._cleanup_task is not None:
+            self._cleanup_task.cancel()
+            try:
+                await self._cleanup_task
+            except asyncio.CancelledError:
+                pass
         await self.illustration.terminate()
+
+    async def _cleanup_expired(self) -> dict[str, int]:
+        now = time.time()
+        session_days = max(1, int(self.config.get("session_retention_days", 30)))
+        preview_days = max(1, int(self.config.get("preview_retention_days", 7)))
+        deleted = await asyncio.to_thread(
+            self.storage.cleanup_expired,
+            session_cutoff=now - session_days * 86400,
+            preview_cutoff=now - preview_days * 86400,
+        )
+        if deleted["sessions"] or deleted["previews"]:
+            logger.info(
+                "[%s] 已清理过期会话状态 %d 条、请求预览 %d 条",
+                DISPLAY_NAME, deleted["sessions"], deleted["previews"],
+            )
+        return deleted
+
+    async def _cleanup_loop(self) -> None:
+        interval = max(1, int(self.config.get("cleanup_interval_hours", 24))) * 3600
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                await self._cleanup_expired()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning("[%s] 自动清理失败，将在下个周期重试：%s", DISPLAY_NAME, exc)
 
     @staticmethod
     def _session_id(event: AstrMessageEvent, req: ProviderRequest | None = None) -> str:

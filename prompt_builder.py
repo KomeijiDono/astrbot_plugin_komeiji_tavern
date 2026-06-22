@@ -44,7 +44,7 @@ class PromptBuilder:
         output_reserve: int = 2048,
         history_first_trimming: bool = True,
         history_keep_recent_messages: int = 6,
-        history_max_messages: int = 0,
+        history_max_messages: int = 12,
     ):
         self.context_budget = max(2048, context_budget)
         self.output_reserve = max(256, output_reserve)
@@ -97,6 +97,8 @@ class PromptBuilder:
         values: dict[str, Any],
         mode: str = "normal",
         quiet_prompt: str = "",
+        session_summary: str = "",
+        apply_history_limit: bool = True,
     ) -> BuildResult:
         preset = preset or {}
         char_blocks = self._character_blocks(character or {})
@@ -173,12 +175,15 @@ class PromptBuilder:
 
         for block in blocks:
             block.content = self.macros.render(block.content, values).strip()
+            if block.identifier == "summary" and session_summary.strip():
+                generated = f"[会话自动摘要]\n{session_summary.strip()}"
+                block.content = f"{block.content}\n\n{generated}".strip()
             block.token_estimate = estimate_tokens(block.content)
 
         active = [block for block in blocks if block.enabled and block.content]
         history = copy.deepcopy(contexts or [])
         dropped: list[str] = []
-        if self.history_max_messages and len(history) > self.history_max_messages:
+        if apply_history_limit and self.history_max_messages and len(history) > self.history_max_messages:
             removed_count = len(history) - self.history_max_messages
             history = history[-self.history_max_messages:]
             dropped.extend(["history:max_messages"] * removed_count)

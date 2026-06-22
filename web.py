@@ -7,7 +7,7 @@ from typing import Any, Awaitable, Callable
 
 from quart import Response, jsonify, request
 
-from .constants import API_PREFIX
+from .constants import API_PREFIX, PLUGIN_VERSION
 from .importers import export_document, parse_binary_payload, parse_payload, preview_import, read_material_sqlite
 from .documents import normalize_document, validate_document
 from .service import TavernService
@@ -241,7 +241,7 @@ class TavernWebApi:
             tasks.append("把角色绑定到 Persona 或会话")
         if counts.get("lorebook") and not any(item["kind"] == "lorebook" for item in bindings):
             tasks.append("已有世界书尚未绑定")
-        return self.ok({"version": "0.3.6", "counts": counts, "bindings": len(bindings),
+        return self.ok({"version": PLUGIN_VERSION, "counts": counts, "bindings": len(bindings),
                         "tasks": tasks, "ready": not tasks})
 
     async def personas(self):

@@ -37,7 +37,7 @@
         "description": "最多发送聊天历史消息数",
         "hint": "只发送最近 N 条聊天记录；不计算本次用户消息和插件注入消息。0 表示不限制，12 通常约为 6 轮。",
         "type": "int",
-        "default": 0
+        "default": 12
       },
       "history_first_trimming": {
         "description": "优先裁剪旧聊天历史",
@@ -50,6 +50,76 @@
         "hint": "第一阶段不会删除这些最近消息；若仍超出硬上限则继续裁剪。建议 4-10。",
         "type": "int",
         "default": 6
+      }
+    }
+  },
+  "summary_config": {
+    "description": "自动摘要与历史压缩",
+    "hint": "用独立小模型把较旧聊天合并进会话摘要，并注入 Prompt Manager 的 Summary 块。默认关闭。",
+    "type": "object",
+    "items": {
+      "summary_enabled": {
+        "description": "启用自动摘要",
+        "hint": "开启后会产生额外模型调用。建议先选择成本较低、上下文足够的小模型。",
+        "type": "bool",
+        "default": false
+      },
+      "summary_provider_id": {
+        "description": "摘要 Provider ID",
+        "hint": "留空使用当前会话 Provider；填写后若该 Provider 不可用会直接降级，不会静默切换模型。",
+        "type": "string",
+        "_special": "select_provider",
+        "default": ""
+      },
+      "summary_trigger_messages": {
+        "description": "触发摘要的未压缩消息数",
+        "hint": "必须大于“最多发送聊天历史消息数”。默认 18，配合保留 12 条时每次压缩最旧 6 条。",
+        "type": "int",
+        "default": 18
+      },
+      "summary_max_tokens": {
+        "description": "摘要最大输出 token",
+        "type": "int",
+        "default": 1024
+      },
+      "summary_timeout_seconds": {
+        "description": "摘要调用超时（秒）",
+        "type": "int",
+        "default": 60
+      },
+      "summary_prompt": {
+        "description": "摘要提示词",
+        "hint": "支持 {previous_summary} 和 {history} 占位符。",
+        "type": "text",
+        "default": "请把以下旧聊天记录压缩成可供后续角色扮演继续使用的会话摘要。\n保留人物关系、重要事实、事件顺序、承诺、状态变化、未解决事项和持续有效的偏好。\n不要续写剧情，不要添加原文没有的信息，不要输出标题之外的解释。\n\n已有摘要：\n{previous_summary}\n\n新增旧聊天记录：\n{history}\n"
+      }
+    }
+  },
+  "lifecycle_config": {
+    "description": "会话数据生命周期",
+    "hint": "自动清理不活跃的插件状态和调试预览，不会删除 AstrBot 聊天、角色资料或绑定。",
+    "type": "object",
+    "items": {
+      "cleanup_enabled": {
+        "description": "启用自动过期清理",
+        "type": "bool",
+        "default": true
+      },
+      "session_retention_days": {
+        "description": "会话状态保留天数",
+        "hint": "过期后会重置世界书生命周期、状态变量和滚动摘要。",
+        "type": "int",
+        "default": 30
+      },
+      "preview_retention_days": {
+        "description": "真实请求预览保留天数",
+        "type": "int",
+        "default": 7
+      },
+      "cleanup_interval_hours": {
+        "description": "清理检查间隔（小时）",
+        "type": "int",
+        "default": 24
       }
     }
   },
