@@ -11,7 +11,7 @@ from typing import Any, Iterable
 
 
 class TavernStorage:
-    SCHEMA_VERSION = 3
+    SCHEMA_VERSION = 4
 
     def __init__(self, path: str | Path):
         self.path = Path(path)
@@ -58,6 +58,38 @@ class TavernStorage:
             session_id TEXT PRIMARY KEY, payload TEXT NOT NULL,
             updated_at REAL NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS memories (
+            id TEXT PRIMARY KEY,
+            scope_type TEXT NOT NULL,
+            scope_id TEXT NOT NULL,
+            category TEXT NOT NULL,
+            content TEXT NOT NULL,
+            embedding TEXT NOT NULL DEFAULT '[]',
+            enabled INTEGER NOT NULL DEFAULT 1,
+            source_session_id TEXT NOT NULL DEFAULT '',
+            source_turn INTEGER NOT NULL DEFAULT 0,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_memories_scope ON memories(scope_type, scope_id, enabled, updated_at);
+        CREATE TABLE IF NOT EXISTS runtime_metrics (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            provider_id TEXT NOT NULL DEFAULT '',
+            mode TEXT NOT NULL DEFAULT 'normal',
+            prompt_tokens INTEGER NOT NULL DEFAULT 0,
+            message_count INTEGER NOT NULL DEFAULT 0,
+            block_count INTEGER NOT NULL DEFAULT 0,
+            worldbook_hits INTEGER NOT NULL DEFAULT 0,
+            summary_generated INTEGER NOT NULL DEFAULT 0,
+            summary_failed INTEGER NOT NULL DEFAULT 0,
+            memory_hits INTEGER NOT NULL DEFAULT 0,
+            warning_count INTEGER NOT NULL DEFAULT 0,
+            duration_ms INTEGER NOT NULL DEFAULT 0,
+            created_at REAL NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_runtime_metrics_created_at ON runtime_metrics(created_at);
+        CREATE INDEX IF NOT EXISTS idx_runtime_metrics_session ON runtime_metrics(session_id, created_at);
         CREATE INDEX IF NOT EXISTS idx_sessions_updated_at ON sessions(updated_at);
         CREATE INDEX IF NOT EXISTS idx_previews_updated_at ON previews(updated_at);
         CREATE TABLE IF NOT EXISTS schema_meta (
@@ -230,6 +262,162 @@ class TavernStorage:
             row = conn.execute("SELECT payload FROM previews WHERE session_id=?", (session_id,)).fetchone()
         return json.loads(row["payload"]) if row else None
 
+    def put_memory(
+        self,
+        *,
+        scope_type: str,
+        scope_id: str,
+        category: str,
+        content: str,
+        embedding: list[float] | None = None,
+        memory_id: str | None = None,
+        enabled: bool = True,
+        source_session_id: str = "",
+        source_turn: int = 0,
+    ) -> str:
+        memory_id = memory_id or str(uuid.uuid4())
+        now = time.time()
+        with self._lock, self._connection() as conn:
+            conn.execute(
+                """INSERT INTO memories(
+                    id,scope_type,scope_id,category,content,embedding,enabled,
+                    source_session_id,source_turn,created_at,updated_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(id) DO UPDATE SET
+                    scope_type=excluded.scope_type,scope_id=excluded.scope_id,
+                    category=excluded.category,content=excluded.content,
+                    embedding=excluded.embedding,enabled=excluded.enabled,
+                    source_session_id=excluded.source_session_id,
+                    source_turn=excluded.source_turn,updated_at=excluded.updated_at""",
+                (
+                    memory_id,
+                    scope_type,
+                    scope_id,
+                    category,
+                    content,
+                    json.dumps(embedding or []),
+                    1 if enabled else 0,
+                    source_session_id,
+                    int(source_turn or 0),
+                    now,
+                    now,
+                ),
+            )
+        return memory_id
+
+    def list_memories(
+        self,
+        *,
+        scope_type: str | None = None,
+        scope_id: str | None = None,
+        enabled: bool | None = None,
+        query: str | None = None,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if scope_type:
+            clauses.append("scope_type=?")
+            params.append(scope_type)
+        if scope_id:
+            clauses.append("scope_id=?")
+            params.append(scope_id)
+        if enabled is not None:
+            clauses.append("enabled=?")
+            params.append(1 if enabled else 0)
+        if query:
+            clauses.append("(content LIKE ? OR category LIKE ? OR scope_id LIKE ?)")
+            needle = f"%{query}%"
+            params.extend([needle, needle, needle])
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(max(1, int(limit)))
+        with self._connection() as conn:
+            rows = conn.execute(
+                "SELECT * FROM memories" + where + " ORDER BY updated_at DESC LIMIT ?",
+                params,
+            ).fetchall()
+        return [self._decode_memory(row) for row in rows]
+
+    def set_memory_enabled(self, memory_id: str, enabled: bool) -> bool:
+        with self._lock, self._connection() as conn:
+            result = conn.execute(
+                "UPDATE memories SET enabled=?,updated_at=? WHERE id=?",
+                (1 if enabled else 0, time.time(), memory_id),
+            )
+        return bool(result.rowcount)
+
+    def delete_memory(self, memory_id: str) -> bool:
+        with self._lock, self._connection() as conn:
+            result = conn.execute("DELETE FROM memories WHERE id=?", (memory_id,))
+        return bool(result.rowcount)
+
+    @staticmethod
+    def _decode_memory(row: sqlite3.Row) -> dict[str, Any]:
+        result = dict(row)
+        try:
+            result["embedding"] = json.loads(result.get("embedding") or "[]")
+        except json.JSONDecodeError:
+            result["embedding"] = []
+        result["enabled"] = bool(result.get("enabled"))
+        return result
+
+    def record_metric(self, payload: dict[str, Any]) -> str:
+        metric_id = str(payload.get("id") or uuid.uuid4())
+        created_at = float(payload.get("created_at") or time.time())
+        with self._lock, self._connection() as conn:
+            conn.execute(
+                """INSERT INTO runtime_metrics(
+                    id,session_id,provider_id,mode,prompt_tokens,message_count,
+                    block_count,worldbook_hits,summary_generated,summary_failed,
+                    memory_hits,warning_count,duration_ms,created_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    metric_id,
+                    str(payload.get("session_id", "")),
+                    str(payload.get("provider_id", "")),
+                    str(payload.get("mode", "normal") or "normal"),
+                    int(payload.get("prompt_tokens", 0) or 0),
+                    int(payload.get("message_count", 0) or 0),
+                    int(payload.get("block_count", 0) or 0),
+                    int(payload.get("worldbook_hits", 0) or 0),
+                    1 if payload.get("summary_generated") else 0,
+                    1 if payload.get("summary_failed") else 0,
+                    int(payload.get("memory_hits", 0) or 0),
+                    int(payload.get("warning_count", 0) or 0),
+                    int(payload.get("duration_ms", 0) or 0),
+                    created_at,
+                ),
+            )
+        return metric_id
+
+    def list_metrics(
+        self,
+        *,
+        session_id: str | None = None,
+        provider_id: str | None = None,
+        since: float | None = None,
+        limit: int = 500,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if session_id:
+            clauses.append("session_id=?")
+            params.append(session_id)
+        if provider_id:
+            clauses.append("provider_id=?")
+            params.append(provider_id)
+        if since is not None:
+            clauses.append("created_at>=?")
+            params.append(float(since))
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(max(1, int(limit)))
+        with self._connection() as conn:
+            rows = conn.execute(
+                "SELECT * FROM runtime_metrics" + where + " ORDER BY created_at DESC LIMIT ?",
+                params,
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def cleanup_expired(
         self,
         *,
@@ -244,4 +432,23 @@ class TavernStorage:
             if preview_cutoff is not None:
                 result = conn.execute("DELETE FROM previews WHERE updated_at < ?", (preview_cutoff,))
                 deleted["previews"] = int(result.rowcount)
+        return deleted
+
+    def cleanup_expired_extended(
+        self,
+        *,
+        session_cutoff: float | None = None,
+        preview_cutoff: float | None = None,
+        metric_cutoff: float | None = None,
+        memory_cutoff: float | None = None,
+    ) -> dict[str, int]:
+        deleted = self.cleanup_expired(session_cutoff=session_cutoff, preview_cutoff=preview_cutoff)
+        deleted.update({"metrics": 0, "memories": 0})
+        with self._lock, self._connection() as conn:
+            if metric_cutoff is not None:
+                result = conn.execute("DELETE FROM runtime_metrics WHERE created_at < ?", (metric_cutoff,))
+                deleted["metrics"] = int(result.rowcount)
+            if memory_cutoff is not None:
+                result = conn.execute("DELETE FROM memories WHERE updated_at < ?", (memory_cutoff,))
+                deleted["memories"] = int(result.rowcount)
         return deleted

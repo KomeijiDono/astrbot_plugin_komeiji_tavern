@@ -8,6 +8,15 @@ data/
 *.log
 .env
 .env.*
+cmd_config.json
+credentials.json
+secrets.json
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
 
 # Python caches and local environments
 __pycache__/

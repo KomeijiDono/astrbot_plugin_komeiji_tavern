@@ -95,6 +95,52 @@
       }
     }
   },
+  "memory_config": {
+    "description": "长期记忆",
+    "hint": "从 RP 对话中提取可跨会话检索的长期记忆，并通过 Prompt Manager 的 Memory 块注入。默认关闭。",
+    "type": "object",
+    "items": {
+      "memory_enabled": {
+        "description": "启用长期记忆",
+        "type": "bool",
+        "default": false
+      },
+      "memory_provider_id": {
+        "description": "记忆提取 Provider ID",
+        "hint": "留空时优先复用摘要 Provider，再使用当前会话 Provider。",
+        "type": "string",
+        "_special": "select_provider",
+        "default": ""
+      },
+      "memory_extract_interval": {
+        "description": "记忆提取间隔轮次",
+        "type": "int",
+        "default": 12
+      },
+      "memory_top_k": {
+        "description": "每次注入的记忆条数",
+        "type": "int",
+        "default": 5
+      },
+      "memory_retention_days": {
+        "description": "长期记忆保留天数",
+        "type": "int",
+        "default": 365
+      }
+    }
+  },
+  "metrics_config": {
+    "description": "运行仪表盘",
+    "hint": "记录真实请求的 token 估算、耗时、世界书命中和 Provider 调用量，用于管理台展示趋势。",
+    "type": "object",
+    "items": {
+      "metrics_retention_days": {
+        "description": "运行指标保留天数",
+        "type": "int",
+        "default": 30
+      }
+    }
+  },
   "lifecycle_config": {
     "description": "会话数据生命周期",
     "hint": "自动清理不活跃的插件状态和调试预览，不会删除 AstrBot 聊天、角色资料或绑定。",

@@ -48,6 +48,8 @@ const saveJson = (value, filename) => {
   saveBlob(new Blob([JSON.stringify(value, null, 2)], { type: 'application/json;charset=utf-8' }), filename)
 }
 
+const downloadLocationHint = '文件由浏览器下载，通常保存在系统“下载”文件夹；如果浏览器开启了“每次询问保存位置”，则保存到你选择的位置。'
+
 const labels = {
   character: '角色卡',
   preset: '提示词预设',
@@ -64,6 +66,8 @@ const tabs = [
   ['lorebook', '世界书'],
   ['persona', '用户设定'],
   ['bindings', '绑定管理'],
+  ['memories', '长期记忆'],
+  ['metrics', '运行仪表盘'],
   ['debug', '调试器'],
   ['help', '使用说明'],
 ]
@@ -119,6 +123,8 @@ createApp({
     const overview = ref({ counts: {}, tasks: [] })
     const documents = ref([])
     const bindings = ref([])
+    const memories = ref([])
+    const metrics = ref({ items: [], totals: {}, providers: {} })
     const personas = ref([])
     const conversations = ref([])
     const selected = ref(null)
@@ -133,8 +139,11 @@ createApp({
     const dQuery = ref('')
     const dOpen = ref(false)
     const dFocused = ref(false)
+    const memoryQuery = ref('')
+    const metricDays = ref(7)
 
     const binding = ref({ scope_type: 'session', scope_id: '', kind: 'character', target_id: '', priority: 0 })
+    const memoryDraft = ref({ id: '', scope_type: 'session', scope_id: '', category: 'status', content: '', enabled: true })
     const debug = ref({ session_id: '', persona_id: '', prompt: '', system_prompt: '', mode: 'normal', quiet_prompt: '', seed: 1 })
     const debugResult = ref(null)
     const formatTimestamp = value => value ? new Date(Number(value) * 1000).toLocaleString() : '无'
@@ -164,6 +173,14 @@ createApp({
       const q = dQuery.value.toLowerCase()
       return sessionOptions.value.filter(x => !q || (x.title + ' ' + x.id + ' ' + x.platform).toLowerCase().includes(q))
     })
+    const filteredMemories = computed(() => {
+      const q = memoryQuery.value.toLowerCase()
+      return memories.value.filter(x => !q || (x.content + ' ' + x.category + ' ' + x.scope_id).toLowerCase().includes(q))
+    })
+    const metricItems = computed(() => metrics.value.items || [])
+    const metricTotals = computed(() => metrics.value.totals || {})
+    const metricProviders = computed(() => Object.entries(metrics.value.providers || {}).sort((a, b) => b[1] - a[1]))
+    const maxMetricTokens = computed(() => Math.max(1, ...metricItems.value.map(x => Number(x.prompt_tokens || 0))))
 
     const sessionDisplay = computed({
       get() {
@@ -193,12 +210,16 @@ createApp({
           request('/bindings'),
           request('/catalog/personas'),
           request('/catalog/conversations?page_size=100'),
+          request('/memories?limit=300'),
+          request('/metrics?days=' + encodeURIComponent(metricDays.value) + '&limit=1000'),
         ])
         overview.value = x[0].data
         documents.value = x[1].data
         bindings.value = x[2].data
         personas.value = x[3].data
         conversations.value = x[4].data.items || []
+        memories.value = x[5].data
+        metrics.value = x[6].data
         if (!debug.value.session_id) {
           const bound = bindings.value.find(b => b.scope_type === 'session')
           if (bound) { debug.value.session_id = bound.scope_id; selectConversation() }
@@ -263,8 +284,9 @@ createApp({
     const runDownload = async action => {
       busy.value = true; clear()
       try {
-        saveDownload((await action()).data)
-        notice.value = '导出已开始。'
+        const payload = (await action()).data
+        saveDownload(payload)
+        notice.value = `已开始下载 ${payload.filename || '导出文件'}。${downloadLocationHint}`
       } catch (e) {
         error.value = e.message || '导出失败。'
       } finally {
@@ -281,8 +303,9 @@ createApp({
     const exportMessages = () => {
       if (!Array.isArray(debugResult.value?.messages)) { error.value = '当前没有可导出的 messages[]。'; return }
       const suffix = debug.value.session_id ? '-' + debug.value.session_id.replace(/[^a-zA-Z0-9_-]/g, '_') : ''
-      saveJson(debugResult.value.messages, 'messages' + suffix + '.json')
-      notice.value = 'messages[] 已导出。'
+      const filename = 'messages' + suffix + '.json'
+      saveJson(debugResult.value.messages, filename)
+      notice.value = `已开始下载 ${filename}。${downloadLocationHint}`
     }
 
     const backupSession = () => {
@@ -331,6 +354,52 @@ createApp({
       binding.value.scope_id = binding.value.scope_type === 'global' ? '*' : ''
       sQuery.value = ''
       sOpen.value = false
+    }
+
+    const updateMemoryScope = () => {
+      memoryDraft.value.scope_id = memoryDraft.value.scope_type === 'global' ? '*' : ''
+    }
+
+    const resetMemoryDraft = () => {
+      memoryDraft.value = { id: '', scope_type: 'session', scope_id: debug.value.session_id || '', category: 'status', content: '', enabled: true }
+    }
+
+    const saveMemory = async () => {
+      clear()
+      if (!memoryDraft.value.content.trim()) { error.value = '请填写记忆内容。'; return }
+      if (!memoryDraft.value.scope_id.trim()) { error.value = '请填写记忆作用域 ID。'; return }
+      const out = await post('/memories', memoryDraft.value)
+      await load()
+      resetMemoryDraft()
+      notice.value = out.data.warning || '长期记忆已保存。'
+    }
+
+    const editMemory = item => {
+      memoryDraft.value = {
+        id: item.id,
+        scope_type: item.scope_type,
+        scope_id: item.scope_id,
+        category: item.category,
+        content: item.content,
+        enabled: item.enabled,
+      }
+      tab.value = 'memories'
+    }
+
+    const toggleMemory = async item => {
+      await post('/memories/' + encodeURIComponent(item.id) + '/toggle', { enabled: !item.enabled })
+      await load()
+    }
+
+    const deleteMemory = async item => {
+      if (!confirm('确定删除这条长期记忆吗？')) return
+      await post('/memories/' + encodeURIComponent(item.id) + '/delete', {})
+      await load()
+    }
+
+    const refreshMetrics = async () => {
+      clear()
+      metrics.value = (await request('/metrics?days=' + encodeURIComponent(metricDays.value) + '&limit=1000')).data
     }
 
     const addBinding = async () => {
@@ -409,13 +478,18 @@ createApp({
 
     return {
       tabs, labels, tab, overview, documents, bindings, personas, selected, error, notice, busy,
-      advanced, binding, debug, debugResult, docsForTab, bindDocs, card, entries,
+      downloadLocationHint,
+      advanced, binding, memoryDraft, memoryQuery, memories, filteredMemories,
+      metricDays, metrics, metricItems, metricTotals, metricProviders, maxMetricTokens,
+      debug, debugResult, docsForTab, bindDocs, card, entries,
       sessionOptions, sFiltered, dFiltered, sessionDisplay, debugDisplay,
       sOpen, dOpen, pickSession, onSFocus, onSBlur, pickDebug, onDFocus, onDBlur,
       choose, createDoc, save, remove, duplicate, applyAdvanced, importData,
       exportSelected, exportKind, exportAll, exportMessages, backupSession,
       setFile: e => file.value = e.target.files[0],
-      updateScope, addBinding, unbind, scopeName, move, addBlock, keyText, setKeys,
+      updateScope, addBinding, unbind, scopeName, updateMemoryScope, resetMemoryDraft,
+      saveMemory, editMemory, toggleMemory, deleteMemory, refreshMetrics,
+      move, addBlock, keyText, setKeys,
       addEntry: () => selected.value.data.entries.push(newEntry()),
       selectConversation, simulate, actual, formatTimestamp,
     }
@@ -426,14 +500,29 @@ createApp({
     <div class="brand">
       <small>ASTRBOT 角色扮演工作台</small>
       <h1>Komeiji's<br>Tavern</h1>
-      <span>v0.4.1</span>
+      <span>v0.5.0</span>
     </div>
     <button v-for="t in tabs" :class="{active:tab===t[0]}" @click="tab=t[0];selected=null">{{t[1]}}</button>
   </aside>
   <main>
     <header>
       <div><h2>{{tabs.find(x=>x[0]===tab)?.[1]}}</h2><p>创建或导入 → 编辑 → 绑定 → 扫描测试 → 检查 messages[]</p></div>
-      <label class="import"><input type="file" accept=".json,.yaml,.yml,.png,.txt,.md" @change="setFile"><button @click="importData" :disabled="busy">解析并导入</button></label>
+      <div class="header-actions">
+        <label class="import"><input type="file" accept=".json,.yaml,.yml,.png,.txt,.md" @change="setFile"><button @click="importData" :disabled="busy">解析并导入</button></label>
+        <details class="export-menu">
+          <summary>导出</summary>
+          <div class="export-popover">
+            <strong>导出内容</strong>
+            <button v-if="['character','preset','lorebook','persona'].includes(tab) && selected?.id" @click="exportSelected" :disabled="busy">当前资料 JSON</button>
+            <button v-if="['character','preset','lorebook','persona'].includes(tab)" @click="exportKind" :disabled="busy || !docsForTab.length">当前类别 ZIP</button>
+            <button v-if="tab==='home' || ['character','preset','lorebook','persona'].includes(tab)" @click="exportAll" :disabled="busy || !documents.length">全部资料 ZIP</button>
+            <button v-if="tab==='debug'" @click="exportMessages" :disabled="busy || !debugResult?.messages">当前 messages[] JSON</button>
+            <button v-if="tab==='debug'" @click="backupSession" :disabled="busy || !debug.session_id">当前会话备份 ZIP</button>
+            <p v-if="!['home','character','preset','lorebook','persona','debug'].includes(tab)" class="muted">当前页面没有可导出的内容。</p>
+            <small>{{downloadLocationHint}}</small>
+          </div>
+        </details>
+      </div>
     </header>
     <div v-if="error" class="alert error">{{error}}</div>
     <div v-if="notice" class="alert ok">{{notice}}</div>
@@ -446,7 +535,6 @@ createApp({
           <button @click="tab='bindings'"><b>2</b>绑定会话</button>
           <button @click="tab='debug'"><b>3</b>检查请求</button>
         </div>
-        <button @click="exportAll" :disabled="!documents.length">一键导出全部资料 ZIP</button>
       </div>
       <div class="cards">
         <div class="metric" v-for="(v,k) in labels"><strong>{{overview.counts?.[k]||0}}</strong><span>{{v}}</span></div>
@@ -457,8 +545,6 @@ createApp({
       <div class="library">
         <div class="library-actions">
           <button class="primary" @click="createDoc(tab)">新建{{labels[tab]}}</button>
-          <button @click="exportKind" :disabled="!docsForTab.length">导出本类 ZIP</button>
-          <button @click="exportAll" :disabled="!documents.length">全部资料 ZIP</button>
         </div>
         <button v-for="d in docsForTab" :class="['doc',{active:selected?.id===d.id}]" @click="choose(d)"><b>{{d.name}}</b><small>{{new Date(d.updated_at*1000).toLocaleString()}}</small></button>
         <p v-if="!docsForTab.length" class="muted">还没有{{labels[tab]}}。</p>
@@ -467,7 +553,6 @@ createApp({
         <div class="editor-title">
           <input class="title-input" v-model="selected.name">
           <div>
-            <button v-if="selected.id" @click="exportSelected">导出 JSON</button>
             <button v-if="selected.id" @click="duplicate">复制</button>
             <button v-if="selected.id" class="danger" @click="remove">删除</button>
             <button class="primary" @click="save">保存</button>
@@ -567,6 +652,75 @@ createApp({
         </table>
       </div>
     </section>
+    <section v-else-if="tab==='memories'" class="stack">
+      <div class="panel">
+        <h3>{{memoryDraft.id?'编辑长期记忆':'新增长期记忆'}}</h3>
+        <p>自动提取的记忆会出现在这里。你可以手动新增、禁用或删除，禁用后不会再注入 Prompt。</p>
+        <div class="binding-form">
+          <label>作用域<select v-model="memoryDraft.scope_type" @change="updateMemoryScope"><option value="session">会话</option><option value="user">用户</option><option value="group">群组</option><option value="persona">Persona</option><option value="global">全局</option></select></label>
+          <label>作用域 ID<input v-model="memoryDraft.scope_id" placeholder="会话 ID / 用户 ID / *"></label>
+          <label>分类<select v-model="memoryDraft.category"><option value="preference">用户偏好</option><option value="relationship">角色关系</option><option value="plot">剧情节点</option><option value="status">长期状态</option></select></label>
+          <label><input type="checkbox" v-model="memoryDraft.enabled">启用</label>
+        </div>
+        <label>记忆内容<textarea v-model="memoryDraft.content" placeholder="一条具体、可长期复用的事实。"></textarea></label>
+        <div class="actions"><button class="primary" @click="saveMemory">保存记忆</button><button @click="resetMemoryDraft">清空表单</button></div>
+      </div>
+      <div class="panel">
+        <div class="result-head">
+          <h3>长期记忆列表</h3>
+          <input v-model="memoryQuery" placeholder="搜索内容、分类或作用域">
+        </div>
+        <table><tr><th>状态</th><th>作用域</th><th>分类</th><th>内容</th><th>更新时间</th><th></th></tr>
+          <tr v-for="m in filteredMemories">
+            <td>{{m.enabled?'启用':'禁用'}}</td>
+            <td>{{m.scope_type}}: {{m.scope_id}}</td>
+            <td>{{m.category}}</td>
+            <td>{{m.content}}</td>
+            <td>{{formatTimestamp(m.updated_at)}}</td>
+            <td class="actions"><button @click="editMemory(m)">编辑</button><button @click="toggleMemory(m)">{{m.enabled?'禁用':'启用'}}</button><button class="danger" @click="deleteMemory(m)">删除</button></td>
+          </tr>
+        </table>
+        <p v-if="!filteredMemories.length" class="muted">还没有长期记忆。</p>
+      </div>
+    </section>
+    <section v-else-if="tab==='metrics'" class="stack">
+      <div class="panel">
+        <div class="result-head">
+          <h3>运行仪表盘</h3>
+          <div class="actions"><label>时间范围<select v-model.number="metricDays"><option :value="1">1 天</option><option :value="7">7 天</option><option :value="30">30 天</option></select></label><button @click="refreshMetrics">刷新</button></div>
+        </div>
+        <div class="cards">
+          <div class="metric"><strong>{{metricTotals.requests||0}}</strong><span>请求数</span></div>
+          <div class="metric"><strong>{{metricTotals.prompt_tokens||0}}</strong><span>估算 Token</span></div>
+          <div class="metric"><strong>{{metricTotals.avg_duration_ms||0}}ms</strong><span>平均耗时</span></div>
+          <div class="metric"><strong>{{metricTotals.worldbook_hits||0}}</strong><span>世界书命中</span></div>
+          <div class="metric"><strong>{{metricTotals.memory_hits||0}}</strong><span>记忆命中</span></div>
+          <div class="metric"><strong>{{metricTotals.summary_generated||0}} / {{metricTotals.summary_failed||0}}</strong><span>摘要生成 / 失败</span></div>
+        </div>
+      </div>
+      <div class="grid">
+        <div class="panel">
+          <h3>Provider 调用量</h3>
+          <div v-for="p in metricProviders" class="bar-row"><span>{{p[0]}}</span><b>{{p[1]}}</b></div>
+          <p v-if="!metricProviders.length" class="muted">暂无 Provider 数据。</p>
+        </div>
+        <div class="panel">
+          <h3>Token 趋势</h3>
+          <div v-for="m in metricItems.slice(-30)" class="spark-row">
+            <span>{{formatTimestamp(m.created_at)}}</span>
+            <div class="spark"><i :style="{width: Math.max(4, Number(m.prompt_tokens||0) / maxMetricTokens * 100) + '%'}"></i></div>
+            <b>{{m.prompt_tokens}}</b>
+          </div>
+          <p v-if="!metricItems.length" class="muted">暂无运行指标。真实请求后会自动记录；只读模拟不会写入。</p>
+        </div>
+      </div>
+      <div class="panel">
+        <h3>最近请求</h3>
+        <table><tr><th>时间</th><th>会话</th><th>Provider</th><th>模式</th><th>Token</th><th>耗时</th><th>世界书</th><th>记忆</th><th>警告</th></tr>
+          <tr v-for="m in metricItems.slice().reverse().slice(0,50)"><td>{{formatTimestamp(m.created_at)}}</td><td>{{m.session_id}}</td><td>{{m.provider_id||'unknown'}}</td><td>{{m.mode}}</td><td>{{m.prompt_tokens}}</td><td>{{m.duration_ms}}ms</td><td>{{m.worldbook_hits}}</td><td>{{m.memory_hits}}</td><td>{{m.warning_count}}</td></tr>
+        </table>
+      </div>
+    </section>
     <section v-else-if="tab==='debug'" class="debug">
       <div class="panel controls">
         <h3>请求调试器</h3>
@@ -581,13 +735,12 @@ createApp({
         <label v-if="debug.mode==='quiet'">Quiet Prompt<input v-model="debug.quiet_prompt"></label>
         <label>本次用户消息<textarea v-model="debug.prompt"></textarea></label>
         <label>原始 AstrBot System Prompt<textarea v-model="debug.system_prompt"></textarea></label>
-        <div class="actions"><button class="primary" @click="simulate">只读模拟</button><button @click="actual" :disabled="!debug.session_id">最近真实请求</button><button @click="backupSession" :disabled="!debug.session_id">重置前备份 ZIP</button></div>
+        <div class="actions"><button class="primary" @click="simulate">只读模拟</button><button @click="actual" :disabled="!debug.session_id">最近真实请求</button></div>
         <p class="muted">模拟不会推进 Sticky、Cooldown、Delay 或轮次。未选会话时只解析全局绑定。</p>
       </div>
       <div class="panel result" v-if="debugResult">
         <div class="result-head">
           <h3>最终 messages[]</h3>
-          <div class="actions"><button @click="exportMessages">导出 messages[]</button><button @click="backupSession" :disabled="!debug.session_id">重置前备份 ZIP</button></div>
           <span>Token 为近似估算</span>
         </div>
         <div class="effective" v-if="debugResult.effective">

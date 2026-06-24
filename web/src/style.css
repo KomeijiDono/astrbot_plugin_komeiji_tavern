@@ -88,6 +88,64 @@ header p {
 .import input {
   max-width:210px;
 }
+.header-actions {
+  display:flex;
+  align-items:flex-start;
+  gap:10px;
+}
+.export-menu {
+  position:relative;
+}
+.export-menu>summary {
+  list-style:none;
+  cursor:pointer;
+  border:1px solid #bd658b;
+  border-radius:7px;
+  background:#824462;
+  color:#fff;
+  padding:9px 28px 9px 12px;
+  white-space:nowrap;
+}
+.export-menu>summary::-webkit-details-marker {
+  display:none;
+}
+.export-menu>summary::after {
+  content:'▾';
+  position:absolute;
+  right:11px;
+  top:9px;
+}
+.export-menu[open]>summary::after {
+  transform:rotate(180deg);
+}
+.export-popover {
+  position:absolute;
+  z-index:30;
+  top:calc(100% + 7px);
+  right:0;
+  width:300px;
+  padding:14px;
+  display:grid;
+  gap:8px;
+  background:#211c26;
+  border:1px solid #4a3d4e;
+  border-radius:10px;
+  box-shadow:0 12px 30px rgba(0,0,0,.45);
+}
+.export-popover strong {
+  font-size:13px;
+  color:#e7b2c7;
+}
+.export-popover button {
+  width:100%;
+  text-align:left;
+}
+.export-popover small {
+  color:#93899a;
+  line-height:1.5;
+  padding-top:4px;
+  border-top:1px solid #3a303e;
+}
 .panel,.hero,.workspace {
   background:#19161e;
   border:1px solid #3a303e;
@@ -359,10 +417,43 @@ th,td {
 .result-head {
   display:flex;
   justify-content:space-between;
+  align-items:center;
+  gap:12px;
 }
 .result-head span {
   color:#d9a4bb;
   font-size:12px;
+}
+.result-head input {
+  max-width:260px;
+}
+.bar-row,.spark-row {
+  display:grid;
+  grid-template-columns:minmax(100px,1fr) 64px;
+  gap:10px;
+  align-items:center;
+  margin:9px 0;
+  color:#c9becb;
+}
+.bar-row b,.spark-row b {
+  color:#e7b2c7;
+  text-align:right;
+}
+.spark-row {
+  grid-template-columns:150px minmax(120px,1fr) 70px;
+  font-size:12px;
+}
+.spark {
+  height:9px;
+  border-radius:99px;
+  background:#2a2330;
+  overflow:hidden;
+}
+.spark i {
+  display:block;
+  height:100%;
+  border-radius:99px;
+  background:linear-gradient(90deg,#824462,#d889aa);
 }
 .message,.activation {
   padding:12px;
@@ -440,6 +531,18 @@ th,td {
   .import {
     margin-top:14px;
     flex-wrap:wrap;
+  }
+  .header-actions {
+    flex-wrap:wrap;
+    margin-top:14px;
+  }
+  .import {
+    margin-top:0;
+  }
+  .export-popover {
+    right:auto;
+    left:0;
+    width:min(300px,calc(100vw - 30px));
   }
   .cards {
     grid-template-columns:repeat(2,1fr);

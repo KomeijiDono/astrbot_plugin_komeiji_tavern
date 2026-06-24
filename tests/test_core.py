@@ -30,7 +30,7 @@ from astrbot_plugin_komeiji_tavern.export_utils import (
     document_download,
     safe_filename,
 )
-from astrbot.api.message_components import Nodes, Plain
+from astrbot.api.message_components import At, Nodes, Plain
 from astrbot.core.message.message_event_result import MessageEventResult
 
 
@@ -336,6 +336,49 @@ class CoreTests(unittest.TestCase):
         payload = json.loads(results[0].chain[0].text)
         self.assertEqual(payload["session_id"], "test-session")
         self.assertEqual(payload["messages"][0]["content"], "hello")
+
+    def test_mentioned_tavern_reset_handles_unstripped_slash(self):
+        class Service:
+            def __init__(self):
+                self.reset_ids = []
+
+            async def reset_session(self, session_id):
+                self.reset_ids.append(session_id)
+
+        class Event:
+            def __init__(self, target="bot-self-id"):
+                self.target = target
+
+            @staticmethod
+            def get_self_id():
+                return "bot-self-id"
+
+            def get_messages(self):
+                return [At(qq=self.target), Plain("/tavern reset")]
+
+            @staticmethod
+            def get_message_str():
+                return "/tavern reset"
+
+            @staticmethod
+            def plain_result(text):
+                return MessageEventResult().message(text)
+
+        async def collect(generator):
+            return [item async for item in generator]
+
+        plugin = KomeijiTavernPlugin.__new__(KomeijiTavernPlugin)
+        plugin.service = Service()
+        plugin._session_id = lambda _event: "test-session"
+
+        results = run(collect(plugin.tavern_mentioned(Event())))
+        self.assertEqual(plugin.service.reset_ids, ["test-session"])
+        self.assertEqual(len(results), 1)
+        self.assertIn("状态已清除", results[0].chain[0].text)
+
+        ignored = run(collect(plugin.tavern_mentioned(Event("123456"))))
+        self.assertEqual(ignored, [])
+        self.assertEqual(plugin.service.reset_ids, ["test-session"])
 
     def test_forced_preview_result_uses_long_delivery_without_llm_result_type(self):
         class Result:
@@ -857,6 +900,32 @@ class _FakeEmbeddingProvider:
         return self._vectors.get(text, [0.0, 0.0])
 
 
+class _FakeMemoryProvider:
+    def __init__(self, text='[{"category":"preference","content":"User likes tea"}]', *, error=None):
+        self.provider_config = {"id": "memory"}
+        self.text = text
+        self.error = error
+        self.calls = []
+
+    async def text_chat(self, **kwargs):
+        self.calls.append(kwargs)
+        if self.error:
+            raise self.error
+        return _FakeSummaryResponse(self.text)
+
+
+class _FakeMemoryContext(_FakeEmbeddingContext):
+    def __init__(self, embedding_provider, memory_provider):
+        super().__init__([embedding_provider])
+        self.memory_provider = memory_provider
+
+    def get_provider_by_id(self, provider_id):
+        return self.memory_provider if provider_id == self.memory_provider.provider_config["id"] else None
+
+    def get_using_provider(self, _session_id):
+        return self.memory_provider
+
+
 class _FakeSummaryResponse:
     def __init__(self, text):
         self.completion_text = text
@@ -1084,6 +1153,83 @@ class VectorMatcherTests(unittest.TestCase):
             run(service._vector_matcher("query", entries))
             self.assertEqual(provider.calls.count("hello"), 1)
             self.assertEqual(provider.calls.count("query"), 2)
+
+
+class LongTermMemoryTests(unittest.TestCase):
+    def test_memory_crud_persists_embedding_and_toggle_delete(self):
+        with tempfile.TemporaryDirectory() as d:
+            storage = TavernStorage(Path(d) / "state.db")
+            memory_id = storage.put_memory(
+                scope_type="session",
+                scope_id="s1",
+                category="plot",
+                content="Gate opened",
+                embedding=[1.0, 0.0],
+            )
+            items = storage.list_memories(scope_type="session", scope_id="s1")
+            self.assertEqual(items[0]["embedding"], [1.0, 0.0])
+            self.assertTrue(items[0]["enabled"])
+            self.assertTrue(storage.set_memory_enabled(memory_id, False))
+            self.assertFalse(storage.list_memories(scope_type="session", scope_id="s1")[0]["enabled"])
+            self.assertTrue(storage.delete_memory(memory_id))
+            self.assertEqual(storage.list_memories(scope_type="session", scope_id="s1"), [])
+
+    def test_enabled_memory_is_retrieved_and_injected(self):
+        provider = _FakeEmbeddingProvider("emb", {"tea": [1.0, 0.0], "User likes tea": [1.0, 0.0], "disabled": [1.0, 0.0]})
+        with tempfile.TemporaryDirectory() as d:
+            storage = TavernStorage(Path(d) / "state.db")
+            preset_id = storage.put_document("preset", "Default", {"main_prompt": "base"})
+            storage.bind("global", "*", "preset", preset_id)
+            storage.put_memory(
+                scope_type="session", scope_id="s1", category="preference",
+                content="User likes tea", embedding=[1.0, 0.0],
+            )
+            storage.put_memory(
+                scope_type="session", scope_id="s1", category="status",
+                content="disabled", embedding=[1.0, 0.0], enabled=False,
+            )
+            service = TavernService(storage, _FakeEmbeddingContext([provider]), {
+                "memory_enabled": True,
+                "embedding_provider_id": "emb",
+                "memory_top_k": 3,
+            })
+            result = run(service.simulate({"session_id": "s1", "prompt": "tea"}))
+            memory_block = next(block for block in result["blocks"] if block["id"] == "memory")
+            self.assertIn("User likes tea", memory_block["content"])
+            self.assertNotIn("disabled", memory_block["content"])
+            self.assertEqual(len(result["memory"]["matches"]), 1)
+            self.assertEqual(storage.list_metrics(), [])
+
+    def test_memory_extraction_failure_does_not_block_process(self):
+        embedding = _FakeEmbeddingProvider("emb", {"hello": [1.0, 0.0]})
+        memory_provider = _FakeMemoryProvider(error=RuntimeError("memory down"))
+        with tempfile.TemporaryDirectory() as d:
+            storage = TavernStorage(Path(d) / "state.db")
+            preset_id = storage.put_document("preset", "Default", {"main_prompt": "base"})
+            storage.bind("global", "*", "preset", preset_id)
+            service = TavernService(storage, _FakeMemoryContext(embedding, memory_provider), {
+                "memory_enabled": True,
+                "memory_extract_interval": 1,
+                "embedding_provider_id": "emb",
+            })
+            result = run(service.process(_MockEvent(), _MockReq()))
+            self.assertEqual(result.system_prompt, "base")
+            self.assertEqual(storage.list_memories(), [])
+            self.assertEqual(len(storage.list_metrics()), 1)
+
+    def test_real_process_records_metrics_but_simulation_does_not(self):
+        with tempfile.TemporaryDirectory() as d:
+            storage = TavernStorage(Path(d) / "state.db")
+            preset_id = storage.put_document("preset", "Default", {"main_prompt": "base"})
+            storage.bind("global", "*", "preset", preset_id)
+            service = TavernService(storage, object(), {})
+            run(service.simulate({"session_id": "s1", "prompt": "hello"}))
+            self.assertEqual(storage.list_metrics(), [])
+            run(service.process(_MockEvent(), _MockReq()))
+            metrics = storage.list_metrics()
+            self.assertEqual(len(metrics), 1)
+            self.assertEqual(metrics[0]["session_id"], "s1")
+            self.assertGreaterEqual(metrics[0]["prompt_tokens"], 1)
 
 
 class IllustrationConcurrencyTests(unittest.TestCase):

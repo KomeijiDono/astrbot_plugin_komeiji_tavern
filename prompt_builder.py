@@ -98,6 +98,7 @@ class PromptBuilder:
         mode: str = "normal",
         quiet_prompt: str = "",
         session_summary: str = "",
+        memory_context: str = "",
         apply_history_limit: bool = True,
     ) -> BuildResult:
         preset = preset or {}
@@ -177,6 +178,9 @@ class PromptBuilder:
             block.content = self.macros.render(block.content, values).strip()
             if block.identifier == "summary" and session_summary.strip():
                 generated = f"[会话自动摘要]\n{session_summary.strip()}"
+                block.content = f"{block.content}\n\n{generated}".strip()
+            if block.identifier == "memory" and memory_context.strip():
+                generated = f"[长期记忆]\n{memory_context.strip()}"
                 block.content = f"{block.content}\n\n{generated}".strip()
             block.token_estimate = estimate_tokens(block.content)
 

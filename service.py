@@ -14,10 +14,19 @@ from astrbot.api import logger
 
 from .lore import LoreScanner, normalize_entries
 from .models import BuildResult, LoreEntry, ScanResult
-from .prompt_builder import PromptBuilder
+from .prompt_builder import PromptBuilder, estimate_tokens
 from .storage import TavernStorage
 
 PLUGIN_TAG = "[Komeiji's Tavern]"
+DEFAULT_MEMORY_PROMPT = """从以下角色扮演聊天中提取需要长期保留的记忆。
+只提取对后续跨会话继续 RP 有价值的信息，例如用户偏好、角色关系变化、重要剧情节点、长期状态。
+不要续写剧情，不要加入原文没有的信息。
+请只输出 JSON 数组，每项格式为 {"category":"preference|relationship|plot|status","content":"一句具体记忆"}。
+如果没有值得保存的内容，输出 []。
+
+聊天记录：
+{history}
+"""
 DEFAULT_SUMMARY_PROMPT = """请把以下旧聊天记录压缩成可供后续角色扮演继续使用的会话摘要。
 保留人物关系、重要事实、事件顺序、承诺、状态变化、未解决事项和持续有效的偏好。
 不要续写剧情，不要添加原文没有的信息，不要输出标题之外的解释。
@@ -153,13 +162,29 @@ class TavernService:
         while len(self._embedding_cache) > self._embedding_cache_limit:
             self._embedding_cache.popitem(last=False)
 
+    def _embedding_provider(self):
+        provider_id = str(self.config.get("embedding_provider_id", ""))
+        providers = list(self.context.get_all_embedding_providers())
+        return next((item for item in providers if str(item.provider_config.get("id", "")) == provider_id), None)
+
+    async def _embedding(self, text: str) -> list[float]:
+        provider = self._embedding_provider()
+        if provider is None:
+            return []
+        return list(await provider.get_embedding(text))
+
+    @staticmethod
+    def _cosine(a: list[float], b: list[float]) -> float:
+        if not a or not b:
+            return 0.0
+        norm = math.sqrt(sum(x * x for x in a)) * math.sqrt(sum(x * x for x in b))
+        return sum(x * y for x, y in zip(a, b)) / norm if norm else 0.0
+
     async def _vector_matcher(self, text: str, entries: list[LoreEntry]) -> dict[str, float]:
         if not self.config.get("vector_enabled", False):
             return {}
         try:
-            provider_id = str(self.config.get("embedding_provider_id", ""))
-            providers = list(self.context.get_all_embedding_providers())
-            provider = next((item for item in providers if str(item.provider_config.get("id", "")) == provider_id), None)
+            provider = self._embedding_provider()
             if provider is None:
                 return {}
             query = await provider.get_embedding(text)
@@ -179,6 +204,143 @@ class TavernService:
         except Exception as exc:
             logger.warning("%s 向量匹配失败，已降级跳过向量条目: %s", PLUGIN_TAG, exc)
             return {}
+
+    async def _retrieve_memories(
+        self,
+        *,
+        scopes: list[tuple[str, str]],
+        text: str,
+    ) -> tuple[str, list[dict[str, Any]]]:
+        if not self.config.get("memory_enabled", False):
+            return "", []
+        try:
+            query = await self._embedding(text)
+            if not query:
+                return "", []
+            candidates: list[dict[str, Any]] = []
+            for scope_type, scope_id in scopes:
+                candidates.extend(await asyncio.to_thread(
+                    self.storage.list_memories,
+                    scope_type=scope_type,
+                    scope_id=scope_id,
+                    enabled=True,
+                    limit=500,
+                ))
+            seen: set[str] = set()
+            scored: list[tuple[float, dict[str, Any]]] = []
+            for item in candidates:
+                memory_id = str(item.get("id", ""))
+                if not memory_id or memory_id in seen:
+                    continue
+                seen.add(memory_id)
+                score = self._cosine(query, item.get("embedding", []))
+                if score > 0:
+                    scored.append((score, item))
+            scored.sort(key=lambda pair: pair[0], reverse=True)
+            top_k = max(1, int(self.config.get("memory_top_k", 5) or 5))
+            matches = [dict(item, score=score) for score, item in scored[:top_k]]
+            lines = [
+                f"- [{item.get('category') or 'memory'}] {item.get('content')}"
+                for item in matches
+            ]
+            return "\n".join(lines), matches
+        except Exception as exc:
+            logger.warning("%s 长期记忆检索失败，已降级跳过: %s", PLUGIN_TAG, exc)
+            return "", []
+
+    def _memory_provider(self, session_id: str):
+        configured_id = str(self.config.get("memory_provider_id", "") or "").strip()
+        if configured_id:
+            provider = self.context.get_provider_by_id(configured_id)
+            if provider is None:
+                raise RuntimeError(f"找不到记忆 Provider: {configured_id}")
+            return provider, configured_id
+        configured_id = str(self.config.get("summary_provider_id", "") or "").strip()
+        if configured_id:
+            provider = self.context.get_provider_by_id(configured_id)
+            if provider is None:
+                raise RuntimeError(f"找不到摘要 Provider: {configured_id}")
+            return provider, configured_id
+        provider = self.context.get_using_provider(session_id)
+        if provider is None:
+            raise RuntimeError("当前会话没有可用的记忆 Provider")
+        return provider, str(getattr(provider, "provider_config", {}).get("id", "current"))
+
+    @staticmethod
+    def _parse_memory_items(text: str) -> list[dict[str, str]]:
+        raw = text.strip()
+        start, end = raw.find("["), raw.rfind("]")
+        if start >= 0 and end >= start:
+            raw = raw[start:end + 1]
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            return []
+        if not isinstance(parsed, list):
+            return []
+        allowed = {"preference", "relationship", "plot", "status"}
+        result: list[dict[str, str]] = []
+        for item in parsed:
+            if not isinstance(item, dict):
+                continue
+            content = str(item.get("content", "")).strip()
+            if not content:
+                continue
+            category = str(item.get("category", "status")).strip().lower()
+            result.append({"category": category if category in allowed else "status", "content": content})
+        return result
+
+    async def _extract_memories(
+        self,
+        *,
+        session_id: str,
+        state: dict[str, Any],
+        messages: list[dict[str, Any]],
+    ) -> list[str]:
+        if not self.config.get("memory_enabled", False):
+            return []
+        interval = max(1, int(self.config.get("memory_extract_interval", 12) or 12))
+        turn = int(state.get("turn", 0) or 0)
+        last_turn = int(state.get("last_memory_turn", 0) or 0)
+        if turn <= 0 or turn - last_turn < interval:
+            return []
+        try:
+            provider, provider_id = self._memory_provider(session_id)
+            recent = messages[-max(2, interval):]
+            transcript = "\n".join(
+                f"{str(message.get('role', 'unknown')).upper()}: {self._message_text(message)}"
+                for message in recent
+            )
+            template = str(self.config.get("memory_prompt", DEFAULT_MEMORY_PROMPT) or DEFAULT_MEMORY_PROMPT)
+            prompt = template.replace("{history}", transcript)
+            response = await provider.text_chat(
+                prompt=prompt,
+                max_tokens=max(128, int(self.config.get("memory_max_tokens", 512) or 512)),
+                temperature=0.1,
+            )
+            items = self._parse_memory_items(str(getattr(response, "completion_text", "") or ""))
+            written: list[str] = []
+            for item in items:
+                embedding = await self._embedding(item["content"])
+                if not embedding:
+                    continue
+                memory_id = await asyncio.to_thread(
+                    self.storage.put_memory,
+                    scope_type="session",
+                    scope_id=session_id,
+                    category=item["category"],
+                    content=item["content"],
+                    embedding=embedding,
+                    source_session_id=session_id,
+                    source_turn=turn,
+                )
+                written.append(memory_id)
+            state["last_memory_turn"] = turn
+            state["last_memory_provider_id"] = provider_id
+            return written
+        except Exception as exc:
+            logger.warning("%s 长期记忆提取失败，已跳过本轮: %s", PLUGIN_TAG, exc)
+            return []
 
     async def _collect_entries(self, scopes: list[tuple[str, str]]) -> list[LoreEntry]:
         entries: list[LoreEntry] = []
@@ -381,6 +543,7 @@ class TavernService:
         return payload
 
     async def process(self, event: Any, req: Any, *, mode: str = "normal", quiet_prompt: str = ""):
+        started = time.perf_counter()
         scopes = self.scopes(event, req)
         session_id = str(getattr(event, "unified_msg_origin", "") or req.session_id or "default")
         async with self._session_lock(session_id):
@@ -403,6 +566,10 @@ class TavernService:
             history, summary_meta, summary_warnings, apply_history_limit = await self._prepare_history(
                 list(req.contexts or []), state, session_id=session_id, generate=True
             )
+            memory_text = "\n".join([self._message_text(item) for item in list(req.contexts or [])[-4:]])
+            if req.prompt:
+                memory_text = f"{memory_text}\n{req.prompt}".strip()
+            memory_context, memory_matches = await self._retrieve_memories(scopes=scopes, text=memory_text)
             character = character_doc["data"] if character_doc else {}
             char_data = character.get("data", character)
             values = {
@@ -420,6 +587,7 @@ class TavernService:
                 character=character, persona=(persona_doc or {}).get("data", {}).get("content", ""),
                 lore=scan, values=values, mode=mode, quiet_prompt=quiet_prompt,
                 session_summary=str(summary_meta.get("content", "")),
+                memory_context=memory_context,
                 apply_history_limit=apply_history_limit,
             )
             result.warnings.extend(summary_warnings)
@@ -427,9 +595,40 @@ class TavernService:
                 block.identifier == "summary" and block.enabled and bool(block.content)
                 for block in result.blocks
             )
+            await self._extract_memories(
+                session_id=session_id,
+                state=state,
+                messages=list(req.contexts or []) + ([{"role": "user", "content": req.prompt}] if req.prompt else []),
+            )
             await asyncio.to_thread(self.storage.save_session, session_id, state)
             preview = self._serialize_result(result, scan, summary=summary_meta)
+            preview["memory"] = {
+                "enabled": bool(self.config.get("memory_enabled", False)),
+                "matches": [
+                    {key: item.get(key) for key in ("id", "scope_type", "scope_id", "category", "content", "score")}
+                    for item in memory_matches
+                ],
+            }
             await asyncio.to_thread(self.storage.save_preview, session_id, preview)
+            provider = getattr(req, "provider", None) or getattr(req, "llm_provider", None)
+            provider_id = str(getattr(provider, "provider_config", {}).get("id", ""))
+            if not provider_id:
+                using = getattr(self.context, "get_using_provider", lambda _sid: None)(session_id)
+                provider_id = str(getattr(using, "provider_config", {}).get("id", ""))
+            await asyncio.to_thread(self.storage.record_metric, {
+                "session_id": session_id,
+                "provider_id": provider_id,
+                "mode": mode,
+                "prompt_tokens": sum(estimate_tokens(str(message.get("content", ""))) for message in result.messages),
+                "message_count": len(result.messages),
+                "block_count": len(result.blocks),
+                "worldbook_hits": len(scan.activated),
+                "summary_generated": bool(summary_meta.get("generated_this_request")),
+                "summary_failed": bool(summary_meta.get("error")),
+                "memory_hits": len(memory_matches),
+                "warning_count": len(result.warnings),
+                "duration_ms": int((time.perf_counter() - started) * 1000),
+            })
         return result
 
     async def simulate(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -452,7 +651,11 @@ class TavernService:
             entries, scan_messages, state,
             vector_matcher=self._vector_matcher if self.config.get("vector_enabled", False) else None,
             rng=random.Random(int(payload.get("seed", 1))),
-        )
+            )
+        memory_text = "\n".join([self._message_text(item) for item in messages[-4:]])
+        if prompt:
+            memory_text = f"{memory_text}\n{prompt}".strip()
+        memory_context, memory_matches = await self._retrieve_memories(scopes=scopes, text=memory_text)
         preset_doc = await asyncio.to_thread(self._bound_one, "preset", scopes)
         character_doc = await asyncio.to_thread(self._bound_one, "character", scopes)
         persona_doc = await asyncio.to_thread(self._bound_one, "persona", scopes)
@@ -474,6 +677,7 @@ class TavernService:
             lore=scan, values=values, mode=str(payload.get("mode", "normal")),
             quiet_prompt=str(payload.get("quiet_prompt", "")),
             session_summary=str(summary_meta.get("content", "")),
+            memory_context=memory_context,
             apply_history_limit=apply_history_limit,
         )
         warnings = list(result.warnings) + summary_warnings
@@ -492,5 +696,9 @@ class TavernService:
             "effective": effective,
             "state_after": state,
             "state_persisted": False,
+            "memory": {
+                "enabled": bool(self.config.get("memory_enabled", False)),
+                "matches": memory_matches,
+            },
         })
         return serialized

@@ -9,7 +9,7 @@ from typing import Any
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
-from astrbot.api.message_components import Node, Nodes, Plain
+from astrbot.api.message_components import At, Node, Nodes, Plain
 from astrbot.api.provider import LLMResponse, ProviderRequest
 from astrbot.api.star import Context, Star, register
 from astrbot.core.star.filter.command import GreedyStr
@@ -27,7 +27,7 @@ _STATE_FIELDS = re.compile(r"\[LOVE_DATA\]\s*(.+)$", re.MULTILINE)
 _CONFIG_GROUPS = (
     "basic_config", "context_config", "worldbook_config", "qq_direct_config",
     "qq_forward_config", "status_config", "illustration_config", "summary_config",
-    "lifecycle_config",
+    "memory_config", "metrics_config", "lifecycle_config",
 )
 
 
@@ -76,14 +76,17 @@ class KomeijiTavernPlugin(Star):
         session_days = max(1, int(self.config.get("session_retention_days", 30)))
         preview_days = max(1, int(self.config.get("preview_retention_days", 7)))
         deleted = await asyncio.to_thread(
-            self.storage.cleanup_expired,
+            self.storage.cleanup_expired_extended,
             session_cutoff=now - session_days * 86400,
             preview_cutoff=now - preview_days * 86400,
+            metric_cutoff=now - max(1, int(self.config.get("metrics_retention_days", 30))) * 86400,
+            memory_cutoff=now - max(1, int(self.config.get("memory_retention_days", 365))) * 86400,
         )
-        if deleted["sessions"] or deleted["previews"]:
+        if deleted["sessions"] or deleted["previews"] or deleted.get("metrics") or deleted.get("memories"):
             logger.info(
-                "[%s] 已清理过期会话状态 %d 条、请求预览 %d 条",
+                "[%s] 已清理过期会话状态 %d 条、请求预览 %d 条、运行指标 %d 条、长期记忆 %d 条",
                 DISPLAY_NAME, deleted["sessions"], deleted["previews"],
+                deleted.get("metrics", 0), deleted.get("memories", 0),
             )
         return deleted
 
@@ -311,9 +314,12 @@ class KomeijiTavernPlugin(Star):
                 await asyncio.sleep(batch_interval_ms / 1000)
         await self._dispatch_pending_illustration(event)
 
-    @filter.command("tavern")
-    async def tavern(self, event: AstrMessageEvent, action: str = "status", rest: GreedyStr = ""):
-        """Komeiji's Tavern: status, preview, reset, continue, impersonate, quiet."""
+    async def _handle_tavern(
+        self,
+        event: AstrMessageEvent,
+        action: str = "status",
+        rest: str = "",
+    ):
         action = (action or "status").strip().lower()
         session_id = self._session_id(event)
         if action == "preview":
@@ -344,3 +350,28 @@ class KomeijiTavernPlugin(Star):
             "continue": "Continue.", "impersonate": "Draft my next message.", "quiet": "Generate quietly."
         }[action]
         yield event.request_llm(prompt=prompt, conversation=conversation)
+
+    @filter.command("tavern")
+    async def tavern(self, event: AstrMessageEvent, action: str = "status", rest: GreedyStr = ""):
+        """Komeiji's Tavern: status, preview, reset, continue, impersonate, quiet."""
+        async for result in self._handle_tavern(event, action, str(rest)):
+            yield result
+
+    @filter.regex(r"^/tavern(?:\s|$)")
+    async def tavern_mentioned(self, event: AstrMessageEvent):
+        """Handle AstrBot's unstripped slash when a QQ command starts with @bot."""
+        is_at_self = any(
+            isinstance(component, At)
+            and str(component.qq) == str(event.get_self_id())
+            for component in event.get_messages()
+        )
+        if not is_at_self:
+            return
+
+        command = re.sub(r"\s+", " ", event.get_message_str().strip())
+        parts = command[1:].split(" ", 2)
+        action = parts[1] if len(parts) > 1 else "status"
+        rest = parts[2] if len(parts) > 2 else ""
+        logger.info("[%s] 已兼容处理 @机器人 /tavern %s", DISPLAY_NAME, action)
+        async for result in self._handle_tavern(event, action, rest):
+            yield result

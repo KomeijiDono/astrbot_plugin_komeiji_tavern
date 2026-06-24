@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import mimetypes
+import time
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
@@ -55,6 +56,11 @@ class TavernWebApi:
             (f"{self.PREFIX}/export/<document_id>", ["GET"], self.export, "Export document"),
             (f"{self.PREFIX}/export/document", ["POST"], self.export_document_download, "Export document download"),
             (f"{self.PREFIX}/export/archive", ["POST"], self.export_archive, "Export document archive"),
+            (f"{self.PREFIX}/memories", ["GET"], self.memories, "List long-term memories"),
+            (f"{self.PREFIX}/memories", ["POST"], self.save_memory, "Create or update long-term memory"),
+            (f"{self.PREFIX}/memories/<memory_id>/toggle", ["POST"], self.toggle_memory, "Toggle long-term memory"),
+            (f"{self.PREFIX}/memories/<memory_id>/delete", ["POST"], self.delete_memory, "Delete long-term memory"),
+            (f"{self.PREFIX}/metrics", ["GET"], self.metrics, "Runtime metrics"),
             (f"{self.PREFIX}/preview/<session_id>", ["GET"], self.preview, "Last request preview"),
             (f"{self.PREFIX}/session/<session_id>", ["GET"], self.session, "Session state"),
             (f"{self.PREFIX}/session/<session_id>/reset", ["POST"], self.reset_session, "Reset session"),
@@ -237,6 +243,89 @@ class TavernWebApi:
         name = safe_filename(payload.get("name"), "komeiji-tavern-documents")
         content = build_document_archive(documents)
         return self.ok(download_payload(f"{name}.zip", "application/zip", content))
+
+    async def memories(self):
+        enabled_arg = request.args.get("enabled")
+        enabled = None if enabled_arg in {None, ""} else enabled_arg not in {"0", "false", "False"}
+        return self.ok(self.storage.list_memories(
+            scope_type=request.args.get("scope_type"),
+            scope_id=request.args.get("scope_id"),
+            enabled=enabled,
+            query=request.args.get("q"),
+            limit=int(request.args.get("limit", 300)),
+        ))
+
+    async def save_memory(self):
+        payload = await request.get_json(force=True)
+        if not isinstance(payload, dict):
+            return self.error("JSON object required")
+        content = str(payload.get("content", "")).strip()
+        scope_type = str(payload.get("scope_type", "session") or "session").strip()
+        scope_id = str(payload.get("scope_id", "")).strip()
+        if not content or not scope_type or not scope_id:
+            return self.error("content, scope_type and scope_id are required")
+        warning = ""
+        try:
+            embedding = await self.service._embedding(content)
+            if not embedding:
+                warning = "Embedding Provider 未配置或不可用；该记忆已保存，但暂时不会参与向量检索。"
+        except Exception as exc:
+            embedding = []
+            warning = f"生成 embedding 失败：{exc}"
+        memory_id = self.storage.put_memory(
+            memory_id=str(payload.get("id") or "") or None,
+            scope_type=scope_type,
+            scope_id=scope_id,
+            category=str(payload.get("category", "status") or "status"),
+            content=content,
+            embedding=embedding,
+            enabled=bool(payload.get("enabled", True)),
+            source_session_id=str(payload.get("source_session_id", "")),
+            source_turn=int(payload.get("source_turn", 0) or 0),
+        )
+        return self.ok({"id": memory_id, "warning": warning})
+
+    async def toggle_memory(self, memory_id: str):
+        payload = await request.get_json(force=True)
+        enabled = bool((payload or {}).get("enabled", True))
+        return self.ok({"updated": self.storage.set_memory_enabled(memory_id, enabled)})
+
+    async def delete_memory(self, memory_id: str):
+        return self.ok({"deleted": self.storage.delete_memory(memory_id)})
+
+    async def metrics(self):
+        days = float(request.args.get("days", 7) or 7)
+        since = time.time() - max(0.01, days) * 86400
+        rows = self.storage.list_metrics(
+            session_id=request.args.get("session_id"),
+            provider_id=request.args.get("provider_id"),
+            since=since,
+            limit=int(request.args.get("limit", 1000)),
+        )
+        rows = list(reversed(rows))
+        providers: dict[str, int] = {}
+        totals = {
+            "requests": len(rows),
+            "prompt_tokens": 0,
+            "duration_ms": 0,
+            "worldbook_hits": 0,
+            "summary_generated": 0,
+            "summary_failed": 0,
+            "memory_hits": 0,
+            "warnings": 0,
+        }
+        for row in rows:
+            provider_id = str(row.get("provider_id") or "unknown")
+            providers[provider_id] = providers.get(provider_id, 0) + 1
+            totals["prompt_tokens"] += int(row.get("prompt_tokens", 0) or 0)
+            totals["duration_ms"] += int(row.get("duration_ms", 0) or 0)
+            totals["worldbook_hits"] += int(row.get("worldbook_hits", 0) or 0)
+            totals["summary_generated"] += int(row.get("summary_generated", 0) or 0)
+            totals["summary_failed"] += int(row.get("summary_failed", 0) or 0)
+            totals["memory_hits"] += int(row.get("memory_hits", 0) or 0)
+            totals["warnings"] += int(row.get("warning_count", 0) or 0)
+        totals["avg_duration_ms"] = int(totals["duration_ms"] / len(rows)) if rows else 0
+        return self.ok({"items": rows, "totals": totals, "providers": providers})
 
     async def preview(self, session_id: str):
         payload = self.storage.get_preview(session_id)

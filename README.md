@@ -2,7 +2,7 @@
 
 # Komeiji's Tavern
 
-[![Version](https://img.shields.io/badge/version-0.4.1-7c5cff?style=for-the-badge)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.5.0-7c5cff?style=for-the-badge)](CHANGELOG.md)
 [![AstrBot](https://img.shields.io/badge/AstrBot-4.25%2B-4f9cff?style=for-the-badge)](https://github.com/AstrBotDevs/AstrBot)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-42b883?style=for-the-badge)](LICENSE)
 
