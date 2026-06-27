@@ -281,6 +281,25 @@ createApp({
       for (const kind of additiveKinds) out.additive[kind] = bindingsForTarget.value.filter(item => item.kind === kind)
       return out
     })
+    const debugSummary = computed(() => {
+      const result = debugResult.value || {}
+      const effective = result.effective || {}
+      const single = effective.single || {}
+      const additive = effective.additive || {}
+      const messages = Array.isArray(result.messages) ? result.messages : []
+      const tokens = messages.reduce((sum, item) => sum + Math.ceil(String(item.content || '').length / 4), 0)
+      return [
+        { label: '预设', value: single.preset?.name || '未绑定', state: single.preset ? 'ready' : 'warn' },
+        { label: '本轮角色', value: result.character_selection?.character?.card_name || result.character_selection?.character?.name || single.character?.name || '未绑定', state: (result.character_selection?.character || single.character) ? 'ready' : 'warn' },
+        { label: '角色选择', value: result.character_selection?.reason || '无角色组状态', state: result.character_selection ? 'ready' : 'idle' },
+        { label: '世界书', value: String((result.activated || []).length || (additive.lorebook || []).length || 0) + ' 条', state: ((result.activated || []).length || (additive.lorebook || []).length) ? 'ready' : 'idle' },
+        { label: '创作素材', value: String(result.retrieval?.matches?.length || 0) + ' 条', state: result.retrieval?.matches?.length ? 'ready' : 'idle' },
+        { label: '长期记忆', value: String(result.memory?.injected_count || result.memory?.matches?.length || 0) + ' 条', state: (result.memory?.injected_count || result.memory?.matches?.length) ? 'ready' : 'idle' },
+        { label: '自动摘要', value: result.summary?.included ? '已注入' : result.summary?.enabled ? '已启用' : '未启用', state: result.summary?.included ? 'ready' : result.summary?.enabled ? 'idle' : 'warn' },
+        { label: '消息与 Token', value: messages.length + ' 条 / ≈ ' + tokens, state: messages.length ? 'ready' : 'warn' },
+        { label: '警告', value: String((result.warnings || []).length) + ' 个', state: (result.warnings || []).length ? 'warn' : 'ready' },
+      ]
+    })
 
     const sessionDisplay = computed({
       get() {
@@ -733,7 +752,7 @@ createApp({
       metricDays, metrics, metricItems, metricTotals, metricProviders, maxMetricTokens,
       retrievalTest, retrievalStats, retrievalResult,
       archive, archiveTree, homeGuide,
-      debug, debugResult, docsForTab, bindDocs, characterDocs, card, entries,
+      debug, debugResult, debugSummary, docsForTab, bindDocs, characterDocs, card, entries,
       groupMembers, availableGroupMembers,
       sessionOptions, sFiltered, dFiltered, sessionDisplay, debugDisplay, bindingTargetTitle, bindingsForTarget, bindingSummary,
       sOpen, dOpen, pickSession, onSFocus, onSBlur, pickDebug, onDFocus, onDBlur,
@@ -1125,6 +1144,17 @@ createApp({
       </div>
       <div class="panel result" v-if="debugResult">
         <div class="result-head">
+          <h3>本轮结论</h3>
+          <span>先看结论，再展开细节</span>
+        </div>
+        <div class="summary-grid">
+          <div v-for="item in debugSummary" :class="['summary-card', item.state]">
+            <span>{{item.label}}</span>
+            <b>{{item.value}}</b>
+          </div>
+        </div>
+        <div class="alert error" v-for="w in debugResult.warnings">{{w}}</div>
+        <div class="result-head compact">
           <h3>最终 messages[]</h3>
           <span>Token 为近似估算</span>
         </div>
@@ -1215,7 +1245,6 @@ createApp({
             </div>
           </div>
         </details>
-        <div class="alert error" v-for="w in debugResult.warnings">{{w}}</div>
         <div class="message" v-for="(m,i) in debugResult.messages"><b>{{i}} · {{m.role}}</b><pre>{{m.content}}</pre></div>
         <details open><summary>提示词块（{{debugResult.blocks?.length||0}}）</summary>
           <table><tr v-for="b in debugResult.blocks"><td>{{b.name}}</td><td>{{b.role}} / {{b.position}} / depth {{b.depth}}</td><td>≈ {{b.tokens}}</td><td>{{b.source}}</td></tr></table>
