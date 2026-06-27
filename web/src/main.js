@@ -155,6 +155,9 @@ createApp({
     const dQuery = ref('')
     const dOpen = ref(false)
     const dFocused = ref(false)
+    const entryQuery = ref('')
+    const entryFilter = ref('all')
+    const openEntryUid = ref('')
     const memoryQuery = ref('')
     const memoryStatusFilter = ref('')
     const selectedMemoryIds = ref([])
@@ -178,6 +181,21 @@ createApp({
     const characterDocs = computed(() => documents.value.filter(x => x.kind === 'character'))
     const card = computed(() => selected.value?.data?.data && typeof selected.value.data.data === 'object' ? selected.value.data.data : selected.value?.data || {})
     const entries = computed(() => { const x = selected.value?.data?.entries || []; return Array.isArray(x) ? x : Object.values(x) })
+    const filteredEntries = computed(() => {
+      const q = entryQuery.value.toLowerCase().trim()
+      return entries.value.filter(item => {
+        const category = item.extensions?.category || item.category || item.group || ''
+        const haystack = [item.comment, item.content, category, keyText(item.key), keyText(item.keysecondary)].join(' ').toLowerCase()
+        const matchedQuery = !q || haystack.includes(q)
+        const matchedFilter = entryFilter.value === 'all'
+          || (entryFilter.value === 'enabled' && !item.disable)
+          || (entryFilter.value === 'disabled' && item.disable)
+          || (entryFilter.value === 'vectorized' && item.vectorized)
+          || (entryFilter.value === 'constant' && item.constant)
+          || (entryFilter.value === 'no_keys' && !keyText(item.key))
+        return matchedQuery && matchedFilter
+      })
+    })
     const groupMembers = computed(() => (selected.value?.data?.members || []).map(id => characterDocs.value.find(x => x.id === id)).filter(Boolean))
     const availableGroupMembers = computed(() => characterDocs.value.filter(x => !(selected.value?.data?.members || []).includes(x.id)))
 
@@ -703,6 +721,12 @@ createApp({
       priority: 50,
     })
 
+    const addEntry = () => {
+      const item = newEntry(tab.value)
+      selected.value.data.entries.push(item)
+      openEntryUid.value = item.uid
+    }
+
     const keyText = v => Array.isArray(v) ? v.join(', ') : String(v || '')
     const setKeys = (e, f, v) => e[f] = v.split(',').map(x => x.trim()).filter(Boolean)
 
@@ -752,9 +776,10 @@ createApp({
       metricDays, metrics, metricItems, metricTotals, metricProviders, maxMetricTokens,
       retrievalTest, retrievalStats, retrievalResult,
       archive, archiveTree, homeGuide,
-      debug, debugResult, debugSummary, docsForTab, bindDocs, characterDocs, card, entries,
+      debug, debugResult, debugSummary, docsForTab, bindDocs, characterDocs, card, entries, filteredEntries,
       groupMembers, availableGroupMembers,
       sessionOptions, sFiltered, dFiltered, sessionDisplay, debugDisplay, bindingTargetTitle, bindingsForTarget, bindingSummary,
+      entryQuery, entryFilter, openEntryUid,
       sOpen, dOpen, pickSession, onSFocus, onSBlur, pickDebug, onDFocus, onDBlur,
       choose, createDoc, save, remove, duplicate, applyAdvanced, importData,
       exportSelected, exportKind, exportAll, exportMessages, backupSession,
@@ -764,8 +789,7 @@ createApp({
       saveMemory, editMemory, toggleMemory, toggleAllVisibleMemories,
       updateSelectedMemoryStatus, deleteMemory, refreshMetrics,
       refreshRetrievalStats, runRetrievalTest,
-      move, moveMember, addMember, addBlock, keyText, setKeys,
-      addEntry: () => selected.value.data.entries.push(newEntry(tab.value)),
+      move, moveMember, addMember, addBlock, addEntry, keyText, setKeys,
       selectConversation, simulate, actual, formatTimestamp,
     }
   },
@@ -900,38 +924,63 @@ createApp({
           <button @click="addBlock">添加自定义块</button>
         </template>
         <template v-if="tab==='lorebook' || tab==='material'">
-          <div class="entry" v-for="(e,i) in entries">
-            <div class="entry-head">
-              <input v-model="e.comment"><label><input type="checkbox" v-model="e.constant">常驻</label>
-              <label><input type="checkbox" v-model="e.disable">禁用</label>
-              <label><input type="checkbox" v-model="e.vectorized">向量化</label>
-              <button class="danger" @click="selected.data.entries.splice(i,1)">删除</button>
-            </div>
-            <div class="grid">
-              <label>主关键词<input :value="keyText(e.key)" @input="setKeys(e,'key',$event.target.value)"></label>
-              <label>次关键词<input :value="keyText(e.keysecondary)" @input="setKeys(e,'keysecondary',$event.target.value)"></label>
-            </div>
-            <div class="inline">
-              <label><input type="checkbox" v-model="e.selective">次关键词</label>
-              <label>逻辑<select v-model.number="e.selectiveLogic"><option :value="0">且任一</option><option :value="3">且全部</option><option :value="2">且无</option><option :value="1">且非全部</option></select></label>
-              <label>位置<select v-model.number="e.position"><option :value="0">角色前</option><option :value="1">角色后</option><option :value="2">作者注顶部</option><option :value="3">作者注底部</option><option :value="4">聊天深度</option><option :value="5">示例顶部</option><option :value="6">示例底部</option><option :value="7">Outlet</option></select></label>
-              <label>角色<select v-model="e.role"><option>system</option><option>user</option><option>assistant</option></select></label>
-            </div>
-            <div class="inline">
-              <label>深度<input type="number" v-model.number="e.depth"></label>
-              <label>顺序<input type="number" v-model.number="e.order"></label>
-              <label>概率<input type="number" min="0" max="100" v-model.number="e.probability"></label>
-              <label>Sticky<input type="number" v-model.number="e.sticky"></label>
-              <label>Cooldown<input type="number" v-model.number="e.cooldown"></label>
-              <label>Delay<input type="number" v-model.number="e.delay"></label>
-            </div>
-            <div class="grid" v-if="tab==='material'">
-              <label>分类<input v-model="e.extensions.category"></label>
-              <label>描述<input v-model="e.extensions.description"></label>
-            </div>
-            <label>注入内容<textarea v-model="e.content"></textarea></label>
+          <div class="entry-toolbar">
+            <input v-model="entryQuery" placeholder="搜索标题、关键词、分类或内容">
+            <select v-model="entryFilter"><option value="all">全部条目</option><option value="enabled">只看启用</option><option value="disabled">只看禁用</option><option value="vectorized">只看向量化</option><option value="constant">只看常驻</option><option value="no_keys">无主关键词</option></select>
+            <button @click="openEntryUid=''">全部收起</button>
+            <button class="primary" @click="addEntry">添加条目</button>
           </div>
-          <button @click="addEntry">添加条目</button>
+          <p class="muted">显示 {{filteredEntries.length}} / {{entries.length}} 条。点击条目卡片展开编辑；保存后会自动重建检索索引。</p>
+          <div class="entry-card" v-for="e in filteredEntries" :class="{open:openEntryUid===e.uid, disabled:e.disable}">
+            <div class="entry-summary" @click="openEntryUid = openEntryUid===e.uid ? '' : e.uid">
+              <div>
+                <b>{{e.comment || '未命名条目'}}</b>
+                <p>{{(e.extensions?.description || e.content || '没有内容').slice(0,120)}}</p>
+              </div>
+              <div class="entry-tags">
+                <span v-if="tab==='material'">{{e.extensions?.category || '未分类'}}</span>
+                <span>{{keyText(e.key) || '无主关键词'}}</span>
+                <span v-if="e.vectorized">向量化</span>
+                <span v-if="e.constant">常驻</span>
+                <span v-if="e.disable">禁用</span>
+              </div>
+            </div>
+            <div class="entry-detail" v-if="openEntryUid===e.uid">
+              <div class="entry-head">
+                <input v-model="e.comment"><label><input type="checkbox" v-model="e.constant">常驻</label>
+                <label><input type="checkbox" v-model="e.disable">禁用</label>
+                <label><input type="checkbox" v-model="e.vectorized">向量化</label>
+                <button class="danger" @click="selected.data.entries.splice(entries.indexOf(e),1)">删除</button>
+              </div>
+              <div class="grid" v-if="tab==='material'">
+                <label>分类<input v-model="e.extensions.category"></label>
+                <label>描述<input v-model="e.extensions.description"></label>
+              </div>
+              <div class="grid">
+                <label>主关键词<input :value="keyText(e.key)" @input="setKeys(e,'key',$event.target.value)"></label>
+                <label>次关键词<input :value="keyText(e.keysecondary)" @input="setKeys(e,'keysecondary',$event.target.value)"></label>
+              </div>
+              <label>注入内容<textarea v-model="e.content"></textarea></label>
+              <details class="advanced entry-advanced">
+                <summary>高级触发设置</summary>
+                <div class="inline">
+                  <label><input type="checkbox" v-model="e.selective">启用次关键词逻辑</label>
+                  <label>逻辑<select v-model.number="e.selectiveLogic"><option :value="0">且任一</option><option :value="3">且全部</option><option :value="2">且无</option><option :value="1">且非全部</option></select></label>
+                  <label>位置<select v-model.number="e.position"><option :value="0">角色前</option><option :value="1">角色后</option><option :value="2">作者注顶部</option><option :value="3">作者注底部</option><option :value="4">聊天深度</option><option :value="5">示例顶部</option><option :value="6">示例底部</option><option :value="7">Outlet</option></select></label>
+                  <label>角色<select v-model="e.role"><option>system</option><option>user</option><option>assistant</option></select></label>
+                </div>
+                <div class="inline">
+                  <label>深度<input type="number" v-model.number="e.depth"></label>
+                  <label>顺序<input type="number" v-model.number="e.order"></label>
+                  <label>概率<input type="number" min="0" max="100" v-model.number="e.probability"></label>
+                  <label>Sticky<input type="number" v-model.number="e.sticky"></label>
+                  <label>Cooldown<input type="number" v-model.number="e.cooldown"></label>
+                  <label>Delay<input type="number" v-model.number="e.delay"></label>
+                </div>
+              </details>
+            </div>
+          </div>
+          <p v-if="!filteredEntries.length" class="muted">没有匹配当前筛选条件的条目。</p>
         </template>
         <template v-if="tab==='persona'"><label>用户设定内容<textarea class="tall" v-model="selected.data.content"></textarea></label></template>
         <details class="advanced">
