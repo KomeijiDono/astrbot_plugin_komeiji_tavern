@@ -231,6 +231,14 @@ createApp({
     })
     const visibleMemoryIds = computed(() => filteredMemories.value.map(x => x.id))
     const allVisibleMemoriesSelected = computed(() => visibleMemoryIds.value.length > 0 && visibleMemoryIds.value.every(id => selectedMemoryIds.value.includes(id)))
+    const memoryGroups = computed(() => {
+      const order = ['session', 'user', 'group', 'persona', 'global']
+      return order.map(scope => ({
+        scope,
+        title: scope === 'session' ? '会话记忆' : scope === 'user' ? '用户记忆' : scope === 'group' ? '群组记忆' : scope === 'persona' ? 'Persona 记忆' : '全局记忆',
+        items: filteredMemories.value.filter(item => item.scope_type === scope),
+      })).filter(group => group.items.length)
+    })
     const metricItems = computed(() => metrics.value.items || [])
     const metricTotals = computed(() => metrics.value.totals || {})
     const metricProviders = computed(() => Object.entries(metrics.value.providers || {}).sort((a, b) => b[1] - a[1]))
@@ -772,7 +780,7 @@ createApp({
       tabs, navGroups, labels, tab, overview, documents, bindings, personas, selected, pendingDeleteId, pendingImport, pendingMemoryDeleteId, error, notice, busy,
       downloadLocationHint, saveJson,
       advanced, binding, memoryDraft, memoryQuery, memoryStatusFilter, selectedMemoryIds,
-      memories, filteredMemories, allVisibleMemoriesSelected,
+      memories, filteredMemories, memoryGroups, allVisibleMemoriesSelected,
       metricDays, metrics, metricItems, metricTotals, metricProviders, maxMetricTokens,
       retrievalTest, retrievalStats, retrievalResult,
       archive, archiveTree, homeGuide,
@@ -1077,19 +1085,23 @@ createApp({
           </div>
         </div>
         <div class="actions"><button @click="toggleAllVisibleMemories">{{allVisibleMemoriesSelected?'取消全选':'全选当前列表'}}</button><button @click="updateSelectedMemoryStatus('active')" :disabled="!selectedMemoryIds.length">确认为 active</button><button @click="updateSelectedMemoryStatus('rejected')" :disabled="!selectedMemoryIds.length">拒绝</button><button @click="updateSelectedMemoryStatus('archived')" :disabled="!selectedMemoryIds.length">归档</button><span class="muted">已选择 {{selectedMemoryIds.length}} 条</span></div>
-        <table><tr><th></th><th>状态</th><th>作用域</th><th>分类</th><th>重要度</th><th>来源</th><th>内容</th><th>更新时间</th><th></th></tr>
-          <tr v-for="m in filteredMemories">
-            <td><input type="checkbox" :value="m.id" v-model="selectedMemoryIds"></td>
-            <td>{{m.status || (m.enabled?'active':'archived')}}</td>
-            <td>{{m.scope_type}}: {{m.scope_id}}</td>
-            <td>{{m.category}}</td>
-            <td>{{Number(m.importance || 1).toFixed(1)}}</td>
-            <td>{{m.source_type || 'manual'}}</td>
-            <td>{{m.content}}</td>
-            <td>{{formatTimestamp(m.updated_at)}}</td>
-            <td class="actions"><button @click="editMemory(m)">编辑</button><button @click="toggleMemory(m)">{{m.enabled?'禁用':'启用'}}</button><button class="danger" @click="deleteMemory(m)">{{pendingMemoryDeleteId===m.id?'确认删除':'删除'}}</button></td>
-          </tr>
-        </table>
+        <div v-for="group in memoryGroups" class="memory-group">
+          <h4>{{group.title}} <span>{{group.items.length}} 条</span></h4>
+          <div class="memory-card" v-for="m in group.items" :class="{inactive:!m.enabled || ['archived','rejected'].includes(m.status)}">
+            <label class="memory-check"><input type="checkbox" :value="m.id" v-model="selectedMemoryIds"></label>
+            <div>
+              <div class="memory-meta">
+                <span>{{m.status || (m.enabled?'active':'archived')}}</span>
+                <span>{{m.category}}</span>
+                <span>重要度 {{Number(m.importance || 1).toFixed(1)}}</span>
+                <span>{{m.source_type || 'manual'}}</span>
+              </div>
+              <p>{{m.content}}</p>
+              <small>{{m.scope_type}}: {{m.scope_id}} · {{formatTimestamp(m.updated_at)}}</small>
+            </div>
+            <div class="actions"><button @click="editMemory(m)">编辑</button><button @click="toggleMemory(m)">{{m.enabled?'禁用':'启用'}}</button><button class="danger" @click="deleteMemory(m)">{{pendingMemoryDeleteId===m.id?'确认删除':'删除'}}</button></div>
+          </div>
+        </div>
         <p v-if="!filteredMemories.length" class="muted">还没有长期记忆。</p>
       </div>
     </section>
@@ -1156,13 +1168,13 @@ createApp({
           <label>从此继续的新分支名<input v-model="archive.branch_name" placeholder="留空继承主线"></label>
         </div>
         <div class="actions"><button @click="branchFromArchiveNode">从此节点继续</button><button @click="saveJson(archive.selected,'story-node-'+archive.selected.id+'.json')">导出该节点 JSON</button></div>
-        <div class="effective">
-          <span>ID：{{archive.selected.id}}</span>
-          <span>父节点：{{archive.selected.parent_id||'无'}}</span>
-          <span>会话：{{archive.selected.session_id}}</span>
-          <span>轮次：{{archive.selected.turn_index}}</span>
-          <span>消息数：{{archive.selected.message_count}}</span>
-          <span>创建：{{formatTimestamp(archive.selected.created_at)}}</span>
+        <div class="summary-grid archive-summary">
+          <div class="summary-card ready"><span>分支</span><b>{{archive.selected.branch_name||'主线'}}</b></div>
+          <div class="summary-card ready"><span>轮次</span><b>{{archive.selected.turn_index}}</b></div>
+          <div class="summary-card ready"><span>消息数</span><b>{{archive.selected.message_count}}</b></div>
+          <div class="summary-card"><span>父节点</span><b>{{archive.selected.parent_id||'无'}}</b></div>
+          <div class="summary-card"><span>会话</span><b>{{archive.selected.session_id}}</b></div>
+          <div class="summary-card"><span>创建时间</span><b>{{formatTimestamp(archive.selected.created_at)}}</b></div>
         </div>
         <details open><summary>Assistant 回复</summary><pre>{{archive.selected.assistant_text||'（空）'}}</pre></details>
         <details open><summary>请求 messages[]（{{archive.selected.request_messages?.length||0}}）</summary>
