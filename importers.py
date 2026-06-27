@@ -106,6 +106,83 @@ def read_material_sqlite(encoded: str) -> list[dict[str, Any]]:
         path.unlink(missing_ok=True)
 
 
+def _json_list(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [str(x) for x in value if x]
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+            if isinstance(parsed, list):
+                return [str(x) for x in parsed if x]
+        except Exception:
+            pass
+        return [part.strip() for part in value.split(",") if part.strip()]
+    return []
+
+
+def read_quill_kb_sqlite(encoded: str) -> list[dict[str, Any]]:
+    raw = base64.b64decode(encoded, validate=True)
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as handle:
+        handle.write(raw)
+        path = Path(handle.name)
+    try:
+        with sqlite3.connect(f"file:{path}?mode=ro", uri=True) as conn:
+            conn.row_factory = sqlite3.Row
+            tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            if "knowledge_base" not in tables:
+                raise ValueError("数据库中没有可识别的知识库表")
+            rows = conn.execute('SELECT * FROM "knowledge_base"').fetchall()
+            entries = []
+            for index, row in enumerate(rows):
+                row_dict = dict(row)
+                keywords = _json_list(row_dict.get("keywords"))
+                secondary = _json_list(row_dict.get("secondary_keywords"))
+                aliases = _json_list(row_dict.get("aliases"))
+                is_constant = bool(row_dict.get("is_constant"))
+                priority = int(row_dict.get("priority") or 5)
+
+                entry = {
+                    "uid": str(row_dict.get("entry_id") or f"quill_{index}"),
+                    "comment": str(row_dict.get("name") or row_dict.get("entry_id") or f"Knowledge Entry {index+1}"),
+                    "content": str(row_dict.get("content") or ""),
+                    "key": keywords + aliases,
+                    "keysecondary": secondary,
+                    "constant": is_constant,
+                    "disabled": not bool(row_dict.get("enabled", True)),
+                    "vectorized": True,
+                    "order": max(1, 200 - priority * 10),
+                    "position": 1 if is_constant else 4,
+                    "useProbability": False,
+                    "extensions": {
+                        "category": str(row_dict.get("category") or ""),
+                        "description": str(row_dict.get("description") or ""),
+                        "aliases": aliases,
+                        "source": "quill_kb",
+                        "quill_priority": priority,
+                        "quill_inject_position": int(row_dict.get("inject_position") or 2),
+                    },
+                }
+                entries.append(entry)
+            return entries
+    finally:
+        path.unlink(missing_ok=True)
+
+
+def detect_quill_kb(encoded: str) -> bool:
+    raw = base64.b64decode(encoded, validate=True)
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as handle:
+        handle.write(raw)
+        path = Path(handle.name)
+    try:
+        with sqlite3.connect(f"file:{path}?mode=ro", uri=True) as conn:
+            tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            return "knowledge_base" in tables
+    except Exception:
+        return False
+    finally:
+        path.unlink(missing_ok=True)
+
+
 def export_document(document: dict[str, Any]) -> dict[str, Any]:
     raw = document.get("raw") or {}
     edited = document.get("data") or {}

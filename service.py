@@ -187,14 +187,30 @@ class TavernService:
             provider = self._embedding_provider()
             if provider is None:
                 return {}
+            embedding_model = str(self.config.get("embedding_provider_id", ""))
             query = await provider.get_embedding(text)
             result: dict[str, float] = {}
             for entry in entries:
-                key = hashlib.sha1(entry.content.encode("utf-8")).hexdigest()
-                vector = self._cache_get(key)
+                if not entry.vectorized or entry.disabled or not entry.content:
+                    continue
+                content_hash = hashlib.sha1(entry.content.encode("utf-8")).hexdigest()
+                cache_key = f"{embedding_model}:{content_hash}"
+                vector = self._cache_get(cache_key)
                 if vector is None:
-                    vector = await provider.get_embedding(entry.content)
-                    self._cache_put(key, vector)
+                    vector = await asyncio.to_thread(
+                        self.storage.get_entry_embedding_by_hash, content_hash, embedding_model
+                    )
+                    if vector:
+                        self._cache_put(cache_key, vector)
+                if not vector:
+                    vector = list(await provider.get_embedding(entry.content))
+                    self._cache_put(cache_key, vector)
+                    await asyncio.to_thread(
+                        self.storage.update_entry_embedding,
+                        content_hash,
+                        vector,
+                        embedding_model,
+                    )
                 norm = math.sqrt(sum(x * x for x in query)) * math.sqrt(sum(x * x for x in vector))
                 score = sum(a * b for a, b in zip(query, vector)) / norm if norm else 0.0
                 threshold = float(entry.raw.get("vector_threshold", 0.35))
@@ -204,6 +220,82 @@ class TavernService:
         except Exception as exc:
             logger.warning("%s 向量匹配失败，已降级跳过向量条目: %s", PLUGIN_TAG, exc)
             return {}
+
+    async def _hybrid_matcher(self, text: str, entries: list[LoreEntry]) -> dict[str, float]:
+        mode = str(self.config.get("retrieval_mode", "hybrid") or "hybrid")
+
+        if mode in {"vector", "hybrid"} and not self.config.get("vector_enabled", False):
+            if mode == "vector":
+                return {}
+            mode = "keyword"
+
+        keyword_weight = float(self.config.get("keyword_weight", 0.35))
+        vector_weight = float(self.config.get("vector_weight", 0.65))
+        retrieval_top_k = int(self.config.get("retrieval_top_k", 8))
+        retrieval_candidate_k = int(self.config.get("retrieval_candidate_k", 60))
+
+        allowed_by_hash: dict[str, LoreEntry] = {}
+        for entry in entries:
+            if entry.content:
+                content_hash = hashlib.sha1(entry.content.encode("utf-8")).hexdigest()
+                allowed_by_hash[content_hash] = entry
+
+        keyword_scores: dict[str, float] = {}
+        if mode in {"keyword", "hybrid"}:
+            try:
+                fts_results = await asyncio.to_thread(
+                    self.storage.search_entries_fts, text, limit=retrieval_candidate_k
+                )
+                for item in fts_results:
+                    content_hash = item.get("content_hash", "")
+                    if content_hash in allowed_by_hash:
+                        entry = allowed_by_hash[content_hash]
+                        keyword_scores[entry.uid] = float(item.get("score", 0.5))
+            except Exception as exc:
+                logger.warning("%s 关键词检索失败，已降级: %s", PLUGIN_TAG, exc)
+
+        vector_scores: dict[str, float] = {}
+        if mode in {"vector", "hybrid"}:
+            vector_scores = await self._vector_matcher(text, entries)
+
+        if mode == "keyword":
+            combined = keyword_scores
+        elif mode == "vector":
+            combined = vector_scores
+        else:
+            all_uids = set(keyword_scores) | set(vector_scores)
+            combined = {}
+            for uid in all_uids:
+                kw_score = keyword_scores.get(uid, 0.0)
+                vec_score = vector_scores.get(uid, 0.0)
+                combined[uid] = keyword_weight * kw_score + vector_weight * vec_score
+
+        sorted_items = sorted(combined.items(), key=lambda x: x[1], reverse=True)
+
+        category_dedup_limit = int(self.config.get("retrieval_category_dedup_limit", 2) or 0)
+        if category_dedup_limit > 0:
+            entries_by_uid = {entry.uid: entry for entry in entries}
+            category_counts: dict[str, int] = {}
+            filtered_items: list[tuple[str, float]] = []
+            for uid, score in sorted_items:
+                entry = entries_by_uid.get(uid)
+                if not entry:
+                    filtered_items.append((uid, score))
+                    continue
+                ext = entry.raw.get("extensions") if isinstance(entry.raw.get("extensions"), dict) else {}
+                category = str(entry.raw.get("category", ext.get("category", entry.group or "")) or "")
+                if not category:
+                    filtered_items.append((uid, score))
+                    continue
+                if category_counts.get(category, 0) < category_dedup_limit:
+                    category_counts[category] = category_counts.get(category, 0) + 1
+                    filtered_items.append((uid, score))
+            sorted_items = filtered_items
+
+        if len(sorted_items) > retrieval_top_k:
+            sorted_items = sorted_items[:retrieval_top_k]
+
+        return dict(sorted_items)
 
     async def _retrieve_memories(
         self,
@@ -347,7 +439,13 @@ class TavernService:
         for kind in ("lorebook", "material"):
             documents = await asyncio.to_thread(self.storage.resolve_bindings, kind, scopes)
             for document in documents:
-                entries.extend(normalize_entries(document["data"]))
+                normalized = normalize_entries(document["data"], kind=kind)
+                for index, item in enumerate(normalized):
+                    item.raw.setdefault("document_id", document["id"])
+                    item.raw.setdefault("document_name", document.get("name", ""))
+                    item.raw.setdefault("kind", kind)
+                    item.raw.setdefault("index", index)
+                entries.extend(normalized)
         return entries
 
     @staticmethod
@@ -549,16 +647,26 @@ class TavernService:
         async with self._session_lock(session_id):
             state = await asyncio.to_thread(self.storage.get_session, session_id)
             pending = state.pop("pending_generation", {})
-            mode = str(event.get_extra("_kt_mode") or pending.get("mode") or mode)
+            generation_mode = str(event.get_extra("_kt_mode") or pending.get("mode") or mode)
             quiet_prompt = str(event.get_extra("_kt_quiet_prompt") or pending.get("prompt") or quiet_prompt)
             await asyncio.to_thread(self.storage.save_session, session_id, state)
             entries = await self._collect_entries(scopes)
             scan_messages = list(req.contexts or [])
             if req.prompt:
                 scan_messages.append({"role": "user", "content": req.prompt})
+
+            retrieval_mode = str(self.config.get("retrieval_mode", "hybrid") or "hybrid")
+            matcher = None
+            if retrieval_mode == "vector" and not self.config.get("vector_enabled", False):
+                pass
+            elif retrieval_mode == "vector":
+                matcher = self._vector_matcher
+            else:
+                matcher = self._hybrid_matcher
+
             scan = await self.scanner.scan(
                 entries, scan_messages, state,
-                vector_matcher=self._vector_matcher if self.config.get("vector_enabled", False) else None,
+                vector_matcher=matcher,
             )
             preset_doc = await asyncio.to_thread(self._bound_one, "preset", scopes)
             character_doc = await asyncio.to_thread(self._select_character, scopes, req.prompt or "", state)
@@ -585,7 +693,7 @@ class TavernService:
                 original_system=req.system_prompt or "", contexts=history,
                 current_prompt=req.prompt or "", preset=preset_doc["data"] if preset_doc else {},
                 character=character, persona=(persona_doc or {}).get("data", {}).get("content", ""),
-                lore=scan, values=values, mode=mode, quiet_prompt=quiet_prompt,
+                lore=scan, values=values, mode=generation_mode, quiet_prompt=quiet_prompt,
                 session_summary=str(summary_meta.get("content", "")),
                 memory_context=memory_context,
                 apply_history_limit=apply_history_limit,
@@ -609,7 +717,52 @@ class TavernService:
                     for item in memory_matches
                 ],
             }
+            preview["retrieval"] = {
+                "enabled": bool(self.config.get("vector_enabled", False)) or retrieval_mode == "keyword",
+                "mode": retrieval_mode,
+                "fts_available": bool(self.storage.fts_available),
+                "candidate_count": int(self.config.get("retrieval_candidate_k", 60)),
+                "top_k": int(self.config.get("retrieval_top_k", 8)),
+                "matches": [
+                    {
+                        "uid": match.entry.uid,
+                        "name": match.entry.comment,
+                        "score": match.score,
+                        "reason": "matcher",
+                        "scanner_reason": match.reason,
+                    }
+                    for match in scan.activated
+                    if match.reason in ("vector", "hybrid", "keyword")
+                ],
+            }
             await asyncio.to_thread(self.storage.save_preview, session_id, preview)
+
+            retrieval_matches = [
+                match for match in scan.activated
+                if match.reason in ("vector", "hybrid", "keyword")
+            ]
+            if retrieval_matches:
+                entry_ids = []
+                match_details = []
+                for match in retrieval_matches:
+                    entry_id = f"{match.entry.raw.get('document_id', '')}:{match.entry.uid}:{match.entry.raw.get('index', 0)}"
+                    entry_ids.append(entry_id)
+                    match_details.append({
+                        "entry_id": entry_id,
+                        "entry_uid": match.entry.uid,
+                        "name": match.entry.comment,
+                        "score": match.score,
+                        "reason": "matcher",
+                        "scanner_reason": match.reason,
+                    })
+                await asyncio.to_thread(
+                    self.storage.record_retrieval_log,
+                    session_id=session_id,
+                    query=req.prompt or "",
+                    mode=retrieval_mode,
+                    matches=match_details,
+                )
+                await asyncio.to_thread(self.storage.increment_entry_match_counts, entry_ids)
             provider = getattr(req, "provider", None) or getattr(req, "llm_provider", None)
             provider_id = str(getattr(provider, "provider_config", {}).get("id", ""))
             if not provider_id:
@@ -618,7 +771,7 @@ class TavernService:
             await asyncio.to_thread(self.storage.record_metric, {
                 "session_id": session_id,
                 "provider_id": provider_id,
-                "mode": mode,
+                "mode": generation_mode,
                 "prompt_tokens": sum(estimate_tokens(str(message.get("content", ""))) for message in result.messages),
                 "message_count": len(result.messages),
                 "block_count": len(result.blocks),
@@ -647,9 +800,19 @@ class TavernService:
         prompt = str(payload.get("prompt", ""))
         scan_messages = messages + ([{"role": "user", "content": prompt}] if prompt else [])
         entries = await self._collect_entries(scopes)
+
+        retrieval_mode = str(self.config.get("retrieval_mode", "hybrid") or "hybrid")
+        matcher = None
+        if retrieval_mode == "vector" and not self.config.get("vector_enabled", False):
+            pass
+        elif retrieval_mode == "vector":
+            matcher = self._vector_matcher
+        else:
+            matcher = self._hybrid_matcher
+
         scan = await self.scanner.scan(
             entries, scan_messages, state,
-            vector_matcher=self._vector_matcher if self.config.get("vector_enabled", False) else None,
+            vector_matcher=matcher,
             rng=random.Random(int(payload.get("seed", 1))),
             )
         memory_text = "\n".join([self._message_text(item) for item in messages[-4:]])
@@ -700,5 +863,108 @@ class TavernService:
                 "enabled": bool(self.config.get("memory_enabled", False)),
                 "matches": memory_matches,
             },
+            "retrieval": {
+                "enabled": bool(self.config.get("vector_enabled", False)) or retrieval_mode == "keyword",
+                "mode": retrieval_mode,
+                "fts_available": bool(self.storage.fts_available),
+                "candidate_count": int(self.config.get("retrieval_candidate_k", 60)),
+                "top_k": int(self.config.get("retrieval_top_k", 8)),
+                "matches": [
+                    {
+                        "uid": match.entry.uid,
+                        "name": match.entry.comment,
+                        "score": match.score,
+                        "reason": "matcher",
+                        "scanner_reason": match.reason,
+                    }
+                    for match in scan.activated
+                    if match.reason in ("vector", "hybrid", "keyword")
+                ],
+            },
         })
         return serialized
+
+    async def test_retrieval(self, event: Any, text: str) -> str:
+        if not text:
+            return "请提供测试文本，例如：/tavern retrieval test 下雨的夜晚"
+
+        scopes = self.scopes(event, None)
+        entries = await self._collect_entries(scopes)
+        if not entries:
+            return "当前作用域没有绑定任何世界书或素材库。"
+
+        mode = str(self.config.get("retrieval_mode", "hybrid") or "hybrid")
+        scores = await self._hybrid_matcher(text, entries)
+
+        if not scores:
+            return f"检索模式：{mode}\n输入：{text}\n未命中任何条目。"
+
+        entries_by_uid = {entry.uid: entry for entry in entries}
+        sorted_scores = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+
+        lines = [
+            f"检索模式：{mode}",
+            f"输入：{text}",
+            f"命中 {len(sorted_scores)} 条：",
+            "",
+        ]
+
+        for i, (uid, score) in enumerate(sorted_scores[:10], 1):
+            entry = entries_by_uid.get(uid)
+            if not entry:
+                continue
+            ext = entry.raw.get("extensions") if isinstance(entry.raw.get("extensions"), dict) else {}
+            category = str(entry.raw.get("category", ext.get("category", entry.group or "")) or "")
+            keywords = ", ".join(entry.keys[:5]) if entry.keys else "无"
+            content_preview = entry.content[:80] + "..." if len(entry.content) > 80 else entry.content
+
+            lines.append(f"{i}. [{score:.3f}] {entry.comment or uid}")
+            if category:
+                lines.append(f"   分类：{category}")
+            lines.append(f"   关键词：{keywords}")
+            lines.append(f"   预览：{content_preview}")
+            lines.append("")
+
+        return "\n".join(lines)
+
+    async def get_retrieval_stats(self, session_id: str) -> dict[str, Any]:
+        mode = str(self.config.get("retrieval_mode", "hybrid") or "hybrid")
+        vector_enabled = bool(self.config.get("vector_enabled", False))
+
+        stats = {
+            "mode": mode,
+            "vector_enabled": vector_enabled,
+            "fts_available": bool(self.storage.fts_available),
+            "embedding_provider": str(self.config.get("embedding_provider_id", "")),
+            "keyword_weight": float(self.config.get("keyword_weight", 0.35)),
+            "vector_weight": float(self.config.get("vector_weight", 0.65)),
+            "retrieval_top_k": int(self.config.get("retrieval_top_k", 8)),
+            "retrieval_candidate_k": int(self.config.get("retrieval_candidate_k", 60)),
+            "category_dedup_limit": int(self.config.get("retrieval_category_dedup_limit", 2)),
+        }
+
+        try:
+            with self.storage._connection() as conn:
+                row = conn.execute("SELECT COUNT(*) as count FROM retrieval_logs").fetchone()
+                stats["total_retrieval_logs"] = int(row["count"]) if row else 0
+
+                row = conn.execute(
+                    "SELECT COUNT(*) as count FROM retrieval_logs WHERE session_id=?",
+                    (session_id,)
+                ).fetchone()
+                stats["session_retrieval_logs"] = int(row["count"]) if row else 0
+
+                row = conn.execute("SELECT COUNT(*) as count FROM entry_index WHERE match_count > 0").fetchone()
+                stats["entries_with_matches"] = int(row["count"]) if row else 0
+
+                rows = conn.execute(
+                    "SELECT name, match_count FROM entry_index WHERE match_count > 0 ORDER BY match_count DESC LIMIT 10"
+                ).fetchall()
+                stats["top_matched_entries"] = [
+                    {"name": str(row["name"]), "match_count": int(row["match_count"])}
+                    for row in rows
+                ]
+        except Exception as exc:
+            stats["error"] = str(exc)
+
+        return stats

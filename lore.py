@@ -18,10 +18,22 @@ def _list(value: Any) -> list[str]:
     return []
 
 
-def normalize_entry(raw: dict[str, Any], fallback_uid: str) -> LoreEntry:
+def normalize_entry(raw: dict[str, Any], fallback_uid: str, *, kind: str = "lorebook") -> LoreEntry:
     ext = raw.get("extensions") if isinstance(raw.get("extensions"), dict) else {}
     uid = str(raw.get("uid", raw.get("id", fallback_uid)))
-    position = raw.get("position", ext.get("position", Position.AFTER_CHARACTER))
+    position = raw.get("position", ext.get("position"))
+
+    if kind == "material":
+        vectorized_default = True
+        use_probability_default = False
+        position_default = Position.AT_DEPTH
+        order_default = 120
+    else:
+        vectorized_default = False
+        use_probability_default = True
+        position_default = Position.AFTER_CHARACTER
+        order_default = 100
+
     probability = raw.get("probability", ext.get("probability", 100))
     return LoreEntry(
         uid=uid,
@@ -33,12 +45,12 @@ def normalize_entry(raw: dict[str, Any], fallback_uid: str) -> LoreEntry:
         disabled=bool(raw.get("disable", raw.get("disabled", False))),
         selective=bool(raw.get("selective", False)),
         selective_logic=int(raw.get("selectiveLogic", raw.get("selective_logic", 0)) or 0),
-        position=int(position if position is not None else Position.AFTER_CHARACTER),
+        position=int(position if position is not None else position_default),
         depth=int(raw.get("depth", ext.get("depth", 4)) or 0),
         role=str(raw.get("role", ext.get("role", "system"))),
-        order=int(raw.get("order", 100) or 100),
+        order=int(raw.get("order", order_default) or order_default),
         probability=int(probability if probability is not None else 100),
-        use_probability=bool(raw.get("useProbability", raw.get("use_probability", True))),
+        use_probability=bool(raw.get("useProbability", raw.get("use_probability", use_probability_default))),
         scan_depth=raw.get("scanDepth", ext.get("scan_depth")),
         case_sensitive=bool(raw.get("caseSensitive", ext.get("case_sensitive", False))),
         match_whole_words=bool(raw.get("matchWholeWords", ext.get("match_whole_words", False))),
@@ -50,14 +62,14 @@ def normalize_entry(raw: dict[str, Any], fallback_uid: str) -> LoreEntry:
         prevent_recursion=bool(raw.get("preventRecursion", ext.get("prevent_recursion", False))),
         delay_until_recursion=bool(raw.get("delayUntilRecursion", ext.get("delay_until_recursion", False))),
         outlet_name=str(raw.get("outletName", ext.get("outlet_name", ""))),
-        vectorized=bool(raw.get("vectorized", ext.get("vectorized", False))),
+        vectorized=bool(raw.get("vectorized", ext.get("vectorized", vectorized_default))),
         group=str(raw.get("group", "")),
         group_override=bool(raw.get("groupOverride", raw.get("group_override", False))),
         raw=dict(raw),
     )
 
 
-def normalize_entries(document: dict[str, Any]) -> list[LoreEntry]:
+def normalize_entries(document: dict[str, Any], *, kind: str = "lorebook") -> list[LoreEntry]:
     source = document.get("entries", document.get("data", document))
     if isinstance(source, dict):
         items = list(source.values())
@@ -65,7 +77,7 @@ def normalize_entries(document: dict[str, Any]) -> list[LoreEntry]:
         items = source
     else:
         return []
-    return [normalize_entry(item, str(index)) for index, item in enumerate(items) if isinstance(item, dict)]
+    return [normalize_entry(item, str(index), kind=kind) for index, item in enumerate(items) if isinstance(item, dict)]
 
 
 class LoreScanner:

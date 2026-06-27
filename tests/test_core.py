@@ -651,7 +651,7 @@ class CoreTests(unittest.TestCase):
             storage = TavernStorage(Path(directory) / "state.db")
             preset_id = storage.put_document("preset", "Default", {"main_prompt": "base"})
             material_id = storage.put_document("material", "Material", {
-                "entries": [entry("material-x", ["spark"], "material content")]
+                "entries": [entry("material-x", ["spark"], "material content", vectorized=False)]
             })
             storage.bind("global", "*", "preset", preset_id)
             storage.bind("session", "s1", "material", material_id)

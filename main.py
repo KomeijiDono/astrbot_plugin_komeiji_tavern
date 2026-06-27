@@ -338,8 +338,24 @@ class KomeijiTavernPlugin(Star):
                 f"生命周期记录：{len(state.get('effects', {}))}\n可在插件管理页查看绑定和最终 messages[]。"
             )
             return
+        if action == "retrieval":
+            parts = rest.strip().split(" ", 1)
+            sub = parts[0] if parts else "status"
+            arg = parts[1] if len(parts) > 1 else ""
+            if sub == "test":
+                result = await self.service.test_retrieval(event, arg)
+                event.set_extra("_kt_force_long_delivery", True)
+                yield event.plain_result(result)
+                return
+            if sub == "stats":
+                stats = await self.service.get_retrieval_stats(session_id)
+                event.set_extra("_kt_force_long_delivery", True)
+                yield event.plain_result(json.dumps(stats, ensure_ascii=False, indent=2))
+                return
+            yield event.plain_result("用法：/tavern retrieval test <文本> 或 /tavern retrieval stats")
+            return
         if action not in {"continue", "impersonate", "quiet"}:
-            yield event.plain_result("用法：/tavern status|preview|reset|continue|impersonate|quiet [补充提示]")
+            yield event.plain_result("用法：/tavern status|preview|reset|continue|impersonate|quiet|retrieval [补充提示]")
             return
         event.set_extra("_kt_mode", action)
         event.set_extra("_kt_quiet_prompt", str(rest) if action == "quiet" else "")
