@@ -2,7 +2,7 @@
 
 # Komeiji's Tavern
 
-[![Version](https://img.shields.io/badge/version-0.6.0-7c5cff?style=for-the-badge)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.6.1-7c5cff?style=for-the-badge)](CHANGELOG.md)
 [![AstrBot](https://img.shields.io/badge/AstrBot-4.25%2B-4f9cff?style=for-the-badge)](https://github.com/AstrBotDevs/AstrBot)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-42b883?style=for-the-badge)](LICENSE)
 
@@ -101,12 +101,34 @@ FTS5 可用时优先使用 SQLite FTS5；不可用时自动降级为 LIKE 检索
 - `impersonate`：以用户口吻草拟下一条用户消息。
 - `quiet`：在深度 0 注入临时提示词，不改变长期预设。
 
+## 角色组与角色切换
+
+WebUI 的“角色组”页签可把多个角色卡组合成一个可绑定资源。把角色组绑定到会话、Persona 或全局后，插件会优先使用角色组；没有绑定角色组时继续使用普通单角色卡绑定。
+
+- `round_robin`：用户消息没有点名成员角色时，按成员顺序轮询切换。
+- `manual`：用户消息没有点名成员角色时，使用当前成员但不自动推进。
+- 用户消息中包含某个成员角色名时，本轮优先切到该角色。
+- 调试器会显示“本轮实际角色”和角色组切换状态，便于确认最终请求使用了谁。
+
+手动控制命令：
+
+```text
+/tavern character status
+/tavern character next
+/tavern character use <角色名>
+```
+
+`next` 推进到下一位并取消手动锁定；`use <角色名>` 锁定指定成员，直到再次 `next` 或重置会话状态。
+
 状态与调试命令：
 
 ```text
 /tavern status
 /tavern preview
 /tavern reset
+/tavern character status
+/tavern character next
+/tavern character use <角色名>
 /tavern retrieval test <文本>
 /tavern retrieval stats
 ```

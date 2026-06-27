@@ -129,26 +129,148 @@ class TavernService:
         }
         return {"scopes": scopes, "single": single, "additive": additive}
 
+    @staticmethod
+    def _document_ref(document: dict[str, Any] | None) -> dict[str, Any] | None:
+        if not document:
+            return None
+        return {"id": document.get("id", ""), "name": document.get("name", "")}
+
+    def _group_members(self, group_doc: dict[str, Any] | None) -> list[dict[str, Any]]:
+        if not group_doc:
+            return []
+        group = group_doc.get("data", {})
+        member_ids = [str(item) for item in group.get("members", []) if str(item).strip()]
+        members = [self.storage.get_document(item) for item in member_ids]
+        return [item for item in members if item and item.get("kind") == "character"]
+
+    @staticmethod
+    def _character_name(document: dict[str, Any] | None) -> str:
+        if not document:
+            return ""
+        data = document.get("data", {})
+        card = data.get("data", data) if isinstance(data, dict) else {}
+        return str(card.get("name") or document.get("name") or "")
+
+    def _select_character_with_meta(
+        self, scopes: list[tuple[str, str]], prompt: str, state: dict[str, Any], *, advance: bool = True
+    ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+        group_doc = self._bound_one("character_group", scopes)
+        meta: dict[str, Any] = {
+            "group": None,
+            "character": None,
+            "members": [],
+            "reason": "none",
+            "index": None,
+            "next_index": state.get("group_index", 0),
+            "forced": False,
+        }
+        if not group_doc:
+            selected = self._bound_one("character", scopes)
+            meta["character"] = self._document_ref(selected)
+            meta["reason"] = "single" if selected else "none"
+            return selected, meta
+
+        group = group_doc.get("data", {})
+        selection = str(group.get("selection", "round_robin") or "round_robin")
+        members = self._group_members(group_doc)
+        meta["group"] = {"id": group_doc.get("id", ""), "name": group_doc.get("name", ""), "selection": selection}
+        meta["members"] = [
+            {"id": item.get("id", ""), "name": item.get("name", ""), "card_name": self._character_name(item)}
+            for item in members
+        ]
+        if not members:
+            selected = self._bound_one("character", scopes)
+            meta["character"] = self._document_ref(selected)
+            meta["reason"] = "fallback_single" if selected else "none"
+            return selected, meta
+
+        lowered = prompt.lower()
+        selected = next((item for item in members if self._character_name(item).lower() in lowered), None)
+        reason = "mentioned" if selected is not None else ""
+        forced_id = str(state.get("forced_character_id", "") or "")
+        if selected is None and forced_id:
+            selected = next((item for item in members if item.get("id") == forced_id), None)
+            reason = "forced" if selected is not None else ""
+
+        if selected is None:
+            index = int(state.get("group_index", 0) or 0) % len(members)
+            selected = members[index]
+            reason = "round_robin" if selection == "round_robin" else "manual"
+            if selection == "round_robin" and advance:
+                state["group_index"] = (index + 1) % len(members)
+        else:
+            index = members.index(selected)
+
+        meta["character"] = {"id": selected.get("id", ""), "name": selected.get("name", ""), "card_name": self._character_name(selected)}
+        meta["reason"] = reason
+        meta["index"] = index
+        meta["next_index"] = state.get("group_index", 0)
+        meta["forced"] = reason == "forced"
+        return selected, meta
+
     def _select_character(
         self, scopes: list[tuple[str, str]], prompt: str, state: dict[str, Any]
     ) -> dict[str, Any] | None:
-        group_doc = self._bound_one("character_group", scopes)
-        if not group_doc:
-            return self._bound_one("character", scopes)
-        group = group_doc["data"]
-        member_ids = [str(item) for item in group.get("members", [])]
-        members = [self.storage.get_document(item) for item in member_ids]
-        members = [item for item in members if item and item.get("kind") == "character"]
-        if not members:
-            return self._bound_one("character", scopes)
-        lowered = prompt.lower()
-        selected = next((item for item in members if item["name"].lower() in lowered), None)
-        if selected is None:
-            index = int(state.get("group_index", 0)) % len(members)
-            selected = members[index]
-            if group.get("selection", "round_robin") == "round_robin":
-                state["group_index"] = (index + 1) % len(members)
+        selected, _ = self._select_character_with_meta(scopes, prompt, state)
         return selected
+
+    def _character_group_status(self, scopes: list[tuple[str, str]], state: dict[str, Any]) -> tuple[dict[str, Any] | None, list[dict[str, Any]], str]:
+        group_doc = self._bound_one("character_group", scopes)
+        members = self._group_members(group_doc)
+        forced_id = str(state.get("forced_character_id", "") or "")
+        return group_doc, members, forced_id
+
+    def character_status(self, scopes: list[tuple[str, str]], session_id: str) -> str:
+        state = self.storage.get_session(session_id)
+        group_doc, members, forced_id = self._character_group_status(scopes, state)
+        if not group_doc:
+            selected = self._bound_one("character", scopes)
+            name = self._character_name(selected) if selected else "无"
+            return f"当前作用域没有绑定角色组。普通角色卡：{name}"
+        group = group_doc.get("data", {})
+        index = int(state.get("group_index", 0) or 0) % len(members) if members else 0
+        forced = next((item for item in members if item.get("id") == forced_id), None)
+        current = forced or (members[index] if members else None)
+        lines = [
+            f"角色组：{group_doc.get('name', '')}",
+            f"策略：{group.get('selection', 'round_robin')}",
+            f"当前角色：{self._character_name(current) if current else '无'}",
+            f"手动锁定：{self._character_name(forced) if forced else '无'}",
+            "成员：",
+        ]
+        lines.extend(f"{i + 1}. {self._character_name(item)}" for i, item in enumerate(members))
+        return "\n".join(lines)
+
+    def character_next(self, scopes: list[tuple[str, str]], session_id: str) -> str:
+        state = self.storage.get_session(session_id)
+        group_doc, members, _ = self._character_group_status(scopes, state)
+        if not group_doc or not members:
+            return "当前作用域没有可切换的角色组。"
+        forced_id = str(state.get("forced_character_id", "") or "")
+        forced_index = next((i for i, item in enumerate(members) if item.get("id") == forced_id), None)
+        current_index = forced_index if forced_index is not None else int(state.get("group_index", 0) or 0) % len(members)
+        index = (current_index + 1) % len(members)
+        selected = members[index]
+        state["group_index"] = index
+        state.pop("forced_character_id", None)
+        self.storage.save_session(session_id, state)
+        return f"已切换到：{self._character_name(selected)}"
+
+    def character_use(self, scopes: list[tuple[str, str]], session_id: str, name: str) -> str:
+        state = self.storage.get_session(session_id)
+        group_doc, members, _ = self._character_group_status(scopes, state)
+        if not group_doc or not members:
+            return "当前作用域没有可切换的角色组。"
+        needle = name.strip().lower()
+        if not needle:
+            return "请提供角色名，例如：/tavern character use Alice"
+        selected = next((item for item in members if needle in self._character_name(item).lower()), None)
+        if not selected:
+            return "角色组中没有找到该角色。"
+        state["forced_character_id"] = selected.get("id", "")
+        state["group_index"] = members.index(selected)
+        self.storage.save_session(session_id, state)
+        return f"已锁定角色：{self._character_name(selected)}"
 
     def _cache_get(self, key: str) -> list[float] | None:
         value = self._embedding_cache.get(key)
@@ -669,7 +791,9 @@ class TavernService:
                 vector_matcher=matcher,
             )
             preset_doc = await asyncio.to_thread(self._bound_one, "preset", scopes)
-            character_doc = await asyncio.to_thread(self._select_character, scopes, req.prompt or "", state)
+            character_doc, character_selection = await asyncio.to_thread(
+                self._select_character_with_meta, scopes, req.prompt or "", state
+            )
             persona_doc = await asyncio.to_thread(self._bound_one, "persona", scopes)
             history, summary_meta, summary_warnings, apply_history_limit = await self._prepare_history(
                 list(req.contexts or []), state, session_id=session_id, generate=True
@@ -710,6 +834,7 @@ class TavernService:
             )
             await asyncio.to_thread(self.storage.save_session, session_id, state)
             preview = self._serialize_result(result, scan, summary=summary_meta)
+            preview["character_selection"] = character_selection
             preview["memory"] = {
                 "enabled": bool(self.config.get("memory_enabled", False)),
                 "matches": [
@@ -820,7 +945,9 @@ class TavernService:
             memory_text = f"{memory_text}\n{prompt}".strip()
         memory_context, memory_matches = await self._retrieve_memories(scopes=scopes, text=memory_text)
         preset_doc = await asyncio.to_thread(self._bound_one, "preset", scopes)
-        character_doc = await asyncio.to_thread(self._bound_one, "character", scopes)
+        character_doc, character_selection = await asyncio.to_thread(
+            self._select_character_with_meta, scopes, prompt, state
+        )
         persona_doc = await asyncio.to_thread(self._bound_one, "persona", scopes)
         char_data = (character_doc or {}).get("data", {})
         char_values = char_data.get("data", char_data)
@@ -857,6 +984,7 @@ class TavernService:
         serialized.update({
             "warnings": warnings,
             "effective": effective,
+            "character_selection": character_selection,
             "state_after": state,
             "state_persisted": False,
             "memory": {

@@ -101,6 +101,16 @@ class CoreTests(unittest.TestCase):
         self.assertTrue(flattened["summary_enabled"])
         self.assertEqual(flattened["session_retention_days"], 30)
 
+    def test_character_group_defaults_and_validation(self):
+        normalized, errors, _ = validate_document("character_group", {})
+        self.assertFalse(errors)
+        self.assertEqual(normalized["members"], [])
+        self.assertEqual(normalized["selection"], "round_robin")
+
+        _, errors, _ = validate_document("character_group", {"members": {}, "selection": "bad"})
+        self.assertTrue(any("members" in item for item in errors))
+        self.assertTrue(any("selection" in item for item in errors))
+
     def test_qq_direct_split_sends_plain_messages_and_clears_result(self):
         class Result:
             def __init__(self):
@@ -660,6 +670,71 @@ class CoreTests(unittest.TestCase):
             }))
             self.assertEqual(result["activated"][0]["uid"], "material-x")
             self.assertEqual(result["activated"][0]["content"], "material content")
+
+    def test_simulation_uses_character_group_selection_without_persisting(self):
+        with tempfile.TemporaryDirectory() as directory:
+            storage = TavernStorage(Path(directory) / "state.db")
+            preset_id = storage.put_document("preset", "Default", {"main_prompt": "base"})
+            alice_id = storage.put_document("character", "Alice", {"data": {"name": "Alice", "description": "alice desc"}})
+            bob_id = storage.put_document("character", "Bob", {"data": {"name": "Bob", "description": "bob desc"}})
+            group_id = storage.put_document("character_group", "Group", {
+                "members": [alice_id, bob_id], "selection": "round_robin",
+            })
+            storage.bind("global", "*", "preset", preset_id)
+            storage.bind("session", "s1", "character_group", group_id)
+            before = storage.get_session("s1")
+            result = run(TavernService(storage, object(), {}).simulate({
+                "session_id": "s1", "prompt": "hello", "system_prompt": "system"
+            }))
+            self.assertEqual(result["character_selection"]["character"]["card_name"], "Alice")
+            self.assertEqual(result["character_selection"]["reason"], "round_robin")
+            self.assertEqual(result["state_after"]["group_index"], 1)
+            self.assertEqual(storage.get_session("s1"), before)
+
+    def test_character_group_mentioned_and_manual_do_not_advance(self):
+        with tempfile.TemporaryDirectory() as directory:
+            storage = TavernStorage(Path(directory) / "state.db")
+            preset_id = storage.put_document("preset", "Default", {"main_prompt": "base"})
+            alice_id = storage.put_document("character", "Alice", {"data": {"name": "Alice"}})
+            bob_id = storage.put_document("character", "Bob", {"data": {"name": "Bob"}})
+            group_id = storage.put_document("character_group", "Group", {
+                "members": [alice_id, bob_id], "selection": "manual",
+            })
+            storage.bind("global", "*", "preset", preset_id)
+            storage.bind("session", "s1", "character_group", group_id)
+            storage.save_session("s1", {"turn": 0, "effects": {}, "variables": {}, "group_index": 1})
+            result = run(TavernService(storage, object(), {}).simulate({"session_id": "s1", "prompt": "Alice 请回答"}))
+            self.assertEqual(result["character_selection"]["character"]["card_name"], "Alice")
+            self.assertEqual(result["character_selection"]["reason"], "mentioned")
+            self.assertEqual(result["state_after"]["group_index"], 1)
+
+            result = run(TavernService(storage, object(), {}).simulate({"session_id": "s1", "prompt": "hello"}))
+            self.assertEqual(result["character_selection"]["character"]["card_name"], "Bob")
+            self.assertEqual(result["character_selection"]["reason"], "manual")
+            self.assertEqual(result["state_after"]["group_index"], 1)
+
+    def test_character_commands_lock_and_advance_group(self):
+        with tempfile.TemporaryDirectory() as directory:
+            storage = TavernStorage(Path(directory) / "state.db")
+            alice_id = storage.put_document("character", "Alice", {"data": {"name": "Alice"}})
+            bob_id = storage.put_document("character", "Bob", {"data": {"name": "Bob"}})
+            group_id = storage.put_document("character_group", "Group", {
+                "members": [alice_id, bob_id], "selection": "manual",
+            })
+            storage.bind("session", "s1", "character_group", group_id)
+            service = TavernService(storage, object(), {})
+            scopes = [("global", "*"), ("session", "s1")]
+
+            self.assertIn("当前角色：Alice", service.character_status(scopes, "s1"))
+            self.assertIn("已锁定角色：Bob", service.character_use(scopes, "s1", "Bob"))
+            state = storage.get_session("s1")
+            self.assertEqual(state["forced_character_id"], bob_id)
+            self.assertEqual(state["group_index"], 1)
+
+            self.assertIn("已切换到：Alice", service.character_next(scopes, "s1"))
+            state = storage.get_session("s1")
+            self.assertNotIn("forced_character_id", state)
+            self.assertEqual(state["group_index"], 0)
 
     def test_simulation_warns_when_scope_has_no_preset(self):
         with tempfile.TemporaryDirectory() as directory:
