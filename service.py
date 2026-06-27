@@ -194,16 +194,17 @@ class TavernService:
                 if not entry.vectorized or entry.disabled or not entry.content:
                     continue
                 content_hash = hashlib.sha1(entry.content.encode("utf-8")).hexdigest()
-                vector = self._cache_get(content_hash)
+                cache_key = f"{embedding_model}:{content_hash}"
+                vector = self._cache_get(cache_key)
                 if vector is None:
                     vector = await asyncio.to_thread(
                         self.storage.get_entry_embedding_by_hash, content_hash, embedding_model
                     )
                     if vector:
-                        self._cache_put(content_hash, vector)
+                        self._cache_put(cache_key, vector)
                 if not vector:
                     vector = list(await provider.get_embedding(entry.content))
-                    self._cache_put(content_hash, vector)
+                    self._cache_put(cache_key, vector)
                     await asyncio.to_thread(
                         self.storage.update_entry_embedding,
                         content_hash,
@@ -438,7 +439,13 @@ class TavernService:
         for kind in ("lorebook", "material"):
             documents = await asyncio.to_thread(self.storage.resolve_bindings, kind, scopes)
             for document in documents:
-                entries.extend(normalize_entries(document["data"], kind=kind))
+                normalized = normalize_entries(document["data"], kind=kind)
+                for index, item in enumerate(normalized):
+                    item.raw.setdefault("document_id", document["id"])
+                    item.raw.setdefault("document_name", document.get("name", ""))
+                    item.raw.setdefault("kind", kind)
+                    item.raw.setdefault("index", index)
+                entries.extend(normalized)
         return entries
 
     @staticmethod
@@ -640,7 +647,7 @@ class TavernService:
         async with self._session_lock(session_id):
             state = await asyncio.to_thread(self.storage.get_session, session_id)
             pending = state.pop("pending_generation", {})
-            mode = str(event.get_extra("_kt_mode") or pending.get("mode") or mode)
+            generation_mode = str(event.get_extra("_kt_mode") or pending.get("mode") or mode)
             quiet_prompt = str(event.get_extra("_kt_quiet_prompt") or pending.get("prompt") or quiet_prompt)
             await asyncio.to_thread(self.storage.save_session, session_id, state)
             entries = await self._collect_entries(scopes)
@@ -648,11 +655,11 @@ class TavernService:
             if req.prompt:
                 scan_messages.append({"role": "user", "content": req.prompt})
 
-            mode = str(self.config.get("retrieval_mode", "hybrid") or "hybrid")
+            retrieval_mode = str(self.config.get("retrieval_mode", "hybrid") or "hybrid")
             matcher = None
-            if mode == "vector" and not self.config.get("vector_enabled", False):
+            if retrieval_mode == "vector" and not self.config.get("vector_enabled", False):
                 pass
-            elif mode == "vector":
+            elif retrieval_mode == "vector":
                 matcher = self._vector_matcher
             else:
                 matcher = self._hybrid_matcher
@@ -686,7 +693,7 @@ class TavernService:
                 original_system=req.system_prompt or "", contexts=history,
                 current_prompt=req.prompt or "", preset=preset_doc["data"] if preset_doc else {},
                 character=character, persona=(persona_doc or {}).get("data", {}).get("content", ""),
-                lore=scan, values=values, mode=mode, quiet_prompt=quiet_prompt,
+                lore=scan, values=values, mode=generation_mode, quiet_prompt=quiet_prompt,
                 session_summary=str(summary_meta.get("content", "")),
                 memory_context=memory_context,
                 apply_history_limit=apply_history_limit,
@@ -711,8 +718,8 @@ class TavernService:
                 ],
             }
             preview["retrieval"] = {
-                "enabled": bool(self.config.get("vector_enabled", False)) or str(self.config.get("retrieval_mode", "hybrid") or "hybrid") == "keyword",
-                "mode": str(self.config.get("retrieval_mode", "hybrid") or "hybrid"),
+                "enabled": bool(self.config.get("vector_enabled", False)) or retrieval_mode == "keyword",
+                "mode": retrieval_mode,
                 "fts_available": bool(self.storage.fts_available),
                 "candidate_count": int(self.config.get("retrieval_candidate_k", 60)),
                 "top_k": int(self.config.get("retrieval_top_k", 8)),
@@ -721,7 +728,8 @@ class TavernService:
                         "uid": match.entry.uid,
                         "name": match.entry.comment,
                         "score": match.score,
-                        "reason": match.reason,
+                        "reason": "matcher",
+                        "scanner_reason": match.reason,
                     }
                     for match in scan.activated
                     if match.reason in ("vector", "hybrid", "keyword")
@@ -744,13 +752,14 @@ class TavernService:
                         "entry_uid": match.entry.uid,
                         "name": match.entry.comment,
                         "score": match.score,
-                        "reason": match.reason,
+                        "reason": "matcher",
+                        "scanner_reason": match.reason,
                     })
                 await asyncio.to_thread(
                     self.storage.record_retrieval_log,
                     session_id=session_id,
                     query=req.prompt or "",
-                    mode=str(self.config.get("retrieval_mode", "hybrid") or "hybrid"),
+                    mode=retrieval_mode,
                     matches=match_details,
                 )
                 await asyncio.to_thread(self.storage.increment_entry_match_counts, entry_ids)
@@ -762,7 +771,7 @@ class TavernService:
             await asyncio.to_thread(self.storage.record_metric, {
                 "session_id": session_id,
                 "provider_id": provider_id,
-                "mode": mode,
+                "mode": generation_mode,
                 "prompt_tokens": sum(estimate_tokens(str(message.get("content", ""))) for message in result.messages),
                 "message_count": len(result.messages),
                 "block_count": len(result.blocks),
@@ -792,11 +801,11 @@ class TavernService:
         scan_messages = messages + ([{"role": "user", "content": prompt}] if prompt else [])
         entries = await self._collect_entries(scopes)
 
-        mode = str(self.config.get("retrieval_mode", "hybrid") or "hybrid")
+        retrieval_mode = str(self.config.get("retrieval_mode", "hybrid") or "hybrid")
         matcher = None
-        if mode == "vector" and not self.config.get("vector_enabled", False):
+        if retrieval_mode == "vector" and not self.config.get("vector_enabled", False):
             pass
-        elif mode == "vector":
+        elif retrieval_mode == "vector":
             matcher = self._vector_matcher
         else:
             matcher = self._hybrid_matcher
@@ -855,8 +864,8 @@ class TavernService:
                 "matches": memory_matches,
             },
             "retrieval": {
-                "enabled": bool(self.config.get("vector_enabled", False)),
-                "mode": str(self.config.get("retrieval_mode", "hybrid") or "hybrid"),
+                "enabled": bool(self.config.get("vector_enabled", False)) or retrieval_mode == "keyword",
+                "mode": retrieval_mode,
                 "fts_available": bool(self.storage.fts_available),
                 "candidate_count": int(self.config.get("retrieval_candidate_k", 60)),
                 "top_k": int(self.config.get("retrieval_top_k", 8)),
@@ -865,7 +874,8 @@ class TavernService:
                         "uid": match.entry.uid,
                         "name": match.entry.comment,
                         "score": match.score,
-                        "reason": match.reason,
+                        "reason": "matcher",
+                        "scanner_reason": match.reason,
                     }
                     for match in scan.activated
                     if match.reason in ("vector", "hybrid", "keyword")

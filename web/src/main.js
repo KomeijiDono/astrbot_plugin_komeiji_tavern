@@ -62,9 +62,10 @@ const labels = {
 const tabs = [
   ['home', '开始'],
   ['character', '角色卡'],
-  ['preset', '提示词预设'],
-  ['lorebook', '世界书'],
-  ['persona', '用户设定'],
+    ['preset', '提示词预设'],
+    ['lorebook', '世界书'],
+    ['material', '创作素材'],
+    ['persona', '用户设定'],
   ['bindings', '绑定管理'],
   ['memories', '长期记忆'],
   ['metrics', '运行仪表盘'],
@@ -95,7 +96,7 @@ const blocks = [
   depth: 0,
 }))
 
-const newEntry = () => ({
+const newEntry = kind => ({
   uid: crypto.randomUUID(),
   comment: '新条目',
   key: [],
@@ -115,7 +116,8 @@ const newEntry = () => ({
   cooldown: 0,
   delay: 0,
   outletName: '',
-  vectorized: false,
+  vectorized: kind === 'material',
+  extensions: { category: '', description: '' },
 })
 
 createApp({
@@ -129,6 +131,7 @@ createApp({
     const personas = ref([])
     const conversations = ref([])
     const selected = ref(null)
+    const pendingDeleteId = ref('')
     const error = ref('')
     const notice = ref('')
     const busy = ref(false)
@@ -142,6 +145,9 @@ createApp({
     const dFocused = ref(false)
     const memoryQuery = ref('')
     const metricDays = ref(7)
+    const retrievalTest = ref({ text: '' })
+    const retrievalStats = ref(null)
+    const retrievalResult = ref(null)
 
     const binding = ref({ scope_type: 'session', scope_id: '', kind: 'character', target_id: '', priority: 0 })
     const memoryDraft = ref({ id: '', scope_type: 'session', scope_id: '', category: 'status', content: '', enabled: true })
@@ -234,8 +240,15 @@ createApp({
 
     const choose = d => {
       selected.value = JSON.parse(JSON.stringify(d))
-      if (d.kind === 'lorebook' && !Array.isArray(selected.value.data.entries)) {
+      pendingDeleteId.value = ''
+      if (['lorebook', 'material'].includes(d.kind) && !Array.isArray(selected.value.data.entries)) {
         selected.value.data.entries = Object.values(selected.value.data.entries || {})
+      }
+      if (['lorebook', 'material'].includes(d.kind)) {
+        selected.value.data.entries = (selected.value.data.entries || []).map(e => ({
+          ...e,
+          extensions: { category: '', description: '', ...(e.extensions || {}) },
+        }))
       }
       advanced.value = JSON.stringify(selected.value.data, null, 2)
       clear()
@@ -246,6 +259,7 @@ createApp({
         character: { data: { name: '新角色', description: '', personality: '', scenario: '', first_mes: '', mes_example: '', system_prompt: '', post_history_instructions: '' } },
         preset: { main_prompt: '{{original_system}}', post_history_instructions: '', allow_character_main_override: false, allow_character_phi_override: true, blocks: JSON.parse(JSON.stringify(blocks)) },
         lorebook: { entries: [] },
+        material: { entries: [] },
         persona: { content: '' },
       }
       choose({ kind, name: '新' + labels[kind], data: t[kind] })
@@ -270,10 +284,26 @@ createApp({
     }
 
     const remove = async () => {
-      if (!selected.value?.id || !confirm('确定删除"' + selected.value.name + '"吗？')) return
-      await post('/documents/delete', { id: selected.value.id })
-      selected.value = null
-      await load()
+      if (!selected.value?.id) return
+      if (pendingDeleteId.value !== selected.value.id) {
+        pendingDeleteId.value = selected.value.id
+        notice.value = '再次点击删除以确认删除“' + selected.value.name + '”。'
+        error.value = ''
+        return
+      }
+      busy.value = true; clear()
+      try {
+        const out = await post('/documents/delete', { id: selected.value.id })
+        if (!out.data?.deleted) throw new Error('资料不存在或已经被删除')
+        selected.value = null
+        pendingDeleteId.value = ''
+        await load()
+        notice.value = '已删除。'
+      } catch (e) {
+        error.value = e.message || '删除失败。'
+      } finally {
+        busy.value = false
+      }
     }
 
     const duplicate = async () => {
@@ -327,7 +357,24 @@ createApp({
       if (!file.value) return
       busy.value = true; clear()
       try {
-        const binary = file.value.name.toLowerCase().endsWith('.png')
+        const lowerName = file.value.name.toLowerCase()
+        if (['.db', '.sqlite', '.sqlite3'].some(suffix => lowerName.endsWith(suffix))) {
+          const base64 = await new Promise((ok, fail) => {
+            const r = new FileReader()
+            r.onload = () => ok(String(r.result).split(',')[1])
+            r.onerror = fail
+            r.readAsDataURL(file.value)
+          })
+          const out = await post('/import/sqlite', { base64, file_name: file.value.name })
+          await load()
+          binding.value.kind = 'material'
+          binding.value.target_id = out.data.id
+          tab.value = 'bindings'
+          notice.value = 'SQLite 导入完成：知识库素材，共 ' + out.data.count + ' 条。请选择目标并绑定。'
+          return
+        }
+
+        const binary = lowerName.endsWith('.png')
         const content = binary ? '' : await file.value.text()
         const base64 = binary ? await new Promise((ok, fail) => {
           const r = new FileReader()
@@ -401,6 +448,29 @@ createApp({
     const refreshMetrics = async () => {
       clear()
       metrics.value = (await request('/metrics?days=' + encodeURIComponent(metricDays.value) + '&limit=1000')).data
+    }
+
+    const refreshRetrievalStats = async () => {
+      clear()
+      const query = debug.value.session_id ? '?session_id=' + encodeURIComponent(debug.value.session_id) : ''
+      retrievalStats.value = (await request('/retrieval/stats' + query)).data
+    }
+
+    const runRetrievalTest = async () => {
+      clear()
+      if (!retrievalTest.value.text.trim()) { error.value = '请填写检索测试文本。'; return }
+      busy.value = true
+      try {
+        retrievalResult.value = (await post('/retrieval/test', {
+          text: retrievalTest.value.text,
+          session_id: debug.value.session_id,
+          persona_id: debug.value.persona_id,
+        })).data
+      } catch (e) {
+        error.value = e.message
+      } finally {
+        busy.value = false
+      }
     }
 
     const addBinding = async () => {
@@ -478,10 +548,11 @@ createApp({
     onMounted(load)
 
     return {
-      tabs, labels, tab, overview, documents, bindings, personas, selected, error, notice, busy,
+      tabs, labels, tab, overview, documents, bindings, personas, selected, pendingDeleteId, error, notice, busy,
       downloadLocationHint,
       advanced, binding, memoryDraft, memoryQuery, memories, filteredMemories,
       metricDays, metrics, metricItems, metricTotals, metricProviders, maxMetricTokens,
+      retrievalTest, retrievalStats, retrievalResult,
       debug, debugResult, docsForTab, bindDocs, card, entries,
       sessionOptions, sFiltered, dFiltered, sessionDisplay, debugDisplay,
       sOpen, dOpen, pickSession, onSFocus, onSBlur, pickDebug, onDFocus, onDBlur,
@@ -490,8 +561,9 @@ createApp({
       setFile: e => file.value = e.target.files[0],
       updateScope, addBinding, unbind, scopeName, updateMemoryScope, resetMemoryDraft,
       saveMemory, editMemory, toggleMemory, deleteMemory, refreshMetrics,
+      refreshRetrievalStats, runRetrievalTest,
       move, addBlock, keyText, setKeys,
-      addEntry: () => selected.value.data.entries.push(newEntry()),
+      addEntry: () => selected.value.data.entries.push(newEntry(tab.value)),
       selectConversation, simulate, actual, formatTimestamp,
     }
   },
@@ -501,7 +573,7 @@ createApp({
     <div class="brand">
       <small>ASTRBOT 角色扮演工作台</small>
       <h1>Komeiji's<br>Tavern</h1>
-      <span>v0.5.0</span>
+      <span>v0.6.0</span>
     </div>
     <button v-for="t in tabs" :class="{active:tab===t[0]}" @click="tab=t[0];selected=null">{{t[1]}}</button>
   </aside>
@@ -509,14 +581,14 @@ createApp({
     <header>
       <div><h2>{{tabs.find(x=>x[0]===tab)?.[1]}}</h2><p>创建或导入 → 编辑 → 绑定 → 扫描测试 → 检查 messages[]</p></div>
       <div class="header-actions">
-        <label class="import"><input type="file" accept=".json,.yaml,.yml,.png,.txt,.md" @change="setFile"><button @click="importData" :disabled="busy">解析并导入</button></label>
+        <label class="import"><input type="file" accept=".json,.yaml,.yml,.png,.txt,.md,.db,.sqlite,.sqlite3" @change="setFile"><button @click="importData" :disabled="busy">解析并导入</button></label>
         <details class="export-menu">
           <summary>导出</summary>
           <div class="export-popover">
             <strong>导出内容</strong>
-            <button v-if="['character','preset','lorebook','persona'].includes(tab) && selected?.id" @click="exportSelected" :disabled="busy">当前资料 JSON</button>
-            <button v-if="['character','preset','lorebook','persona'].includes(tab)" @click="exportKind" :disabled="busy || !docsForTab.length">当前类别 ZIP</button>
-            <button v-if="tab==='home' || ['character','preset','lorebook','persona'].includes(tab)" @click="exportAll" :disabled="busy || !documents.length">全部资料 ZIP</button>
+            <button v-if="['character','preset','lorebook','material','persona'].includes(tab) && selected?.id" @click="exportSelected" :disabled="busy">当前资料 JSON</button>
+            <button v-if="['character','preset','lorebook','material','persona'].includes(tab)" @click="exportKind" :disabled="busy || !docsForTab.length">当前类别 ZIP</button>
+            <button v-if="tab==='home' || ['character','preset','lorebook','material','persona'].includes(tab)" @click="exportAll" :disabled="busy || !documents.length">全部资料 ZIP</button>
             <button v-if="tab==='debug'" @click="exportMessages" :disabled="busy || !debugResult?.messages">当前 messages[] JSON</button>
             <button v-if="tab==='debug'" @click="backupSession" :disabled="busy || !debug.session_id">当前会话备份 ZIP</button>
             <p v-if="!['home','character','preset','lorebook','persona','debug'].includes(tab)" class="muted">当前页面没有可导出的内容。</p>
@@ -537,12 +609,16 @@ createApp({
           <button @click="tab='debug'"><b>3</b>检查请求</button>
         </div>
       </div>
+      <div class="panel">
+        <h3>知识库 SQLite 素材导入</h3>
+        <p>顶部“解析并导入”支持 .db / .sqlite / .sqlite3。系统会自动识别兼容的知识库表，并导入为创作素材。</p>
+      </div>
       <div class="cards">
         <div class="metric" v-for="(v,k) in labels"><strong>{{overview.counts?.[k]||0}}</strong><span>{{v}}</span></div>
       </div>
       <div class="panel"><h3>待完成</h3><p v-if="!overview.tasks?.length">没有必须处理的事项。</p><ul><li v-for="x in overview.tasks">{{x}}</li></ul></div>
     </section>
-    <section v-else-if="['character','preset','lorebook','persona'].includes(tab)" class="workspace">
+    <section v-else-if="['character','preset','lorebook','material','persona'].includes(tab)" class="workspace">
       <div class="library">
         <div class="library-actions">
           <button class="primary" @click="createDoc(tab)">新建{{labels[tab]}}</button>
@@ -555,7 +631,7 @@ createApp({
           <input class="title-input" v-model="selected.name">
           <div>
             <button v-if="selected.id" @click="duplicate">复制</button>
-            <button v-if="selected.id" class="danger" @click="remove">删除</button>
+            <button v-if="selected.id" class="danger" @click="remove">{{pendingDeleteId===selected.id?'确认删除':'删除'}}</button>
             <button class="primary" @click="save">保存</button>
           </div>
         </div>
@@ -589,7 +665,7 @@ createApp({
           </div>
           <button @click="addBlock">添加自定义块</button>
         </template>
-        <template v-if="tab==='lorebook'">
+        <template v-if="tab==='lorebook' || tab==='material'">
           <div class="entry" v-for="(e,i) in entries">
             <div class="entry-head">
               <input v-model="e.comment"><label><input type="checkbox" v-model="e.constant">常驻</label>
@@ -614,6 +690,10 @@ createApp({
               <label>Sticky<input type="number" v-model.number="e.sticky"></label>
               <label>Cooldown<input type="number" v-model.number="e.cooldown"></label>
               <label>Delay<input type="number" v-model.number="e.delay"></label>
+            </div>
+            <div class="grid" v-if="tab==='material'">
+              <label>分类<input v-model="e.extensions.category"></label>
+              <label>描述<input v-model="e.extensions.description"></label>
             </div>
             <label>注入内容<textarea v-model="e.content"></textarea></label>
           </div>
@@ -776,7 +856,34 @@ createApp({
             <span>命中条目：{{debugResult.retrieval.matches?.length||0}}</span>
           </div>
           <div v-if="debugResult.retrieval.matches?.length" class="activation" v-for="m in debugResult.retrieval.matches">
-            <b>{{m.name||m.uid}}</b> · {{m.reason}} · 分数 {{m.score?.toFixed(3)}}
+            <b>{{m.name||m.uid}}</b> · {{m.reason}}<span v-if="m.scanner_reason"> / {{m.scanner_reason}}</span> · 分数 {{m.score?.toFixed(3)}}
+          </div>
+        </details>
+        <details open><summary>检索测试与统计</summary>
+          <div class="binding-form">
+            <label>测试文本<textarea v-model="retrievalTest.text" placeholder="输入一段用户消息，测试 keyword/vector/hybrid 召回"></textarea></label>
+            <button class="primary" @click="runRetrievalTest" :disabled="busy">测试检索</button>
+            <button @click="refreshRetrievalStats">刷新统计</button>
+          </div>
+          <div class="effective" v-if="retrievalStats">
+            <span>模式：{{retrievalStats.mode}}</span>
+            <span>向量：{{retrievalStats.vector_enabled?'启用':'禁用'}}</span>
+            <span>FTS：{{retrievalStats.fts_available?'可用':'不可用'}}</span>
+            <span>总日志：{{retrievalStats.total_retrieval_logs||0}}</span>
+            <span>当前会话日志：{{retrievalStats.session_retrieval_logs||0}}</span>
+            <span>命中过的条目：{{retrievalStats.entries_with_matches||0}}</span>
+          </div>
+          <div v-if="retrievalStats?.top_matched_entries?.length">
+            <h4>高频命中</h4>
+            <div class="activation" v-for="m in retrievalStats.top_matched_entries"><b>{{m.name||'未命名'}}</b> · {{m.match_count}} 次</div>
+          </div>
+          <div v-if="retrievalResult">
+            <h4>测试结果：{{retrievalResult.matches?.length||0}} 条</h4>
+            <div class="effective"><span>模式：{{retrievalResult.mode}}</span><span>FTS：{{retrievalResult.fts_available?'可用':'不可用'}}</span><span>候选：{{retrievalResult.candidate_count}}</span><span>上限：{{retrievalResult.top_k}}</span></div>
+            <div class="activation" v-for="m in retrievalResult.matches">
+              <b>{{m.name||m.uid}}</b> · {{m.score?.toFixed(3)}} · {{m.category||'未分类'}}<small v-if="m.document_name"> · {{m.document_name}}</small>
+              <pre>{{m.content}}</pre>
+            </div>
           </div>
         </details>
         <div class="alert error" v-for="w in debugResult.warnings">{{w}}</div>
@@ -807,7 +914,9 @@ createApp({
 /tavern reset
 /tavern continue [补充要求]
 /tavern impersonate [补充要求]
-/tavern quiet [静默提示词]</pre>
+/tavern quiet [静默提示词]
+/tavern retrieval test <文本>
+/tavern retrieval stats</pre>
     </section>
   </main>
 </div>`

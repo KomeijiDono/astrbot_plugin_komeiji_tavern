@@ -130,7 +130,7 @@ def read_quill_kb_sqlite(encoded: str) -> list[dict[str, Any]]:
             conn.row_factory = sqlite3.Row
             tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
             if "knowledge_base" not in tables:
-                raise ValueError("数据库中没有 knowledge_base 表，不是 Quill KB 格式")
+                raise ValueError("数据库中没有可识别的知识库表")
             rows = conn.execute('SELECT * FROM "knowledge_base"').fetchall()
             entries = []
             for index, row in enumerate(rows):
@@ -143,7 +143,7 @@ def read_quill_kb_sqlite(encoded: str) -> list[dict[str, Any]]:
 
                 entry = {
                     "uid": str(row_dict.get("entry_id") or f"quill_{index}"),
-                    "comment": str(row_dict.get("name") or row_dict.get("entry_id") or f"Quill Entry {index+1}"),
+                    "comment": str(row_dict.get("name") or row_dict.get("entry_id") or f"Knowledge Entry {index+1}"),
                     "content": str(row_dict.get("content") or ""),
                     "key": keywords + aliases,
                     "keysecondary": secondary,

@@ -246,6 +246,7 @@ class TavernStorage:
             priority = int(entry.get("priority", ext.get("priority", entry.get("order", 100))) or 100)
             constant = bool(entry.get("constant", entry.get("is_constant", False)))
             inject_position = int(entry.get("inject_position", ext.get("inject_position", 2)) or 2)
+            enabled = 0 if bool(entry.get("disable", entry.get("disabled", False))) else 1
 
             if content_hash in old_embeddings:
                 embedding_json, embedding_model = old_embeddings[content_hash]
@@ -273,7 +274,7 @@ class TavernStorage:
             fts_text = " ".join(all_keys + [category, description, name_val])
             result_rows.append((
                 entry_id, document_id, kind, str(uid), name_val, content,
-                keys_json, metadata_json, embedding_json, embedding_model, content_hash, 1, now,
+                keys_json, metadata_json, embedding_json, embedding_model, content_hash, enabled, now,
                 category, description, aliases_json, secondary_keys_json, priority, int(constant), inject_position, 0,
             ))
             fts_rows.append((entry_id, document_id, kind, name_val, content, fts_text))
@@ -302,7 +303,7 @@ class TavernStorage:
                     fts_rows,
                 )
 
-        return len(rows)
+        return len(result_rows)
 
     def _backup_legacy_database(self) -> None:
         if not self.path.exists():

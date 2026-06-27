@@ -69,6 +69,8 @@ class TavernWebApi:
             (f"{self.PREFIX}/memories/<memory_id>/toggle", ["POST"], self.toggle_memory, "Toggle long-term memory"),
             (f"{self.PREFIX}/memories/<memory_id>/delete", ["POST"], self.delete_memory, "Delete long-term memory"),
             (f"{self.PREFIX}/metrics", ["GET"], self.metrics, "Runtime metrics"),
+            (f"{self.PREFIX}/retrieval/test", ["POST"], self.retrieval_test, "Test retrieval"),
+            (f"{self.PREFIX}/retrieval/stats", ["GET"], self.retrieval_stats, "Retrieval stats"),
             (f"{self.PREFIX}/preview/<session_id>", ["GET"], self.preview, "Last request preview"),
             (f"{self.PREFIX}/session/<session_id>", ["GET"], self.session, "Session state"),
             (f"{self.PREFIX}/session/<session_id>/reset", ["POST"], self.reset_session, "Reset session"),
@@ -223,7 +225,7 @@ class TavernWebApi:
             if fmt == "quill_kb":
                 entries = read_quill_kb_sqlite(base64_data)
                 if not name:
-                    name = "Imported Quill KB"
+                    name = "Imported Knowledge Base"
             elif fmt == "material":
                 entries = read_material_sqlite(base64_data)
                 if not name:
@@ -233,7 +235,7 @@ class TavernWebApi:
                     entries = read_quill_kb_sqlite(base64_data)
                     fmt = "quill_kb"
                     if not name:
-                        name = "Imported Quill KB"
+                        name = "Imported Knowledge Base"
                 else:
                     entries = read_material_sqlite(base64_data)
                     fmt = "material"
@@ -357,6 +359,51 @@ class TavernWebApi:
             totals["warnings"] += int(row.get("warning_count", 0) or 0)
         totals["avg_duration_ms"] = int(totals["duration_ms"] / len(rows)) if rows else 0
         return self.ok({"items": rows, "totals": totals, "providers": providers})
+
+    async def retrieval_test(self):
+        payload = await request.get_json(force=True)
+        payload = payload if isinstance(payload, dict) else {}
+        text = str(payload.get("text", "")).strip()
+        if not text:
+            return self.error("请填写检索测试文本")
+        scopes = [("global", "*")]
+        for scope_type, key in (("session", "session_id"), ("persona", "persona_id"),
+                                ("user", "user_id"), ("group", "group_id")):
+            value = str(payload.get(key, "") or "")
+            if value:
+                scopes.append((scope_type, value))
+        entries = await self.service._collect_entries(scopes)
+        scores = await self.service._hybrid_matcher(text, entries)
+        entries_by_uid = {entry.uid: entry for entry in entries}
+        matches = []
+        for uid, score in sorted(scores.items(), key=lambda item: item[1], reverse=True):
+            entry = entries_by_uid.get(uid)
+            if not entry:
+                continue
+            ext = entry.raw.get("extensions") if isinstance(entry.raw.get("extensions"), dict) else {}
+            matches.append({
+                "uid": uid,
+                "name": entry.comment,
+                "score": score,
+                "category": str(entry.raw.get("category", ext.get("category", entry.group or "")) or ""),
+                "keywords": entry.keys[:8],
+                "content": entry.content[:240],
+                "document_id": str(entry.raw.get("document_id", "")),
+                "document_name": str(entry.raw.get("document_name", "")),
+                "kind": str(entry.raw.get("kind", "")),
+            })
+        return self.ok({
+            "query": text,
+            "mode": str(self.service.config.get("retrieval_mode", "hybrid") or "hybrid"),
+            "fts_available": bool(self.storage.fts_available),
+            "candidate_count": int(self.service.config.get("retrieval_candidate_k", 60)),
+            "top_k": int(self.service.config.get("retrieval_top_k", 8)),
+            "matches": matches,
+        })
+
+    async def retrieval_stats(self):
+        session_id = str(request.args.get("session_id", "") or "")
+        return self.ok(await self.service.get_retrieval_stats(session_id))
 
     async def preview(self, session_id: str):
         payload = self.storage.get_preview(session_id)
