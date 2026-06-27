@@ -295,6 +295,9 @@ class TavernService:
             return []
         return list(await provider.get_embedding(text))
 
+    def _embedding_model_id(self) -> str:
+        return str(self.config.get("embedding_provider_id", ""))
+
     @staticmethod
     def _cosine(a: list[float], b: list[float]) -> float:
         if not a or not b:
@@ -438,6 +441,8 @@ class TavernService:
                     scope_type=scope_type,
                     scope_id=scope_id,
                     enabled=True,
+                    status="active",
+                    include_expired=False,
                     limit=500,
                 ))
             seen: set[str] = set()
@@ -449,7 +454,8 @@ class TavernService:
                 seen.add(memory_id)
                 score = self._cosine(query, item.get("embedding", []))
                 if score > 0:
-                    scored.append((score, item))
+                    importance = max(0.0, float(item.get("importance", 1.0) or 1.0))
+                    scored.append((score * importance, item))
             scored.sort(key=lambda pair: pair[0], reverse=True)
             top_k = max(1, int(self.config.get("memory_top_k", 5) or 5))
             matches = [dict(item, score=score) for score, item in scored[:top_k]]
@@ -534,6 +540,8 @@ class TavernService:
             )
             items = self._parse_memory_items(str(getattr(response, "completion_text", "") or ""))
             written: list[str] = []
+            extract_mode = str(self.config.get("memory_extract_mode", "auto") or "auto")
+            status = "pending" if extract_mode == "pending" else "active"
             for item in items:
                 embedding = await self._embedding(item["content"])
                 if not embedding:
@@ -545,10 +553,17 @@ class TavernService:
                     category=item["category"],
                     content=item["content"],
                     embedding=embedding,
+                    embedding_model=self._embedding_model_id(),
+                    status=status,
+                    enabled=status == "active",
+                    source_type="auto_extract",
+                    source_ref=session_id,
                     source_session_id=session_id,
                     source_turn=turn,
+                    metadata={"provider_id": provider_id},
                 )
-                written.append(memory_id)
+                if memory_id not in written:
+                    written.append(memory_id)
             state["last_memory_turn"] = turn
             state["last_memory_provider_id"] = provider_id
             return written
@@ -837,8 +852,15 @@ class TavernService:
             preview["character_selection"] = character_selection
             preview["memory"] = {
                 "enabled": bool(self.config.get("memory_enabled", False)),
+                "query": memory_text,
+                "scopes": scopes,
+                "injected_count": len(memory_matches),
                 "matches": [
-                    {key: item.get(key) for key in ("id", "scope_type", "scope_id", "category", "content", "score")}
+                    {key: item.get(key) for key in (
+                        "id", "scope_type", "scope_id", "category", "content", "score",
+                        "importance", "status", "source_type", "source_ref",
+                        "source_session_id", "source_turn", "updated_at", "expires_at",
+                    )}
                     for item in memory_matches
                 ],
             }
@@ -989,6 +1011,9 @@ class TavernService:
             "state_persisted": False,
             "memory": {
                 "enabled": bool(self.config.get("memory_enabled", False)),
+                "query": memory_text,
+                "scopes": scopes,
+                "injected_count": len(memory_matches),
                 "matches": memory_matches,
             },
             "retrieval": {

@@ -117,6 +117,12 @@
         "type": "int",
         "default": 12
       },
+      "memory_extract_mode": {
+        "description": "自动提取写入模式",
+        "hint": "auto 会直接启用；pending 会进入待确认，不参与 Prompt 注入。",
+        "type": "string",
+        "default": "auto"
+      },
       "memory_top_k": {
         "description": "每次注入的记忆条数",
         "type": "int",

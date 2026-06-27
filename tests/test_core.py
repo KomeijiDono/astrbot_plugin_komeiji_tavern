@@ -1244,10 +1244,112 @@ class LongTermMemoryTests(unittest.TestCase):
             items = storage.list_memories(scope_type="session", scope_id="s1")
             self.assertEqual(items[0]["embedding"], [1.0, 0.0])
             self.assertTrue(items[0]["enabled"])
+            self.assertEqual(items[0]["status"], "active")
+            self.assertEqual(items[0]["importance"], 1.0)
+            self.assertEqual(items[0]["source_type"], "manual")
+            self.assertTrue(items[0]["content_hash"])
             self.assertTrue(storage.set_memory_enabled(memory_id, False))
             self.assertFalse(storage.list_memories(scope_type="session", scope_id="s1")[0]["enabled"])
+            self.assertEqual(storage.list_memories(scope_type="session", scope_id="s1")[0]["status"], "archived")
             self.assertTrue(storage.delete_memory(memory_id))
             self.assertEqual(storage.list_memories(scope_type="session", scope_id="s1"), [])
+
+    def test_put_memory_reuses_exact_duplicate_in_same_scope(self):
+        with tempfile.TemporaryDirectory() as d:
+            storage = TavernStorage(Path(d) / "state.db")
+            first_id = storage.put_memory(
+                scope_type="session", scope_id="s1", category="plot",
+                content="Gate opened", embedding=[1.0, 0.0], importance=1.0,
+            )
+            second_id = storage.put_memory(
+                scope_type="session", scope_id="s1", category="plot",
+                content="Gate opened", embedding=[0.5, 0.5], importance=2.0,
+            )
+            self.assertEqual(second_id, first_id)
+            items = storage.list_memories(scope_type="session", scope_id="s1")
+            self.assertEqual(len(items), 1)
+            self.assertEqual(items[0]["embedding"], [0.5, 0.5])
+            self.assertEqual(items[0]["importance"], 2.0)
+
+    def test_put_memory_keeps_exact_duplicate_in_different_scope(self):
+        with tempfile.TemporaryDirectory() as d:
+            storage = TavernStorage(Path(d) / "state.db")
+            first_id = storage.put_memory(
+                scope_type="session", scope_id="s1", category="plot",
+                content="Gate opened", embedding=[1.0, 0.0],
+            )
+            second_id = storage.put_memory(
+                scope_type="session", scope_id="s2", category="plot",
+                content="Gate opened", embedding=[1.0, 0.0],
+            )
+            self.assertNotEqual(second_id, first_id)
+            self.assertEqual(len(storage.list_memories()), 2)
+
+    def test_set_memory_status_many_updates_enabled_flags(self):
+        with tempfile.TemporaryDirectory() as d:
+            storage = TavernStorage(Path(d) / "state.db")
+            first_id = storage.put_memory(
+                scope_type="session", scope_id="s1", category="plot",
+                content="first", embedding=[1.0, 0.0], status="pending",
+            )
+            second_id = storage.put_memory(
+                scope_type="session", scope_id="s1", category="plot",
+                content="second", embedding=[1.0, 0.0], status="pending",
+            )
+            self.assertEqual(storage.set_memory_status_many([first_id, second_id], "active"), 2)
+            items = storage.list_memories(scope_type="session", scope_id="s1")
+            self.assertTrue(all(item["status"] == "active" and item["enabled"] for item in items))
+            self.assertEqual(storage.set_memory_status_many([first_id], "rejected"), 1)
+            item = next(item for item in storage.list_memories(scope_type="session", scope_id="s1") if item["id"] == first_id)
+            self.assertEqual(item["status"], "rejected")
+            self.assertFalse(item["enabled"])
+
+    def test_pending_and_expired_memories_are_not_retrieved(self):
+        provider = _FakeEmbeddingProvider("emb", {"tea": [1.0, 0.0]})
+        with tempfile.TemporaryDirectory() as d:
+            storage = TavernStorage(Path(d) / "state.db")
+            storage.put_memory(
+                scope_type="session", scope_id="s1", category="preference",
+                content="active memory", embedding=[1.0, 0.0], status="active",
+            )
+            storage.put_memory(
+                scope_type="session", scope_id="s1", category="preference",
+                content="pending memory", embedding=[1.0, 0.0], status="pending",
+            )
+            storage.put_memory(
+                scope_type="session", scope_id="s1", category="preference",
+                content="expired memory", embedding=[1.0, 0.0], expires_at=1,
+            )
+            service = TavernService(storage, _FakeEmbeddingContext([provider]), {
+                "memory_enabled": True,
+                "embedding_provider_id": "emb",
+                "memory_top_k": 5,
+            })
+            context, matches = run(service._retrieve_memories(scopes=[("session", "s1")], text="tea"))
+            self.assertIn("active memory", context)
+            self.assertNotIn("pending memory", context)
+            self.assertNotIn("expired memory", context)
+            self.assertEqual([item["content"] for item in matches], ["active memory"])
+
+    def test_memory_importance_affects_retrieval_order(self):
+        provider = _FakeEmbeddingProvider("emb", {"tea": [1.0, 0.0]})
+        with tempfile.TemporaryDirectory() as d:
+            storage = TavernStorage(Path(d) / "state.db")
+            storage.put_memory(
+                scope_type="session", scope_id="s1", category="preference",
+                content="low importance", embedding=[1.0, 0.0], importance=1.0,
+            )
+            storage.put_memory(
+                scope_type="session", scope_id="s1", category="preference",
+                content="high importance", embedding=[0.8, 0.0], importance=2.0,
+            )
+            service = TavernService(storage, _FakeEmbeddingContext([provider]), {
+                "memory_enabled": True,
+                "embedding_provider_id": "emb",
+                "memory_top_k": 2,
+            })
+            _, matches = run(service._retrieve_memories(scopes=[("session", "s1")], text="tea"))
+            self.assertEqual(matches[0]["content"], "high importance")
 
     def test_enabled_memory_is_retrieved_and_injected(self):
         provider = _FakeEmbeddingProvider("emb", {"tea": [1.0, 0.0], "User likes tea": [1.0, 0.0], "disabled": [1.0, 0.0]})
@@ -1273,7 +1375,58 @@ class LongTermMemoryTests(unittest.TestCase):
             self.assertIn("User likes tea", memory_block["content"])
             self.assertNotIn("disabled", memory_block["content"])
             self.assertEqual(len(result["memory"]["matches"]), 1)
+            self.assertEqual(result["memory"]["injected_count"], 1)
             self.assertEqual(storage.list_metrics(), [])
+
+    def test_memory_extraction_can_write_pending(self):
+        embedding = _FakeEmbeddingProvider("emb", {"User likes tea": [1.0, 0.0]})
+        memory_provider = _FakeMemoryProvider()
+        with tempfile.TemporaryDirectory() as d:
+            storage = TavernStorage(Path(d) / "state.db")
+            service = TavernService(storage, _FakeMemoryContext(embedding, memory_provider), {
+                "memory_enabled": True,
+                "memory_extract_interval": 1,
+                "memory_extract_mode": "pending",
+                "memory_provider_id": "memory",
+                "embedding_provider_id": "emb",
+            })
+            state = {"turn": 1}
+            written = run(service._extract_memories(
+                session_id="s1",
+                state=state,
+                messages=[{"role": "user", "content": "hello"}],
+            ))
+            self.assertEqual(len(written), 1)
+            item = storage.list_memories()[0]
+            self.assertEqual(item["status"], "pending")
+            self.assertFalse(item["enabled"])
+            self.assertEqual(item["source_type"], "auto_extract")
+
+    def test_memory_extraction_reuses_exact_duplicate(self):
+        embedding = _FakeEmbeddingProvider("emb", {"User likes tea": [1.0, 0.0]})
+        memory_provider = _FakeMemoryProvider()
+        with tempfile.TemporaryDirectory() as d:
+            storage = TavernStorage(Path(d) / "state.db")
+            service = TavernService(storage, _FakeMemoryContext(embedding, memory_provider), {
+                "memory_enabled": True,
+                "memory_extract_interval": 1,
+                "memory_provider_id": "memory",
+                "embedding_provider_id": "emb",
+            })
+            first_state = {"turn": 1}
+            first_written = run(service._extract_memories(
+                session_id="s1",
+                state=first_state,
+                messages=[{"role": "user", "content": "hello"}],
+            ))
+            second_state = {"turn": 2}
+            second_written = run(service._extract_memories(
+                session_id="s1",
+                state=second_state,
+                messages=[{"role": "user", "content": "hello again"}],
+            ))
+            self.assertEqual(second_written, first_written)
+            self.assertEqual(len(storage.list_memories(scope_type="session", scope_id="s1")), 1)
 
     def test_memory_extraction_failure_does_not_block_process(self):
         embedding = _FakeEmbeddingProvider("emb", {"hello": [1.0, 0.0]})

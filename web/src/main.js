@@ -145,13 +145,16 @@ createApp({
     const dOpen = ref(false)
     const dFocused = ref(false)
     const memoryQuery = ref('')
+    const memoryStatusFilter = ref('')
+    const selectedMemoryIds = ref([])
     const metricDays = ref(7)
     const retrievalTest = ref({ text: '' })
     const retrievalStats = ref(null)
     const retrievalResult = ref(null)
 
     const binding = ref({ scope_type: 'session', scope_id: '', kind: 'character', target_id: '', priority: 0 })
-    const memoryDraft = ref({ id: '', scope_type: 'session', scope_id: '', category: 'status', content: '', enabled: true })
+    const newMemoryDraft = () => ({ id: '', scope_type: 'session', scope_id: '', category: 'status', content: '', enabled: true, status: 'active', importance: 1, source_type: 'manual', source_ref: '', expires_at: 0 })
+    const memoryDraft = ref(newMemoryDraft())
     const debug = ref({ session_id: '', persona_id: '', prompt: '', system_prompt: '', mode: 'normal', quiet_prompt: '', seed: 1 })
     const debugResult = ref(null)
     const formatTimestamp = value => value ? new Date(Number(value) * 1000).toLocaleString() : '无'
@@ -186,8 +189,16 @@ createApp({
     })
     const filteredMemories = computed(() => {
       const q = memoryQuery.value.toLowerCase()
-      return memories.value.filter(x => !q || (x.content + ' ' + x.category + ' ' + x.scope_id).toLowerCase().includes(q))
+      const status = memoryStatusFilter.value
+      return memories.value.filter(x => {
+        const itemStatus = x.status || (x.enabled ? 'active' : 'archived')
+        const matchedStatus = !status || itemStatus === status
+        const matchedQuery = !q || (x.content + ' ' + x.category + ' ' + x.scope_id + ' ' + itemStatus + ' ' + x.source_type).toLowerCase().includes(q)
+        return matchedStatus && matchedQuery
+      })
     })
+    const visibleMemoryIds = computed(() => filteredMemories.value.map(x => x.id))
+    const allVisibleMemoriesSelected = computed(() => visibleMemoryIds.value.length > 0 && visibleMemoryIds.value.every(id => selectedMemoryIds.value.includes(id)))
     const metricItems = computed(() => metrics.value.items || [])
     const metricTotals = computed(() => metrics.value.totals || {})
     const metricProviders = computed(() => Object.entries(metrics.value.providers || {}).sort((a, b) => b[1] - a[1]))
@@ -230,6 +241,7 @@ createApp({
         personas.value = x[3].data
         conversations.value = x[4].data.items || []
         memories.value = x[5].data
+        selectedMemoryIds.value = selectedMemoryIds.value.filter(id => memories.value.some(item => item.id === id))
         metrics.value = x[6].data
         if (!debug.value.session_id) {
           const bound = bindings.value.find(b => b.scope_type === 'session')
@@ -414,7 +426,7 @@ createApp({
     }
 
     const resetMemoryDraft = () => {
-      memoryDraft.value = { id: '', scope_type: 'session', scope_id: debug.value.session_id || '', category: 'status', content: '', enabled: true }
+      memoryDraft.value = { ...newMemoryDraft(), scope_id: debug.value.session_id || '' }
     }
 
     const saveMemory = async () => {
@@ -435,6 +447,11 @@ createApp({
         category: item.category,
         content: item.content,
         enabled: item.enabled,
+        status: item.status || (item.enabled ? 'active' : 'archived'),
+        importance: Number(item.importance || 1),
+        source_type: item.source_type || 'manual',
+        source_ref: item.source_ref || '',
+        expires_at: Number(item.expires_at || 0),
       }
       tab.value = 'memories'
     }
@@ -442,6 +459,23 @@ createApp({
     const toggleMemory = async item => {
       await post('/memories/' + encodeURIComponent(item.id) + '/toggle', { enabled: !item.enabled })
       await load()
+    }
+
+    const toggleAllVisibleMemories = () => {
+      if (allVisibleMemoriesSelected.value) {
+        selectedMemoryIds.value = selectedMemoryIds.value.filter(id => !visibleMemoryIds.value.includes(id))
+      } else {
+        selectedMemoryIds.value = Array.from(new Set([...selectedMemoryIds.value, ...visibleMemoryIds.value]))
+      }
+    }
+
+    const updateSelectedMemoryStatus = async status => {
+      clear()
+      if (!selectedMemoryIds.value.length) { error.value = '请先选择长期记忆。'; return }
+      const out = await post('/memories/status', { ids: selectedMemoryIds.value, status })
+      selectedMemoryIds.value = []
+      await load()
+      notice.value = '已更新 ' + out.data.updated + ' 条长期记忆。'
     }
 
     const deleteMemory = async item => {
@@ -566,7 +600,8 @@ createApp({
     return {
       tabs, labels, tab, overview, documents, bindings, personas, selected, pendingDeleteId, error, notice, busy,
       downloadLocationHint,
-      advanced, binding, memoryDraft, memoryQuery, memories, filteredMemories,
+      advanced, binding, memoryDraft, memoryQuery, memoryStatusFilter, selectedMemoryIds,
+      memories, filteredMemories, allVisibleMemoriesSelected,
       metricDays, metrics, metricItems, metricTotals, metricProviders, maxMetricTokens,
       retrievalTest, retrievalStats, retrievalResult,
       debug, debugResult, docsForTab, bindDocs, characterDocs, card, entries,
@@ -577,7 +612,8 @@ createApp({
       exportSelected, exportKind, exportAll, exportMessages, backupSession,
       setFile: e => file.value = e.target.files[0],
       updateScope, addBinding, unbind, scopeName, updateMemoryScope, resetMemoryDraft,
-      saveMemory, editMemory, toggleMemory, deleteMemory, refreshMetrics,
+      saveMemory, editMemory, toggleMemory, toggleAllVisibleMemories,
+      updateSelectedMemoryStatus, deleteMemory, refreshMetrics,
       refreshRetrievalStats, runRetrievalTest,
       move, moveMember, addMember, addBlock, keyText, setKeys,
       addEntry: () => selected.value.data.entries.push(newEntry(tab.value)),
@@ -590,7 +626,7 @@ createApp({
     <div class="brand">
       <small>ASTRBOT 角色扮演工作台</small>
       <h1>Komeiji's<br>Tavern</h1>
-      <span>v0.6.0</span>
+      <span>v0.6.2</span>
     </div>
     <button v-for="t in tabs" :class="{active:tab===t[0]}" @click="tab=t[0];selected=null">{{t[1]}}</button>
   </aside>
@@ -773,11 +809,14 @@ createApp({
     <section v-else-if="tab==='memories'" class="stack">
       <div class="panel">
         <h3>{{memoryDraft.id?'编辑长期记忆':'新增长期记忆'}}</h3>
-        <p>自动提取的记忆会出现在这里。你可以手动新增、禁用或删除，禁用后不会再注入 Prompt。</p>
+        <p>自动提取的记忆会出现在这里。只有 active 且启用的记忆会注入 Prompt；pending 记忆需要确认后才会参与检索。</p>
         <div class="binding-form">
           <label>作用域<select v-model="memoryDraft.scope_type" @change="updateMemoryScope"><option value="session">会话</option><option value="user">用户</option><option value="group">群组</option><option value="persona">Persona</option><option value="global">全局</option></select></label>
           <label>作用域 ID<input v-model="memoryDraft.scope_id" placeholder="会话 ID / 用户 ID / *"></label>
           <label>分类<select v-model="memoryDraft.category"><option value="preference">用户偏好</option><option value="relationship">角色关系</option><option value="plot">剧情节点</option><option value="status">长期状态</option></select></label>
+          <label>状态<select v-model="memoryDraft.status"><option value="active">active</option><option value="pending">pending</option><option value="archived">archived</option><option value="rejected">rejected</option></select></label>
+          <label>重要度<input type="number" min="0" step="0.1" v-model.number="memoryDraft.importance"></label>
+          <label>来源<input v-model="memoryDraft.source_type" placeholder="manual / auto_extract"></label>
           <label><input type="checkbox" v-model="memoryDraft.enabled">启用</label>
         </div>
         <label>记忆内容<textarea v-model="memoryDraft.content" placeholder="一条具体、可长期复用的事实。"></textarea></label>
@@ -786,13 +825,20 @@ createApp({
       <div class="panel">
         <div class="result-head">
           <h3>长期记忆列表</h3>
-          <input v-model="memoryQuery" placeholder="搜索内容、分类或作用域">
+          <div class="actions">
+            <select v-model="memoryStatusFilter"><option value="">全部状态</option><option value="pending">pending</option><option value="active">active</option><option value="archived">archived</option><option value="rejected">rejected</option></select>
+            <input v-model="memoryQuery" placeholder="搜索内容、分类或作用域">
+          </div>
         </div>
-        <table><tr><th>状态</th><th>作用域</th><th>分类</th><th>内容</th><th>更新时间</th><th></th></tr>
+        <div class="actions"><button @click="toggleAllVisibleMemories">{{allVisibleMemoriesSelected?'取消全选':'全选当前列表'}}</button><button @click="updateSelectedMemoryStatus('active')" :disabled="!selectedMemoryIds.length">确认为 active</button><button @click="updateSelectedMemoryStatus('rejected')" :disabled="!selectedMemoryIds.length">拒绝</button><button @click="updateSelectedMemoryStatus('archived')" :disabled="!selectedMemoryIds.length">归档</button><span class="muted">已选择 {{selectedMemoryIds.length}} 条</span></div>
+        <table><tr><th></th><th>状态</th><th>作用域</th><th>分类</th><th>重要度</th><th>来源</th><th>内容</th><th>更新时间</th><th></th></tr>
           <tr v-for="m in filteredMemories">
-            <td>{{m.enabled?'启用':'禁用'}}</td>
+            <td><input type="checkbox" :value="m.id" v-model="selectedMemoryIds"></td>
+            <td>{{m.status || (m.enabled?'active':'archived')}}</td>
             <td>{{m.scope_type}}: {{m.scope_id}}</td>
             <td>{{m.category}}</td>
+            <td>{{Number(m.importance || 1).toFixed(1)}}</td>
+            <td>{{m.source_type || 'manual'}}</td>
             <td>{{m.content}}</td>
             <td>{{formatTimestamp(m.updated_at)}}</td>
             <td class="actions"><button @click="editMemory(m)">编辑</button><button @click="toggleMemory(m)">{{m.enabled?'禁用':'启用'}}</button><button class="danger" @click="deleteMemory(m)">删除</button></td>
@@ -907,6 +953,19 @@ createApp({
           <div v-if="debugResult.retrieval.matches?.length" class="activation" v-for="m in debugResult.retrieval.matches">
             <b>{{m.name||m.uid}}</b> · {{m.reason}}<span v-if="m.scanner_reason"> / {{m.scanner_reason}}</span> · 分数 {{m.score?.toFixed(3)}}
           </div>
+        </details>
+        <details v-if="debugResult.memory" open><summary>长期记忆注入</summary>
+          <div class="effective">
+            <span>状态：{{debugResult.memory.enabled?'已启用':'未启用'}}</span>
+            <span>作用域：{{debugResult.memory.scopes?.map(x=>x.join(':')).join('、')||'无'}}</span>
+            <span>注入条数：{{debugResult.memory.injected_count||0}}</span>
+          </div>
+          <pre v-if="debugResult.memory.query">{{debugResult.memory.query}}</pre>
+          <div v-if="debugResult.memory.matches?.length" class="activation" v-for="m in debugResult.memory.matches">
+            <b>{{m.category||'memory'}}</b> · {{m.scope_type}}:{{m.scope_id}} · 分数 {{m.score?.toFixed(3)}} · 重要度 {{Number(m.importance||1).toFixed(1)}} · {{m.status||'active'}} · {{m.source_type||'manual'}}
+            <pre>{{m.content}}</pre>
+          </div>
+          <p v-if="!debugResult.memory.matches?.length" class="muted">本轮没有注入长期记忆。</p>
         </details>
         <details open><summary>检索测试与统计</summary>
           <div class="binding-form">

@@ -2,7 +2,7 @@
 
 # Komeiji's Tavern
 
-[![Version](https://img.shields.io/badge/version-0.6.1-7c5cff?style=for-the-badge)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.6.2-7c5cff?style=for-the-badge)](CHANGELOG.md)
 [![AstrBot](https://img.shields.io/badge/AstrBot-4.25%2B-4f9cff?style=for-the-badge)](https://github.com/AstrBotDevs/AstrBot)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-42b883?style=for-the-badge)](LICENSE)
 
@@ -16,6 +16,7 @@
 - 世界书扫描：主次关键词、正则、递归、概率、Sticky、Cooldown、Delay、Outlet 和深度注入。
 - 混合检索：世界书和创作素材支持关键词召回、向量召回、加权合并、分类去重和命中统计。
 - 创作素材库：支持 SQLite 知识库导入、默认向量化、禁用条目过滤、检索测试和统计面板。
+- 长期记忆治理：支持 pending/active/archived/rejected 状态、重要度权重、来源记录、精确去重和待确认批量处理。
 - 会话级自动摘要：使用可选小模型压缩旧历史，将滚动摘要注入 Summary 块。
 - 上下文管理：固定历史条数、token 预算、近期消息保护和核心提示块保护。
 - 完整调试器：查看最终 `messages[]`、提示块、世界书激活原因、混合检索状态、裁剪项、摘要状态和警告。
@@ -48,6 +49,7 @@ http://127.0.0.1:6185/api/plug/astrbot_plugin_komeiji_tavern/v1/panel
 - **提示词预设**：调整块顺序、角色、注入位置、深度、裁剪优先级及覆盖规则。
 - **世界书**：配置关键词、扫描深度、递归、概率、生命周期和注入位置。
 - **创作素材**：维护可检索素材条目，支持分类、描述、禁用、向量化和默认深度注入。
+- **长期记忆**：维护自动提取或手动录入的长期事实，支持状态筛选、重要度、来源、批量确认、拒绝和归档。
 - **用户设定**：维护 Persona 内容并映射 AstrBot Persona。
 - **绑定管理**：单选资料按“会话 > Persona > 用户 > 群组 > 全局”覆盖，世界书和素材叠加去重。
 - **调试器**：只读模拟不会推进轮次或生命周期；“最近真实请求”展示实际发送结果；检索测试与统计用于检查关键词/向量召回效果。

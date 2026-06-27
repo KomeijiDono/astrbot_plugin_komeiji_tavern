@@ -66,6 +66,7 @@ class TavernWebApi:
             (f"{self.PREFIX}/export/archive", ["POST"], self.export_archive, "Export document archive"),
             (f"{self.PREFIX}/memories", ["GET"], self.memories, "List long-term memories"),
             (f"{self.PREFIX}/memories", ["POST"], self.save_memory, "Create or update long-term memory"),
+            (f"{self.PREFIX}/memories/status", ["POST"], self.set_memory_status, "Batch update long-term memory status"),
             (f"{self.PREFIX}/memories/<memory_id>/toggle", ["POST"], self.toggle_memory, "Toggle long-term memory"),
             (f"{self.PREFIX}/memories/<memory_id>/delete", ["POST"], self.delete_memory, "Delete long-term memory"),
             (f"{self.PREFIX}/metrics", ["GET"], self.metrics, "Runtime metrics"),
@@ -284,7 +285,10 @@ class TavernWebApi:
             scope_type=request.args.get("scope_type"),
             scope_id=request.args.get("scope_id"),
             enabled=enabled,
+            status=request.args.get("status"),
+            source_type=request.args.get("source_type"),
             query=request.args.get("q"),
+            include_expired=request.args.get("include_expired", "1") not in {"0", "false", "False"},
             limit=int(request.args.get("limit", 300)),
         ))
 
@@ -312,9 +316,15 @@ class TavernWebApi:
             category=str(payload.get("category", "status") or "status"),
             content=content,
             embedding=embedding,
+            embedding_model=self.service._embedding_model_id(),
             enabled=bool(payload.get("enabled", True)),
+            status=str(payload.get("status", "active") or "active"),
+            importance=float(payload.get("importance", 1.0) or 1.0),
+            source_type=str(payload.get("source_type", "manual") or "manual"),
+            source_ref=str(payload.get("source_ref", "")),
             source_session_id=str(payload.get("source_session_id", "")),
             source_turn=int(payload.get("source_turn", 0) or 0),
+            expires_at=float(payload.get("expires_at", 0) or 0),
         )
         return self.ok({"id": memory_id, "warning": warning})
 
@@ -322,6 +332,19 @@ class TavernWebApi:
         payload = await request.get_json(force=True)
         enabled = bool((payload or {}).get("enabled", True))
         return self.ok({"updated": self.storage.set_memory_enabled(memory_id, enabled)})
+
+    async def set_memory_status(self):
+        payload = await request.get_json(force=True)
+        if not isinstance(payload, dict):
+            return self.error("JSON object required")
+        status = str(payload.get("status", "") or "")
+        if status not in {"pending", "active", "archived", "rejected"}:
+            return self.error("invalid memory status")
+        memory_ids = payload.get("ids", [])
+        if not isinstance(memory_ids, list) or not memory_ids:
+            return self.error("ids are required")
+        updated = self.storage.set_memory_status_many([str(item) for item in memory_ids], status)
+        return self.ok({"updated": updated})
 
     async def delete_memory(self, memory_id: str):
         return self.ok({"deleted": self.storage.delete_memory(memory_id)})
