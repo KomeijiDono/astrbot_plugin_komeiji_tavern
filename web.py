@@ -9,7 +9,15 @@ from typing import Any, Awaitable, Callable
 from quart import Response, jsonify, request
 
 from .constants import API_PREFIX, PLUGIN_VERSION
-from .importers import export_document, parse_binary_payload, parse_payload, preview_import, read_material_sqlite
+from .importers import (
+    detect_quill_kb,
+    export_document,
+    parse_binary_payload,
+    parse_payload,
+    preview_import,
+    read_material_sqlite,
+    read_quill_kb_sqlite,
+)
 from .documents import normalize_document, validate_document
 from .export_utils import (
     build_document_archive,
@@ -208,10 +216,33 @@ class TavernWebApi:
     async def import_sqlite(self):
         payload = await request.get_json(force=True)
         try:
-            entries = read_material_sqlite(str(payload.get("base64", "")))
+            base64_data = str(payload.get("base64", ""))
+            fmt = str(payload.get("format", "")).lower()
+            name = str(payload.get("name", ""))
+
+            if fmt == "quill_kb":
+                entries = read_quill_kb_sqlite(base64_data)
+                if not name:
+                    name = "Imported Quill KB"
+            elif fmt == "material":
+                entries = read_material_sqlite(base64_data)
+                if not name:
+                    name = "Imported Materials"
+            else:
+                if detect_quill_kb(base64_data):
+                    entries = read_quill_kb_sqlite(base64_data)
+                    fmt = "quill_kb"
+                    if not name:
+                        name = "Imported Quill KB"
+                else:
+                    entries = read_material_sqlite(base64_data)
+                    fmt = "material"
+                    if not name:
+                        name = "Imported Materials"
+
             data = {"entries": entries}
-            document_id = self.storage.put_document("material", str(payload.get("name", "Imported Materials")), data, raw=data)
-            return self.ok({"id": document_id, "count": len(entries)})
+            document_id = self.storage.put_document("material", name, data, raw=data)
+            return self.ok({"id": document_id, "count": len(entries), "format": fmt})
         except Exception as exc:
             return self.error(str(exc))
 

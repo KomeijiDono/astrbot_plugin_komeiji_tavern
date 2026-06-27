@@ -13,7 +13,7 @@ from typing import Any, Iterable
 
 
 class TavernStorage:
-    SCHEMA_VERSION = 5
+    SCHEMA_VERSION = 6
 
     def __init__(self, path: str | Path):
         self.path = Path(path)
@@ -127,6 +127,7 @@ class TavernStorage:
                 (str(self.SCHEMA_VERSION),),
             )
             self._initialize_fts(conn)
+            self._migrate_schema(conn)
 
     def _initialize_fts(self, conn: sqlite3.Connection) -> None:
         try:
@@ -145,6 +146,42 @@ class TavernStorage:
         except sqlite3.DatabaseError:
             self.fts_available = False
 
+    @staticmethod
+    def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
+        rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+        existing = {str(row[1]) for row in rows}
+        if column not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+    def _migrate_schema(self, conn: sqlite3.Connection) -> None:
+        self._ensure_column(conn, "entry_index", "category", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column(conn, "entry_index", "description", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column(conn, "entry_index", "aliases_json", "TEXT NOT NULL DEFAULT '[]'")
+        self._ensure_column(conn, "entry_index", "secondary_keys_json", "TEXT NOT NULL DEFAULT '[]'")
+        self._ensure_column(conn, "entry_index", "priority", "INTEGER NOT NULL DEFAULT 100")
+        self._ensure_column(conn, "entry_index", "constant", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column(conn, "entry_index", "inject_position", "INTEGER NOT NULL DEFAULT 1")
+        self._ensure_column(conn, "entry_index", "match_count", "INTEGER NOT NULL DEFAULT 0")
+
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS retrieval_logs (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL DEFAULT '',
+            query TEXT NOT NULL,
+            mode TEXT NOT NULL DEFAULT '',
+            matched_entries TEXT NOT NULL DEFAULT '[]',
+            created_at REAL NOT NULL
+        )
+        """)
+        conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_retrieval_logs_created_at
+        ON retrieval_logs(created_at)
+        """)
+        conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_retrieval_logs_session
+        ON retrieval_logs(session_id, created_at)
+        """)
+
     def rebuild_document_index(
         self,
         document_id: str,
@@ -161,28 +198,60 @@ class TavernStorage:
             return 0
 
         now = time.time()
-        rows: list[tuple[str, str, str, str, str, str, str, str, str, str, int, float]] = []
+
+        old_embeddings: dict[str, tuple[str, str]] = {}
+        with self._connection() as conn:
+            rows = conn.execute(
+                "SELECT content_hash, embedding, embedding_model FROM entry_index WHERE document_id=?",
+                (document_id,),
+            ).fetchall()
+            for row in rows:
+                content_hash = str(row["content_hash"])
+                embedding = str(row["embedding"] or "[]")
+                embedding_model = str(row["embedding_model"] or "")
+                if content_hash and embedding != "[]":
+                    old_embeddings[content_hash] = (embedding, embedding_model)
+
+        result_rows: list[tuple[str, str, str, str, str, str, str, str, str, str, str, int, float, str, str, str, str, int, int, int, int]] = []
         fts_rows: list[tuple[str, str, str, str, str, str]] = []
 
         for index, entry in enumerate(entries):
             if not isinstance(entry, dict):
                 continue
-            uid = entry.get("uid", "")
-            content = entry.get("content", "")
+            uid = str(entry.get("uid", entry.get("id", f"entry_{index}")))
+            content = str(entry.get("content", ""))
             if not content:
                 continue
 
             entry_id = f"{document_id}:{uid}:{index}"
-            name_val = entry.get("comment", "") or entry.get("name", "")
-            keys = entry.get("key", [])
+            name_val = str(entry.get("comment", "") or entry.get("title", "") or entry.get("name", ""))
+            keys = entry.get("key", entry.get("keys", []))
             if isinstance(keys, str):
                 keys = [keys]
-            keys_secondary = entry.get("keysecondary", [])
+            keys_secondary = entry.get("keysecondary", entry.get("secondary_keywords", []))
             if isinstance(keys_secondary, str):
                 keys_secondary = [keys_secondary]
-            all_keys = keys + keys_secondary
-            keys_json = json.dumps(all_keys, ensure_ascii=False)
+            aliases = entry.get("aliases", [])
+            if isinstance(aliases, str):
+                aliases = [aliases]
+            all_keys = keys + keys_secondary + aliases
+            keys_json = json.dumps(keys, ensure_ascii=False)
+            secondary_keys_json = json.dumps(keys_secondary, ensure_ascii=False)
+            aliases_json = json.dumps(aliases, ensure_ascii=False)
             content_hash = hashlib.sha1(content.encode("utf-8")).hexdigest()
+
+            ext = entry.get("extensions") if isinstance(entry.get("extensions"), dict) else {}
+            category = str(entry.get("category", ext.get("category", entry.get("group", ""))) or "")
+            description = str(entry.get("description", ext.get("description", "")) or "")
+            priority = int(entry.get("priority", ext.get("priority", entry.get("order", 100))) or 100)
+            constant = bool(entry.get("constant", entry.get("is_constant", False)))
+            inject_position = int(entry.get("inject_position", ext.get("inject_position", 2)) or 2)
+
+            if content_hash in old_embeddings:
+                embedding_json, embedding_model = old_embeddings[content_hash]
+            else:
+                embedding_json = "[]"
+                embedding_model = ""
 
             metadata = {
                 "position": entry.get("position"),
@@ -192,28 +261,38 @@ class TavernStorage:
                 "vectorized": entry.get("vectorized", False),
                 "group": entry.get("group", ""),
                 "source_document_name": name,
+                "category": category,
+                "description": description,
+                "aliases": aliases,
+                "priority": priority,
+                "constant": constant,
+                "inject_position": inject_position,
             }
             metadata_json = json.dumps(metadata, ensure_ascii=False)
 
-            rows.append((
+            fts_text = " ".join(all_keys + [category, description, name_val])
+            result_rows.append((
                 entry_id, document_id, kind, str(uid), name_val, content,
-                keys_json, metadata_json, "[]", "", content_hash, 1, now,
+                keys_json, metadata_json, embedding_json, embedding_model, content_hash, 1, now,
+                category, description, aliases_json, secondary_keys_json, priority, int(constant), inject_position, 0,
             ))
-            fts_rows.append((entry_id, document_id, kind, name_val, content, " ".join(all_keys)))
+            fts_rows.append((entry_id, document_id, kind, name_val, content, fts_text))
 
         with self._lock, self._connection() as conn:
             conn.execute("DELETE FROM entry_index WHERE document_id=?", (document_id,))
             if self.fts_available:
                 conn.execute("DELETE FROM entry_fts WHERE document_id=?", (document_id,))
 
-            if rows:
+            if result_rows:
                 conn.executemany(
                     """INSERT OR REPLACE INTO entry_index(
                         id, document_id, kind, entry_uid, name, content,
                         keys_json, metadata_json, embedding, embedding_model,
-                        content_hash, enabled, updated_at
-                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                    rows,
+                        content_hash, enabled, updated_at,
+                        category, description, aliases_json, secondary_keys_json,
+                        priority, constant, inject_position, match_count
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    result_rows,
                 )
 
             if fts_rows and self.fts_available:
@@ -311,12 +390,18 @@ class TavernStorage:
         result["raw"] = json.loads(result["raw"])
         return result
 
-    def get_entry_embedding_by_hash(self, content_hash: str) -> list[float]:
+    def get_entry_embedding_by_hash(self, content_hash: str, embedding_model: str = "") -> list[float]:
         with self._connection() as conn:
-            row = conn.execute(
-                "SELECT embedding FROM entry_index WHERE content_hash=? AND enabled=1",
-                (content_hash,),
-            ).fetchone()
+            if embedding_model:
+                row = conn.execute(
+                    "SELECT embedding FROM entry_index WHERE content_hash=? AND embedding_model=? AND enabled=1",
+                    (content_hash, embedding_model),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT embedding FROM entry_index WHERE content_hash=? AND enabled=1",
+                    (content_hash,),
+                ).fetchone()
         if not row:
             return []
         try:
@@ -384,7 +469,7 @@ class TavernStorage:
                             bm25(entry_fts) AS bm25_score
                         FROM entry_fts f
                         JOIN entry_index i ON i.id = f.entry_id
-                        WHERE entry_fts MATCH ?
+                        WHERE entry_fts MATCH ? AND i.enabled = 1
                         ORDER BY bm25_score
                         LIMIT ?""",
                         (fts_query, limit),
@@ -417,6 +502,35 @@ class TavernStorage:
             item["score"] = 0.5
             result.append(item)
         return result
+
+    def record_retrieval_log(
+        self,
+        *,
+        session_id: str,
+        query: str,
+        mode: str,
+        matches: list[dict[str, Any]],
+    ) -> str:
+        log_id = str(uuid.uuid4())
+        now = time.time()
+        with self._lock, self._connection() as conn:
+            conn.execute(
+                """INSERT INTO retrieval_logs(id, session_id, query, mode, matched_entries, created_at)
+                VALUES(?,?,?,?,?,?)""",
+                (log_id, session_id, query, mode, json.dumps(matches, ensure_ascii=False), now),
+            )
+        return log_id
+
+    def increment_entry_match_counts(self, entry_ids: list[str]) -> int:
+        if not entry_ids:
+            return 0
+        placeholders = ",".join("?" for _ in entry_ids)
+        with self._lock, self._connection() as conn:
+            result = conn.execute(
+                f"UPDATE entry_index SET match_count = match_count + 1 WHERE id IN ({placeholders})",
+                entry_ids,
+            )
+        return result.rowcount
 
     def bind(self, scope_type: str, scope_id: str, kind: str, target_id: str, priority: int = 0) -> None:
         with self._lock, self._connection() as conn:

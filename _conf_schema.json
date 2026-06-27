@@ -225,6 +225,12 @@
         "description": "向量分数权重",
         "type": "float",
         "default": 0.65
+      },
+      "retrieval_category_dedup_limit": {
+        "description": "同类别素材每轮最多注入条数",
+        "hint": "0 表示不限制。用于防止同一类写作素材刷屏。",
+        "type": "int",
+        "default": 2
       }
     }
   },

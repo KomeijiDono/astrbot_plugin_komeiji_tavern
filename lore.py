@@ -21,7 +21,7 @@ def _list(value: Any) -> list[str]:
 def normalize_entry(raw: dict[str, Any], fallback_uid: str, *, kind: str = "lorebook") -> LoreEntry:
     ext = raw.get("extensions") if isinstance(raw.get("extensions"), dict) else {}
     uid = str(raw.get("uid", raw.get("id", fallback_uid)))
-    position = raw.get("position", ext.get("position", Position.AFTER_CHARACTER))
+    position = raw.get("position", ext.get("position"))
 
     if kind == "material":
         vectorized_default = True
