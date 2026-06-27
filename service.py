@@ -190,11 +190,25 @@ class TavernService:
             query = await provider.get_embedding(text)
             result: dict[str, float] = {}
             for entry in entries:
-                key = hashlib.sha1(entry.content.encode("utf-8")).hexdigest()
-                vector = self._cache_get(key)
+                if not entry.vectorized or entry.disabled or not entry.content:
+                    continue
+                content_hash = hashlib.sha1(entry.content.encode("utf-8")).hexdigest()
+                vector = self._cache_get(content_hash)
                 if vector is None:
-                    vector = await provider.get_embedding(entry.content)
-                    self._cache_put(key, vector)
+                    vector = await asyncio.to_thread(
+                        self.storage.get_entry_embedding_by_hash, content_hash
+                    )
+                    if vector:
+                        self._cache_put(content_hash, vector)
+                if not vector:
+                    vector = list(await provider.get_embedding(entry.content))
+                    self._cache_put(content_hash, vector)
+                    await asyncio.to_thread(
+                        self.storage.update_entry_embedding,
+                        content_hash,
+                        vector,
+                        str(self.config.get("embedding_provider_id", "")),
+                    )
                 norm = math.sqrt(sum(x * x for x in query)) * math.sqrt(sum(x * x for x in vector))
                 score = sum(a * b for a, b in zip(query, vector)) / norm if norm else 0.0
                 threshold = float(entry.raw.get("vector_threshold", 0.35))
@@ -204,6 +218,58 @@ class TavernService:
         except Exception as exc:
             logger.warning("%s 向量匹配失败，已降级跳过向量条目: %s", PLUGIN_TAG, exc)
             return {}
+
+    async def _hybrid_matcher(self, text: str, entries: list[LoreEntry]) -> dict[str, float]:
+        if not self.config.get("vector_enabled", False):
+            return {}
+
+        keyword_weight = float(self.config.get("keyword_weight", 0.35))
+        vector_weight = float(self.config.get("vector_weight", 0.65))
+        retrieval_top_k = int(self.config.get("retrieval_top_k", 8))
+        retrieval_candidate_k = int(self.config.get("retrieval_candidate_k", 60))
+        mode = str(self.config.get("retrieval_mode", "hybrid") or "hybrid")
+
+        allowed_by_hash: dict[str, LoreEntry] = {}
+        for entry in entries:
+            if entry.content:
+                content_hash = hashlib.sha1(entry.content.encode("utf-8")).hexdigest()
+                allowed_by_hash[content_hash] = entry
+
+        keyword_scores: dict[str, float] = {}
+        if mode in {"keyword", "hybrid"}:
+            try:
+                fts_results = await asyncio.to_thread(
+                    self.storage.search_entries_fts, text, limit=retrieval_candidate_k
+                )
+                for item in fts_results:
+                    content_hash = item.get("content_hash", "")
+                    if content_hash in allowed_by_hash:
+                        entry = allowed_by_hash[content_hash]
+                        keyword_scores[entry.uid] = float(item.get("score", 0.5))
+            except Exception as exc:
+                logger.warning("%s 关键词检索失败，已降级: %s", PLUGIN_TAG, exc)
+
+        vector_scores: dict[str, float] = {}
+        if mode in {"vector", "hybrid"}:
+            vector_scores = await self._vector_matcher(text, entries)
+
+        if mode == "keyword":
+            combined = keyword_scores
+        elif mode == "vector":
+            combined = vector_scores
+        else:
+            all_uids = set(keyword_scores) | set(vector_scores)
+            combined = {}
+            for uid in all_uids:
+                kw_score = keyword_scores.get(uid, 0.0)
+                vec_score = vector_scores.get(uid, 0.0)
+                combined[uid] = keyword_weight * kw_score + vector_weight * vec_score
+
+        if len(combined) > retrieval_top_k:
+            sorted_items = sorted(combined.items(), key=lambda x: x[1], reverse=True)
+            combined = dict(sorted_items[:retrieval_top_k])
+
+        return combined
 
     async def _retrieve_memories(
         self,
@@ -347,7 +413,7 @@ class TavernService:
         for kind in ("lorebook", "material"):
             documents = await asyncio.to_thread(self.storage.resolve_bindings, kind, scopes)
             for document in documents:
-                entries.extend(normalize_entries(document["data"]))
+                entries.extend(normalize_entries(document["data"], kind=kind))
         return entries
 
     @staticmethod
@@ -556,9 +622,15 @@ class TavernService:
             scan_messages = list(req.contexts or [])
             if req.prompt:
                 scan_messages.append({"role": "user", "content": req.prompt})
+
+            matcher = None
+            if self.config.get("vector_enabled", False):
+                mode = str(self.config.get("retrieval_mode", "hybrid") or "hybrid")
+                matcher = self._hybrid_matcher if mode in {"keyword", "hybrid"} else self._vector_matcher
+
             scan = await self.scanner.scan(
                 entries, scan_messages, state,
-                vector_matcher=self._vector_matcher if self.config.get("vector_enabled", False) else None,
+                vector_matcher=matcher,
             )
             preset_doc = await asyncio.to_thread(self._bound_one, "preset", scopes)
             character_doc = await asyncio.to_thread(self._select_character, scopes, req.prompt or "", state)
@@ -609,6 +681,23 @@ class TavernService:
                     for item in memory_matches
                 ],
             }
+            preview["retrieval"] = {
+                "enabled": bool(self.config.get("vector_enabled", False)),
+                "mode": str(self.config.get("retrieval_mode", "hybrid") or "hybrid"),
+                "fts_available": bool(self.storage.fts_available),
+                "candidate_count": int(self.config.get("retrieval_candidate_k", 60)),
+                "top_k": int(self.config.get("retrieval_top_k", 8)),
+                "matches": [
+                    {
+                        "uid": match.entry.uid,
+                        "name": match.entry.comment,
+                        "score": match.score,
+                        "reason": match.reason,
+                    }
+                    for match in scan.activated
+                    if match.reason in ("vector", "hybrid", "keyword")
+                ],
+            }
             await asyncio.to_thread(self.storage.save_preview, session_id, preview)
             provider = getattr(req, "provider", None) or getattr(req, "llm_provider", None)
             provider_id = str(getattr(provider, "provider_config", {}).get("id", ""))
@@ -647,9 +736,15 @@ class TavernService:
         prompt = str(payload.get("prompt", ""))
         scan_messages = messages + ([{"role": "user", "content": prompt}] if prompt else [])
         entries = await self._collect_entries(scopes)
+
+        matcher = None
+        if self.config.get("vector_enabled", False):
+            mode = str(self.config.get("retrieval_mode", "hybrid") or "hybrid")
+            matcher = self._hybrid_matcher if mode in {"keyword", "hybrid"} else self._vector_matcher
+
         scan = await self.scanner.scan(
             entries, scan_messages, state,
-            vector_matcher=self._vector_matcher if self.config.get("vector_enabled", False) else None,
+            vector_matcher=matcher,
             rng=random.Random(int(payload.get("seed", 1))),
             )
         memory_text = "\n".join([self._message_text(item) for item in messages[-4:]])
@@ -699,6 +794,23 @@ class TavernService:
             "memory": {
                 "enabled": bool(self.config.get("memory_enabled", False)),
                 "matches": memory_matches,
+            },
+            "retrieval": {
+                "enabled": bool(self.config.get("vector_enabled", False)),
+                "mode": str(self.config.get("retrieval_mode", "hybrid") or "hybrid"),
+                "fts_available": bool(self.storage.fts_available),
+                "candidate_count": int(self.config.get("retrieval_candidate_k", 60)),
+                "top_k": int(self.config.get("retrieval_top_k", 8)),
+                "matches": [
+                    {
+                        "uid": match.entry.uid,
+                        "name": match.entry.comment,
+                        "score": match.score,
+                        "reason": match.reason,
+                    }
+                    for match in scan.activated
+                    if match.reason in ("vector", "hybrid", "keyword")
+                ],
             },
         })
         return serialized

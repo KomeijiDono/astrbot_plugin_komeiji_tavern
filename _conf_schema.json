@@ -193,6 +193,38 @@
         "description": "Embedding Provider ID",
         "type": "string",
         "default": ""
+      },
+      "retrieval_mode": {
+        "description": "检索模式",
+        "hint": "keyword=仅关键词；vector=仅向量；hybrid=关键词+向量。",
+        "type": "string",
+        "options": ["keyword", "vector", "hybrid"],
+        "default": "hybrid"
+      },
+      "retrieval_top_k": {
+        "description": "最终激活候选上限",
+        "type": "int",
+        "default": 8
+      },
+      "retrieval_candidate_k": {
+        "description": "检索候选召回数量",
+        "type": "int",
+        "default": 60
+      },
+      "vector_threshold": {
+        "description": "默认向量相似度阈值",
+        "type": "float",
+        "default": 0.35
+      },
+      "keyword_weight": {
+        "description": "关键词分数权重",
+        "type": "float",
+        "default": 0.35
+      },
+      "vector_weight": {
+        "description": "向量分数权重",
+        "type": "float",
+        "default": 0.65
       }
     }
   },

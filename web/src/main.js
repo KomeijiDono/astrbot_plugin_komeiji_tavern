@@ -115,6 +115,7 @@ const newEntry = () => ({
   cooldown: 0,
   delay: 0,
   outletName: '',
+  vectorized: false,
 })
 
 createApp({
@@ -593,6 +594,7 @@ createApp({
             <div class="entry-head">
               <input v-model="e.comment"><label><input type="checkbox" v-model="e.constant">常驻</label>
               <label><input type="checkbox" v-model="e.disable">禁用</label>
+              <label><input type="checkbox" v-model="e.vectorized">向量化</label>
               <button class="danger" @click="selected.data.entries.splice(i,1)">删除</button>
             </div>
             <div class="grid">
@@ -763,6 +765,19 @@ createApp({
           </div>
           <pre v-if="debugResult.summary.content">{{debugResult.summary.content}}</pre>
           <div class="alert error" v-if="debugResult.summary.error">{{debugResult.summary.error}}</div>
+        </details>
+        <details v-if="debugResult.retrieval" open><summary>混合检索状态</summary>
+          <div class="effective">
+            <span>状态：{{debugResult.retrieval.enabled?'已启用':'未启用'}}</span>
+            <span>模式：{{debugResult.retrieval.mode}}</span>
+            <span>FTS 可用：{{debugResult.retrieval.fts_available?'是':'否'}}</span>
+            <span>候选召回：{{debugResult.retrieval.candidate_count}}</span>
+            <span>最终上限：{{debugResult.retrieval.top_k}}</span>
+            <span>命中条目：{{debugResult.retrieval.matches?.length||0}}</span>
+          </div>
+          <div v-if="debugResult.retrieval.matches?.length" class="activation" v-for="m in debugResult.retrieval.matches">
+            <b>{{m.name||m.uid}}</b> · {{m.reason}} · 分数 {{m.score?.toFixed(3)}}
+          </div>
         </details>
         <div class="alert error" v-for="w in debugResult.warnings">{{w}}</div>
         <div class="message" v-for="(m,i) in debugResult.messages"><b>{{i}} · {{m.role}}</b><pre>{{m.content}}</pre></div>
