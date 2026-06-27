@@ -62,10 +62,11 @@ const labels = {
 const tabs = [
   ['home', '开始'],
   ['character', '角色卡'],
-    ['preset', '提示词预设'],
-    ['lorebook', '世界书'],
-    ['material', '创作素材'],
-    ['persona', '用户设定'],
+  ['character_group', '角色组'],
+  ['preset', '提示词预设'],
+  ['lorebook', '世界书'],
+  ['material', '创作素材'],
+  ['persona', '用户设定'],
   ['bindings', '绑定管理'],
   ['memories', '长期记忆'],
   ['metrics', '运行仪表盘'],
@@ -157,8 +158,11 @@ createApp({
 
     const docsForTab = computed(() => documents.value.filter(x => x.kind === tab.value))
     const bindDocs = computed(() => documents.value.filter(x => x.kind === binding.value.kind))
+    const characterDocs = computed(() => documents.value.filter(x => x.kind === 'character'))
     const card = computed(() => selected.value?.data?.data && typeof selected.value.data.data === 'object' ? selected.value.data.data : selected.value?.data || {})
     const entries = computed(() => { const x = selected.value?.data?.entries || []; return Array.isArray(x) ? x : Object.values(x) })
+    const groupMembers = computed(() => (selected.value?.data?.members || []).map(id => characterDocs.value.find(x => x.id === id)).filter(Boolean))
+    const availableGroupMembers = computed(() => characterDocs.value.filter(x => !(selected.value?.data?.members || []).includes(x.id)))
 
     const sFiltered = computed(() => {
       const q = sQuery.value.toLowerCase()
@@ -257,6 +261,7 @@ createApp({
     const createDoc = kind => {
       const t = {
         character: { data: { name: '新角色', description: '', personality: '', scenario: '', first_mes: '', mes_example: '', system_prompt: '', post_history_instructions: '' } },
+        character_group: { members: [], selection: 'round_robin' },
         preset: { main_prompt: '{{original_system}}', post_history_instructions: '', allow_character_main_override: false, allow_character_phi_override: true, blocks: JSON.parse(JSON.stringify(blocks)) },
         lorebook: { entries: [] },
         material: { entries: [] },
@@ -495,6 +500,17 @@ createApp({
       if (j >= 0 && j < b.length) [b[i], b[j]] = [b[j], b[i]]
     }
 
+    const moveMember = (i, n) => {
+      const b = selected.value.data.members
+      const j = i + n
+      if (j >= 0 && j < b.length) [b[i], b[j]] = [b[j], b[i]]
+    }
+
+    const addMember = id => {
+      if (!id) return
+      selected.value.data.members = [...(selected.value.data.members || []), id]
+    }
+
     const addBlock = () => selected.value.data.blocks.push({
       identifier: 'custom_' + Date.now(),
       name: '自定义提示词',
@@ -553,7 +569,8 @@ createApp({
       advanced, binding, memoryDraft, memoryQuery, memories, filteredMemories,
       metricDays, metrics, metricItems, metricTotals, metricProviders, maxMetricTokens,
       retrievalTest, retrievalStats, retrievalResult,
-      debug, debugResult, docsForTab, bindDocs, card, entries,
+      debug, debugResult, docsForTab, bindDocs, characterDocs, card, entries,
+      groupMembers, availableGroupMembers,
       sessionOptions, sFiltered, dFiltered, sessionDisplay, debugDisplay,
       sOpen, dOpen, pickSession, onSFocus, onSBlur, pickDebug, onDFocus, onDBlur,
       choose, createDoc, save, remove, duplicate, applyAdvanced, importData,
@@ -562,7 +579,7 @@ createApp({
       updateScope, addBinding, unbind, scopeName, updateMemoryScope, resetMemoryDraft,
       saveMemory, editMemory, toggleMemory, deleteMemory, refreshMetrics,
       refreshRetrievalStats, runRetrievalTest,
-      move, addBlock, keyText, setKeys,
+      move, moveMember, addMember, addBlock, keyText, setKeys,
       addEntry: () => selected.value.data.entries.push(newEntry(tab.value)),
       selectConversation, simulate, actual, formatTimestamp,
     }
@@ -586,12 +603,12 @@ createApp({
           <summary>导出</summary>
           <div class="export-popover">
             <strong>导出内容</strong>
-            <button v-if="['character','preset','lorebook','material','persona'].includes(tab) && selected?.id" @click="exportSelected" :disabled="busy">当前资料 JSON</button>
-            <button v-if="['character','preset','lorebook','material','persona'].includes(tab)" @click="exportKind" :disabled="busy || !docsForTab.length">当前类别 ZIP</button>
-            <button v-if="tab==='home' || ['character','preset','lorebook','material','persona'].includes(tab)" @click="exportAll" :disabled="busy || !documents.length">全部资料 ZIP</button>
+            <button v-if="['character','character_group','preset','lorebook','material','persona'].includes(tab) && selected?.id" @click="exportSelected" :disabled="busy">当前资料 JSON</button>
+            <button v-if="['character','character_group','preset','lorebook','material','persona'].includes(tab)" @click="exportKind" :disabled="busy || !docsForTab.length">当前类别 ZIP</button>
+            <button v-if="tab==='home' || ['character','character_group','preset','lorebook','material','persona'].includes(tab)" @click="exportAll" :disabled="busy || !documents.length">全部资料 ZIP</button>
             <button v-if="tab==='debug'" @click="exportMessages" :disabled="busy || !debugResult?.messages">当前 messages[] JSON</button>
             <button v-if="tab==='debug'" @click="backupSession" :disabled="busy || !debug.session_id">当前会话备份 ZIP</button>
-            <p v-if="!['home','character','preset','lorebook','persona','debug'].includes(tab)" class="muted">当前页面没有可导出的内容。</p>
+            <p v-if="!['home','character','character_group','preset','lorebook','material','persona','debug'].includes(tab)" class="muted">当前页面没有可导出的内容。</p>
             <small>{{downloadLocationHint}}</small>
           </div>
         </details>
@@ -618,7 +635,7 @@ createApp({
       </div>
       <div class="panel"><h3>待完成</h3><p v-if="!overview.tasks?.length">没有必须处理的事项。</p><ul><li v-for="x in overview.tasks">{{x}}</li></ul></div>
     </section>
-    <section v-else-if="['character','preset','lorebook','material','persona'].includes(tab)" class="workspace">
+    <section v-else-if="['character','character_group','preset','lorebook','material','persona'].includes(tab)" class="workspace">
       <div class="library">
         <div class="library-actions">
           <button class="primary" @click="createDoc(tab)">新建{{labels[tab]}}</button>
@@ -641,6 +658,25 @@ createApp({
           <div class="grid"><label>性格<textarea v-model="card.personality"></textarea></label><label>场景<textarea v-model="card.scenario"></textarea></label></div>
           <label>示例对话<textarea v-model="card.mes_example"></textarea></label>
           <div class="grid"><label>角色 Main Prompt<textarea v-model="card.system_prompt"></textarea></label><label>历史后指令（PHI）<textarea v-model="card.post_history_instructions"></textarea></label></div>
+        </template>
+        <template v-if="tab==='character_group'">
+          <div class="grid">
+            <label>选择策略<select v-model="selected.data.selection"><option value="round_robin">round_robin：未点名时自动轮询</option><option value="manual">manual：不自动推进</option></select></label>
+            <label>添加成员<select @change="addMember($event.target.value); $event.target.value=''">
+              <option value="">请选择角色卡</option>
+              <option v-for="d in availableGroupMembers" :value="d.id">{{d.name}}</option>
+            </select></label>
+          </div>
+          <p class="muted">真实请求会优先匹配用户消息中点名的成员；未点名时按下方顺序选择。</p>
+          <div class="block" v-for="(m,i) in groupMembers">
+            <div class="block-head">
+              <b>{{i+1}}. {{m.name}}</b>
+              <button @click="moveMember(i,-1)">↑</button><button @click="moveMember(i,1)">↓</button>
+              <button class="danger" @click="selected.data.members.splice(i,1)">移除</button>
+            </div>
+            <small>{{m.id}}</small>
+          </div>
+          <p v-if="!groupMembers.length" class="muted">还没有成员，请先创建角色卡再添加到角色组。</p>
         </template>
         <template v-if="tab==='preset'">
           <div class="grid"><label>主提示词<textarea v-model="selected.data.main_prompt"></textarea></label><label>预设 PHI<textarea v-model="selected.data.post_history_instructions"></textarea></label></div>
@@ -829,8 +865,21 @@ createApp({
           <b>当前有效配置</b>
           <span>预设：{{debugResult.effective.single?.preset?.name||'无'}}</span>
           <span>角色：{{debugResult.effective.single?.character?.name||'无'}}</span>
+          <span>角色组：{{debugResult.effective.single?.character_group?.name||'无'}}</span>
+          <span>本轮实际角色：{{debugResult.character_selection?.character?.card_name||debugResult.character_selection?.character?.name||'无'}}</span>
+          <span>选择原因：{{debugResult.character_selection?.reason||'无'}}</span>
           <span>世界书：{{debugResult.effective.additive?.lorebook?.map(x=>x.name).join('、')||'无'}}</span>
         </div>
+        <details v-if="debugResult.character_selection"><summary>角色组切换状态</summary>
+          <div class="effective">
+            <span>绑定组：{{debugResult.character_selection.group?.name||'无'}}</span>
+            <span>策略：{{debugResult.character_selection.group?.selection||'无'}}</span>
+            <span>当前下标：{{debugResult.character_selection.index ?? '无'}}</span>
+            <span>下轮下标：{{debugResult.character_selection.next_index ?? '无'}}</span>
+            <span>手动锁定：{{debugResult.character_selection.forced?'是':'否'}}</span>
+          </div>
+          <div class="activation" v-for="m in debugResult.character_selection.members"><b>{{m.card_name||m.name}}</b><small> · {{m.id}}</small></div>
+        </details>
         <details v-if="debugResult.summary" open><summary>自动摘要状态</summary>
           <div class="effective">
             <span>状态：{{debugResult.summary.enabled?'已启用':'未启用'}}</span>
@@ -915,6 +964,9 @@ createApp({
 /tavern continue [补充要求]
 /tavern impersonate [补充要求]
 /tavern quiet [静默提示词]
+/tavern character status
+/tavern character next
+/tavern character use <角色名>
 /tavern retrieval test <文本>
 /tavern retrieval stats</pre>
     </section>

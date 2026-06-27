@@ -34,6 +34,9 @@ def normalize_document(kind: str, data: dict[str, Any]) -> dict[str, Any]:
         result.setdefault("blocks", [])
         result.setdefault("allow_character_main_override", False)
         result.setdefault("allow_character_phi_override", True)
+    elif kind == "character_group":
+        result.setdefault("members", [])
+        result.setdefault("selection", "round_robin")
     elif kind in {"lorebook", "material"}:
         result.setdefault("entries", [])
     return result
@@ -84,4 +87,12 @@ def validate_document(kind: str, data: Any) -> tuple[dict[str, Any], list[str], 
         card = normalized.get("data", normalized)
         if not str(card.get("name", "")).strip():
             errors.append("角色名称不能为空")
+    elif kind == "character_group":
+        members = normalized.get("members")
+        if not isinstance(members, list):
+            errors.append("角色组 members 必须是数组")
+        else:
+            normalized["members"] = [str(item) for item in members if str(item).strip()]
+        if str(normalized.get("selection", "round_robin")) not in {"round_robin", "manual"}:
+            errors.append("角色组 selection 只能是 round_robin 或 manual")
     return normalized, errors, warnings

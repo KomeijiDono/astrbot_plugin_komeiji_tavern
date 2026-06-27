@@ -354,8 +354,27 @@ class KomeijiTavernPlugin(Star):
                 return
             yield event.plain_result("用法：/tavern retrieval test <文本> 或 /tavern retrieval stats")
             return
+        if action == "character":
+            parts = rest.strip().split(" ", 1)
+            sub = parts[0] if parts and parts[0] else "status"
+            arg = parts[1] if len(parts) > 1 else ""
+            scopes = self.service.scopes(event, None)
+            if sub == "status":
+                result = await asyncio.to_thread(self.service.character_status, scopes, session_id)
+                yield event.plain_result(result)
+                return
+            if sub == "next":
+                result = await asyncio.to_thread(self.service.character_next, scopes, session_id)
+                yield event.plain_result(result)
+                return
+            if sub in {"use", "switch"}:
+                result = await asyncio.to_thread(self.service.character_use, scopes, session_id, arg)
+                yield event.plain_result(result)
+                return
+            yield event.plain_result("用法：/tavern character status|next|use <角色名>")
+            return
         if action not in {"continue", "impersonate", "quiet"}:
-            yield event.plain_result("用法：/tavern status|preview|reset|continue|impersonate|quiet|retrieval [补充提示]")
+            yield event.plain_result("用法：/tavern status|preview|reset|continue|impersonate|quiet|retrieval|character [补充提示]")
             return
         event.set_extra("_kt_mode", action)
         event.set_extra("_kt_quiet_prompt", str(rest) if action == "quiet" else "")
