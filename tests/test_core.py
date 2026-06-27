@@ -85,6 +85,13 @@ class ExportTests(unittest.TestCase):
             self.assertEqual(json.loads(archive.read("preview.json")), preview)
             self.assertEqual(json.loads(archive.read("session-state.json")), state)
             self.assertEqual(json.loads(archive.read("manifest.json"))["message_count"], 2)
+            self.assertEqual(json.loads(archive.read("story-nodes.json")), [])
+
+    def test_session_backup_can_include_story_nodes(self):
+        nodes = [{"id": "n1", "assistant_text": "reply"}]
+        with self.read_zip(build_session_backup("s1", {}, {}, nodes)) as archive:
+            self.assertEqual(json.loads(archive.read("story-nodes.json")), nodes)
+            self.assertEqual(json.loads(archive.read("manifest.json"))["story_node_count"], 1)
 
 
 class CoreTests(unittest.TestCase):
@@ -557,6 +564,38 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(second.get_session("s1")["turn"], 7)
             self.assertEqual(second.resolve_bindings("lorebook", [("session", "s1")])[0]["id"], document_id)
 
+    def test_story_nodes_roundtrip_and_reset_preserves_archive(self):
+        with tempfile.TemporaryDirectory() as directory:
+            storage = TavernStorage(Path(directory) / "state.db")
+            storage.save_session("s1", {"turn": 3})
+            node_id = storage.create_story_node({
+                "session_id": "s1",
+                "parent_id": "root",
+                "branch_name": "if线",
+                "title": "雨夜",
+                "turn_index": 3,
+                "request_messages": [{"role": "user", "content": "hello"}],
+                "preview_payload": {"warnings": []},
+                "assistant_text": "reply",
+                "bindings_snapshot": {"single": {}},
+                "retrieval_snapshot": {"matches": []},
+                "memory_snapshot": {"matches": []},
+                "state_snapshot": {"turn": 3},
+            })
+            node = storage.get_story_node(node_id)
+            self.assertEqual(node["request_messages"][0]["content"], "hello")
+            self.assertEqual(node["bindings_snapshot"], {"single": {}})
+            listed = storage.list_story_nodes("s1")
+            self.assertEqual(listed[0]["assistant_preview"], "reply")
+            self.assertNotIn("request_messages", listed[0])
+            self.assertTrue(storage.rename_story_node(node_id, title="新标题", branch_name="主线"))
+            renamed = storage.get_story_node(node_id)
+            self.assertEqual(renamed["title"], "新标题")
+            self.assertEqual(renamed["branch_name"], "主线")
+            storage.reset_session("s1")
+            self.assertEqual(storage.get_session("s1")["turn"], 0)
+            self.assertIsNotNone(storage.get_story_node(node_id))
+
     def test_storage_cleanup_uses_independent_cutoffs(self):
         with tempfile.TemporaryDirectory() as directory:
             storage = TavernStorage(Path(directory) / "state.db")
@@ -598,6 +637,24 @@ class CoreTests(unittest.TestCase):
             service = TavernService(storage, object(), {})
             selected = service._bound_one("preset", [("global", "*"), ("session", "s1"), ("persona", "p1")])
             self.assertEqual(selected["id"], session_id)
+
+    def test_finalize_story_snapshot_updates_current_node(self):
+        with tempfile.TemporaryDirectory() as directory:
+            storage = TavernStorage(Path(directory) / "state.db")
+            storage.save_session("s1", {"turn": 2, "variables": {"mood": "calm"}})
+            service = TavernService(storage, object(), {})
+            node_id = run(service.finalize_story_snapshot({
+                "session_id": "s1",
+                "title": "节点",
+                "turn_index": 1,
+                "request_messages": [{"role": "user", "content": "hello"}],
+                "state_snapshot": {"turn": 1},
+            }, "reply", {"raw": True}))
+            self.assertEqual(storage.get_session("s1")["current_story_node_id"], node_id)
+            node = storage.get_story_node(node_id)
+            self.assertEqual(node["assistant_text"], "reply")
+            self.assertEqual(node["assistant_payload"], {"raw": True})
+            self.assertEqual(node["state_snapshot"]["variables"], {"mood": "calm"})
 
     def test_unbound_single_resource_does_not_fall_back(self):
         with tempfile.TemporaryDirectory() as directory:

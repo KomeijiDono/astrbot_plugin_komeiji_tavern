@@ -13,7 +13,7 @@ from typing import Any, Iterable
 
 
 class TavernStorage:
-    SCHEMA_VERSION = 6
+    SCHEMA_VERSION = 7
 
     def __init__(self, path: str | Path):
         self.path = Path(path)
@@ -93,6 +93,26 @@ class TavernStorage:
         );
         CREATE INDEX IF NOT EXISTS idx_runtime_metrics_created_at ON runtime_metrics(created_at);
         CREATE INDEX IF NOT EXISTS idx_runtime_metrics_session ON runtime_metrics(session_id, created_at);
+        CREATE TABLE IF NOT EXISTS story_nodes (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            parent_id TEXT NOT NULL DEFAULT '',
+            branch_name TEXT NOT NULL DEFAULT '',
+            title TEXT NOT NULL DEFAULT '',
+            turn_index INTEGER NOT NULL DEFAULT 0,
+            request_messages TEXT NOT NULL DEFAULT '[]',
+            preview_payload TEXT NOT NULL DEFAULT '{}',
+            assistant_text TEXT NOT NULL DEFAULT '',
+            assistant_payload TEXT NOT NULL DEFAULT '{}',
+            bindings_snapshot TEXT NOT NULL DEFAULT '{}',
+            retrieval_snapshot TEXT NOT NULL DEFAULT '{}',
+            memory_snapshot TEXT NOT NULL DEFAULT '{}',
+            state_snapshot TEXT NOT NULL DEFAULT '{}',
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_story_nodes_session ON story_nodes(session_id, created_at);
+        CREATE INDEX IF NOT EXISTS idx_story_nodes_parent ON story_nodes(parent_id, created_at);
         CREATE INDEX IF NOT EXISTS idx_sessions_updated_at ON sessions(updated_at);
         CREATE INDEX IF NOT EXISTS idx_previews_updated_at ON previews(updated_at);
         CREATE TABLE IF NOT EXISTS schema_meta (
@@ -181,6 +201,29 @@ class TavernStorage:
         CREATE INDEX IF NOT EXISTS idx_retrieval_logs_session
         ON retrieval_logs(session_id, created_at)
         """)
+
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS story_nodes (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            parent_id TEXT NOT NULL DEFAULT '',
+            branch_name TEXT NOT NULL DEFAULT '',
+            title TEXT NOT NULL DEFAULT '',
+            turn_index INTEGER NOT NULL DEFAULT 0,
+            request_messages TEXT NOT NULL DEFAULT '[]',
+            preview_payload TEXT NOT NULL DEFAULT '{}',
+            assistant_text TEXT NOT NULL DEFAULT '',
+            assistant_payload TEXT NOT NULL DEFAULT '{}',
+            bindings_snapshot TEXT NOT NULL DEFAULT '{}',
+            retrieval_snapshot TEXT NOT NULL DEFAULT '{}',
+            memory_snapshot TEXT NOT NULL DEFAULT '{}',
+            state_snapshot TEXT NOT NULL DEFAULT '{}',
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL
+        )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_story_nodes_session ON story_nodes(session_id, created_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_story_nodes_parent ON story_nodes(parent_id, created_at)")
 
     def rebuild_document_index(
         self,
@@ -598,6 +641,106 @@ class TavernStorage:
         with self._lock, self._connection() as conn:
             conn.execute("DELETE FROM sessions WHERE session_id=?", (session_id,))
             conn.execute("DELETE FROM previews WHERE session_id=?", (session_id,))
+
+    def create_story_node(self, payload: dict[str, Any]) -> str:
+        node_id = str(payload.get("id") or uuid.uuid4())
+        now = time.time()
+        created_at = float(payload.get("created_at") or now)
+        updated_at = float(payload.get("updated_at") or now)
+        with self._lock, self._connection() as conn:
+            conn.execute(
+                """INSERT INTO story_nodes(
+                    id,session_id,parent_id,branch_name,title,turn_index,
+                    request_messages,preview_payload,assistant_text,assistant_payload,
+                    bindings_snapshot,retrieval_snapshot,memory_snapshot,state_snapshot,
+                    created_at,updated_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    node_id,
+                    str(payload.get("session_id", "")),
+                    str(payload.get("parent_id", "") or ""),
+                    str(payload.get("branch_name", "") or ""),
+                    str(payload.get("title", "") or ""),
+                    int(payload.get("turn_index", 0) or 0),
+                    json.dumps(payload.get("request_messages", []), ensure_ascii=False),
+                    json.dumps(payload.get("preview_payload", {}), ensure_ascii=False),
+                    str(payload.get("assistant_text", "") or ""),
+                    json.dumps(payload.get("assistant_payload", {}), ensure_ascii=False),
+                    json.dumps(payload.get("bindings_snapshot", {}), ensure_ascii=False),
+                    json.dumps(payload.get("retrieval_snapshot", {}), ensure_ascii=False),
+                    json.dumps(payload.get("memory_snapshot", {}), ensure_ascii=False),
+                    json.dumps(payload.get("state_snapshot", {}), ensure_ascii=False),
+                    created_at,
+                    updated_at,
+                ),
+            )
+        return node_id
+
+    def list_story_nodes(self, session_id: str | None = None, limit: int = 300) -> list[dict[str, Any]]:
+        sql = "SELECT * FROM story_nodes"
+        params: list[Any] = []
+        if session_id:
+            sql += " WHERE session_id=?"
+            params.append(session_id)
+        sql += " ORDER BY created_at DESC LIMIT ?"
+        params.append(max(1, int(limit)))
+        with self._connection() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return [self._decode_story_node(row, summary=True) for row in rows]
+
+    def get_story_node(self, node_id: str) -> dict[str, Any] | None:
+        with self._connection() as conn:
+            row = conn.execute("SELECT * FROM story_nodes WHERE id=?", (node_id,)).fetchone()
+        return self._decode_story_node(row, summary=False) if row else None
+
+    def rename_story_node(self, node_id: str, *, title: str | None = None, branch_name: str | None = None) -> bool:
+        updates: list[str] = []
+        params: list[Any] = []
+        if title is not None:
+            updates.append("title=?")
+            params.append(str(title))
+        if branch_name is not None:
+            updates.append("branch_name=?")
+            params.append(str(branch_name))
+        if not updates:
+            return False
+        updates.append("updated_at=?")
+        params.append(time.time())
+        params.append(node_id)
+        with self._lock, self._connection() as conn:
+            result = conn.execute(f"UPDATE story_nodes SET {','.join(updates)} WHERE id=?", params)
+        return bool(result.rowcount)
+
+    @staticmethod
+    def _load_json(value: Any, fallback: Any) -> Any:
+        try:
+            return json.loads(value or "")
+        except (json.JSONDecodeError, TypeError):
+            return fallback
+
+    @classmethod
+    def _decode_story_node(cls, row: sqlite3.Row, *, summary: bool) -> dict[str, Any]:
+        result = dict(row)
+        messages = cls._load_json(result.pop("request_messages"), [])
+        preview = cls._load_json(result.pop("preview_payload"), {})
+        assistant_payload = cls._load_json(result.pop("assistant_payload"), {})
+        bindings = cls._load_json(result.pop("bindings_snapshot"), {})
+        retrieval = cls._load_json(result.pop("retrieval_snapshot"), {})
+        memory = cls._load_json(result.pop("memory_snapshot"), {})
+        state = cls._load_json(result.pop("state_snapshot"), {})
+        result["message_count"] = len(messages) if isinstance(messages, list) else 0
+        result["assistant_preview"] = str(result.get("assistant_text", ""))[:240]
+        if not summary:
+            result.update({
+                "request_messages": messages,
+                "preview_payload": preview,
+                "assistant_payload": assistant_payload,
+                "bindings_snapshot": bindings,
+                "retrieval_snapshot": retrieval,
+                "memory_snapshot": memory,
+                "state_snapshot": state,
+            })
+        return result
 
     def save_preview(self, session_id: str, payload: dict[str, Any]) -> None:
         with self._lock, self._connection() as conn:

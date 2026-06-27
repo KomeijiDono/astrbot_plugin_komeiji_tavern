@@ -71,6 +71,11 @@ class TavernWebApi:
             (f"{self.PREFIX}/metrics", ["GET"], self.metrics, "Runtime metrics"),
             (f"{self.PREFIX}/retrieval/test", ["POST"], self.retrieval_test, "Test retrieval"),
             (f"{self.PREFIX}/retrieval/stats", ["GET"], self.retrieval_stats, "Retrieval stats"),
+            (f"{self.PREFIX}/archive", ["GET"], self.archive_nodes, "List story nodes"),
+            (f"{self.PREFIX}/archive/export", ["POST"], self.archive_export, "Export story nodes"),
+            (f"{self.PREFIX}/archive/<node_id>", ["GET"], self.archive_node, "Get story node"),
+            (f"{self.PREFIX}/archive/<node_id>/rename", ["POST"], self.archive_rename, "Rename story node"),
+            (f"{self.PREFIX}/archive/<node_id>/branch", ["POST"], self.archive_branch, "Continue from story node"),
             (f"{self.PREFIX}/preview/<session_id>", ["GET"], self.preview, "Last request preview"),
             (f"{self.PREFIX}/session/<session_id>", ["GET"], self.session, "Session state"),
             (f"{self.PREFIX}/session/<session_id>/reset", ["POST"], self.reset_session, "Reset session"),
@@ -421,9 +426,53 @@ class TavernWebApi:
             session_id,
             self.storage.get_session(session_id),
             self.storage.get_preview(session_id),
+            [
+                self.storage.get_story_node(str(item.get("id", ""))) or item
+                for item in self.storage.list_story_nodes(session_id=session_id, limit=1000)
+            ],
         )
         filename = f"tavern-session-{safe_filename(session_id, 'session')}.zip"
         return self.ok(download_payload(filename, "application/zip", content))
+
+    async def archive_nodes(self):
+        session_id = str(request.args.get("session_id", "") or "")
+        limit = min(1000, max(1, int(request.args.get("limit", 300))))
+        return self.ok(self.storage.list_story_nodes(session_id=session_id or None, limit=limit))
+
+    async def archive_node(self, node_id: str):
+        node = self.storage.get_story_node(node_id)
+        return self.ok(node) if node else self.error("Story node not found", 404)
+
+    async def archive_rename(self, node_id: str):
+        payload = await request.get_json(force=True)
+        ok = self.storage.rename_story_node(
+            node_id,
+            title=str(payload.get("title", "")) if "title" in payload else None,
+            branch_name=str(payload.get("branch_name", "")) if "branch_name" in payload else None,
+        )
+        return self.ok() if ok else self.error("Story node not found", 404)
+
+    async def archive_branch(self, node_id: str):
+        payload = await request.get_json(force=True)
+        session_id = str(payload.get("session_id", "") or "")
+        if not session_id:
+            node = self.storage.get_story_node(node_id)
+            session_id = str((node or {}).get("session_id", "") or "")
+        if not session_id:
+            return self.error("Missing session_id")
+        ok = await self.service.set_pending_branch(session_id, node_id, str(payload.get("branch_name", "") or ""))
+        return self.ok() if ok else self.error("Story node not found", 404)
+
+    async def archive_export(self):
+        payload = await request.get_json(force=True)
+        session_id = str(payload.get("session_id", "") or "")
+        nodes = [
+            self.storage.get_story_node(str(item.get("id", ""))) or item
+            for item in self.storage.list_story_nodes(session_id=session_id or None, limit=1000)
+        ]
+        content = json.dumps(nodes, ensure_ascii=False, indent=2).encode("utf-8")
+        name = safe_filename(session_id or "archive", "archive")
+        return self.ok(download_payload(f"tavern-archive-{name}.json", "application/json", content))
 
     async def generation(self):
         payload = await request.get_json(force=True)

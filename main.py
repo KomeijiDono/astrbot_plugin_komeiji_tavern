@@ -162,6 +162,17 @@ class KomeijiTavernPlugin(Star):
                     response.completion_text = (response.completion_text or "").rstrip() + "\n\n" + template.replace("{content}", status_content)
                 await asyncio.to_thread(self.storage.save_session, session_id, state)
         finally:
+            snapshot = event.get_extra("_kt_story_snapshot")
+            if isinstance(snapshot, dict):
+                event.set_extra("_kt_story_snapshot", None)
+                try:
+                    await self.service.finalize_story_snapshot(
+                        snapshot,
+                        str(response.completion_text or ""),
+                        {"completion_text": str(response.completion_text or "")},
+                    )
+                except Exception as exc:
+                    logger.warning("[%s] 保存分支树节点失败：%s", DISPLAY_NAME, exc)
             if self.config.get("illustration_enabled", False):
                 event.set_extra("_kt_illustration_text", str(response.completion_text or ""))
 
@@ -354,8 +365,52 @@ class KomeijiTavernPlugin(Star):
                 return
             yield event.plain_result("用法：/tavern retrieval test <文本> 或 /tavern retrieval stats")
             return
+        if action in {"archive", "branch"}:
+            parts = rest.strip().split(" ", 2)
+            sub = parts[0] if parts and parts[0] else "list"
+            arg = parts[1] if len(parts) > 1 else ""
+            extra = parts[2] if len(parts) > 2 else ""
+            if action == "branch" and sub not in {"list", "show", "rename"}:
+                arg, extra, sub = sub, arg, "branch"
+            if sub == "list":
+                nodes = await asyncio.to_thread(self.storage.list_story_nodes, session_id, 20)
+                if not nodes:
+                    yield event.plain_result("当前会话还没有分支树节点。")
+                    return
+                lines = ["最近分支树节点："]
+                for item in nodes:
+                    node_id = str(item.get("id", ""))
+                    title = str(item.get("title") or "（无标题）")
+                    branch_name = str(item.get("branch_name") or "")
+                    branch_label = f" [{branch_name}]" if branch_name else ""
+                    lines.append(
+                        f"- {node_id} 轮次 {item.get('turn_index', 0)}{branch_label}：{title}"
+                    )
+                lines.append("用法：/tavern archive show <节点ID> 或 /tavern archive branch <节点ID> [分支名]")
+                yield event.plain_result("\n".join(lines))
+                return
+            if sub == "show":
+                node = await asyncio.to_thread(self.storage.get_story_node, arg)
+                if not node:
+                    yield event.plain_result("找不到该分支树节点。")
+                    return
+                event.set_extra("_kt_force_long_delivery", True)
+                yield event.plain_result(json.dumps(node, ensure_ascii=False, indent=2))
+                return
+            if sub == "branch":
+                if not arg:
+                    yield event.plain_result("用法：/tavern archive branch <节点ID> [分支名]")
+                    return
+                ok = await self.service.set_pending_branch(session_id, arg, extra)
+                if not ok:
+                    yield event.plain_result("找不到该分支树节点。")
+                    return
+                yield event.plain_result("已设置从该节点继续；下一次对话会从该快照创建新分支。")
+                return
+            yield event.plain_result("用法：/tavern archive list|show <节点ID>|branch <节点ID> [分支名]")
+            return
         if action not in {"continue", "impersonate", "quiet"}:
-            yield event.plain_result("用法：/tavern status|preview|reset|continue|impersonate|quiet|retrieval [补充提示]")
+            yield event.plain_result("用法：/tavern status|preview|reset|continue|impersonate|quiet|retrieval|archive [补充提示]")
             return
         event.set_extra("_kt_mode", action)
         event.set_extra("_kt_quiet_prompt", str(rest) if action == "quiet" else "")
@@ -369,7 +424,7 @@ class KomeijiTavernPlugin(Star):
 
     @filter.command("tavern")
     async def tavern(self, event: AstrMessageEvent, action: str = "status", rest: GreedyStr = ""):
-        """Komeiji's Tavern: status, preview, reset, continue, impersonate, quiet."""
+        """Komeiji's Tavern: status, preview, reset, continue, impersonate, quiet, archive."""
         async for result in self._handle_tavern(event, action, str(rest)):
             yield result
 

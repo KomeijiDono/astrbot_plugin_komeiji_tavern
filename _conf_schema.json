@@ -162,6 +162,12 @@
         "type": "int",
         "default": 7
       },
+      "archive_enabled": {
+        "description": "启用分支树归档",
+        "hint": "开启后每次真实请求完成时保存请求 messages、绑定快照、检索命中和最终回复。/tavern reset 不会删除归档节点。",
+        "type": "bool",
+        "default": true
+      },
       "cleanup_interval_hours": {
         "description": "清理检查间隔（小时）",
         "type": "int",

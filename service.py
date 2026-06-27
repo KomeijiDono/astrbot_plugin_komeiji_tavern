@@ -72,6 +72,34 @@ class TavernService:
         async with self._session_lock(session_id):
             await asyncio.to_thread(self.storage.reset_session, session_id)
 
+    async def set_pending_branch(self, session_id: str, node_id: str, branch_name: str = "") -> bool:
+        node = await asyncio.to_thread(self.storage.get_story_node, node_id)
+        if not node:
+            return False
+        async with self._session_lock(session_id):
+            state = await asyncio.to_thread(self.storage.get_session, session_id)
+            state["pending_branch"] = {"source_node_id": node_id, "branch_name": branch_name}
+            await asyncio.to_thread(self.storage.save_session, session_id, state)
+        return True
+
+    async def finalize_story_snapshot(
+        self,
+        snapshot: dict[str, Any],
+        assistant_text: str,
+        assistant_payload: dict[str, Any] | None = None,
+    ) -> str:
+        session_id = str(snapshot.get("session_id", "") or "default")
+        payload = dict(snapshot)
+        payload["assistant_text"] = assistant_text
+        payload["assistant_payload"] = assistant_payload or {}
+        async with self._session_lock(session_id):
+            state = await asyncio.to_thread(self.storage.get_session, session_id)
+            payload["state_snapshot"] = copy.deepcopy(state)
+            node_id = await asyncio.to_thread(self.storage.create_story_node, payload)
+            state["current_story_node_id"] = node_id
+            await asyncio.to_thread(self.storage.save_session, session_id, state)
+        return node_id
+
     def ensure_defaults(self) -> None:
         if not self.storage.list_documents("preset"):
             preset = {
@@ -458,6 +486,22 @@ class TavernService:
             )
         return str(content)
 
+    @staticmethod
+    def _story_context_from_node(node: dict[str, Any]) -> list[dict[str, Any]]:
+        messages = node.get("request_messages") if isinstance(node.get("request_messages"), list) else []
+        result: list[dict[str, Any]] = []
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            role = str(message.get("role", ""))
+            if role == "system" or message.get("_kt_injected") or message.get("_kt_example"):
+                continue
+            result.append({"role": role or "user", "content": message.get("content", "")})
+        assistant_text = str(node.get("assistant_text", "") or "").strip()
+        if assistant_text:
+            result.append({"role": "assistant", "content": assistant_text})
+        return result
+
     @classmethod
     def _message_fingerprint(cls, message: dict[str, Any]) -> str:
         payload = json.dumps(
@@ -647,11 +691,24 @@ class TavernService:
         async with self._session_lock(session_id):
             state = await asyncio.to_thread(self.storage.get_session, session_id)
             pending = state.pop("pending_generation", {})
+            pending_branch = state.pop("pending_branch", {}) if isinstance(state.get("pending_branch"), dict) else {}
             generation_mode = str(event.get_extra("_kt_mode") or pending.get("mode") or mode)
             quiet_prompt = str(event.get_extra("_kt_quiet_prompt") or pending.get("prompt") or quiet_prompt)
+            branch_parent_id = ""
+            branch_name = ""
+            branch_contexts: list[dict[str, Any]] | None = None
+            if pending_branch:
+                branch_parent_id = str(pending_branch.get("source_node_id", "") or "")
+                branch_name = str(pending_branch.get("branch_name", "") or "")
+                node = await asyncio.to_thread(self.storage.get_story_node, branch_parent_id)
+                if node:
+                    state.update(copy.deepcopy(node.get("state_snapshot", {})) if isinstance(node.get("state_snapshot"), dict) else {})
+                    state["current_story_node_id"] = branch_parent_id
+                    branch_contexts = self._story_context_from_node(node)
             await asyncio.to_thread(self.storage.save_session, session_id, state)
             entries = await self._collect_entries(scopes)
-            scan_messages = list(req.contexts or [])
+            source_contexts = branch_contexts if branch_contexts is not None else list(req.contexts or [])
+            scan_messages = list(source_contexts)
             if req.prompt:
                 scan_messages.append({"role": "user", "content": req.prompt})
 
@@ -672,9 +729,9 @@ class TavernService:
             character_doc = await asyncio.to_thread(self._select_character, scopes, req.prompt or "", state)
             persona_doc = await asyncio.to_thread(self._bound_one, "persona", scopes)
             history, summary_meta, summary_warnings, apply_history_limit = await self._prepare_history(
-                list(req.contexts or []), state, session_id=session_id, generate=True
+                list(source_contexts), state, session_id=session_id, generate=True
             )
-            memory_text = "\n".join([self._message_text(item) for item in list(req.contexts or [])[-4:]])
+            memory_text = "\n".join([self._message_text(item) for item in list(source_contexts)[-4:]])
             if req.prompt:
                 memory_text = f"{memory_text}\n{req.prompt}".strip()
             memory_context, memory_matches = await self._retrieve_memories(scopes=scopes, text=memory_text)
@@ -706,7 +763,7 @@ class TavernService:
             await self._extract_memories(
                 session_id=session_id,
                 state=state,
-                messages=list(req.contexts or []) + ([{"role": "user", "content": req.prompt}] if req.prompt else []),
+                messages=list(source_contexts) + ([{"role": "user", "content": req.prompt}] if req.prompt else []),
             )
             await asyncio.to_thread(self.storage.save_session, session_id, state)
             preview = self._serialize_result(result, scan, summary=summary_meta)
@@ -736,6 +793,25 @@ class TavernService:
                 ],
             }
             await asyncio.to_thread(self.storage.save_preview, session_id, preview)
+
+            if bool(self.config.get("archive_enabled", True)):
+                effective = await asyncio.to_thread(self.effective_bindings, scopes)
+                title = str(req.prompt or "").strip().splitlines()[0][:80]
+                if not title:
+                    title = f"第 {int(state.get('turn', 0) or 0)} 轮"
+                event.set_extra("_kt_story_snapshot", {
+                    "session_id": session_id,
+                    "parent_id": branch_parent_id or str(state.get("current_story_node_id", "") or ""),
+                    "branch_name": branch_name,
+                    "title": title,
+                    "turn_index": int(state.get("turn", 0) or 0),
+                    "request_messages": result.messages,
+                    "preview_payload": preview,
+                    "bindings_snapshot": effective,
+                    "retrieval_snapshot": preview.get("retrieval", {}),
+                    "memory_snapshot": preview.get("memory", {}),
+                    "state_snapshot": copy.deepcopy(state),
+                })
 
             retrieval_matches = [
                 match for match in scan.activated

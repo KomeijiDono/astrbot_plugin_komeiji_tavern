@@ -73,8 +73,14 @@ def build_document_archive(documents: Iterable[dict[str, Any]]) -> bytes:
     return output.getvalue()
 
 
-def build_session_backup(session_id: str, state: dict[str, Any], preview: dict[str, Any] | None) -> bytes:
+def build_session_backup(
+    session_id: str,
+    state: dict[str, Any],
+    preview: dict[str, Any] | None,
+    story_nodes: list[dict[str, Any]] | None = None,
+) -> bytes:
     preview = preview or {}
+    story_nodes = story_nodes or []
     messages = preview.get("messages") if isinstance(preview.get("messages"), list) else []
     manifest = {
         "format": "komeiji-tavern-session-backup",
@@ -83,7 +89,8 @@ def build_session_backup(session_id: str, state: dict[str, Any], preview: dict[s
         "session_id": session_id,
         "has_preview": bool(preview),
         "message_count": len(messages),
-        "note": "此备份仅包含插件会话状态和请求预览，不包含 AstrBot 原始聊天记录。",
+        "story_node_count": len(story_nodes),
+        "note": "此备份包含插件会话状态、请求预览和分支树节点，不包含 AstrBot 原始聊天记录。",
     }
     output = io.BytesIO()
     with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as archive:
@@ -91,4 +98,5 @@ def build_session_backup(session_id: str, state: dict[str, Any], preview: dict[s
         _write_json(archive, "messages.json", messages)
         _write_json(archive, "preview.json", preview)
         _write_json(archive, "session-state.json", state)
+        _write_json(archive, "story-nodes.json", story_nodes)
     return output.getvalue()

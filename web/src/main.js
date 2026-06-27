@@ -69,6 +69,7 @@ const tabs = [
   ['bindings', '绑定管理'],
   ['memories', '长期记忆'],
   ['metrics', '运行仪表盘'],
+  ['archive', '分支树'],
   ['debug', '调试器'],
   ['help', '使用说明'],
 ]
@@ -148,6 +149,7 @@ createApp({
     const retrievalTest = ref({ text: '' })
     const retrievalStats = ref(null)
     const retrievalResult = ref(null)
+    const archive = ref({ session_id: '', nodes: [], selected: null, branch_name: '' })
 
     const binding = ref({ scope_type: 'session', scope_id: '', kind: 'character', target_id: '', priority: 0 })
     const memoryDraft = ref({ id: '', scope_type: 'session', scope_id: '', category: 'status', content: '', enabled: true })
@@ -188,6 +190,26 @@ createApp({
     const metricTotals = computed(() => metrics.value.totals || {})
     const metricProviders = computed(() => Object.entries(metrics.value.providers || {}).sort((a, b) => b[1] - a[1]))
     const maxMetricTokens = computed(() => Math.max(1, ...metricItems.value.map(x => Number(x.prompt_tokens || 0))))
+    const archiveTree = computed(() => {
+      const byParent = new Map()
+      for (const node of archive.value.nodes.slice().reverse()) {
+        const parent = node.parent_id || ''
+        if (!byParent.has(parent)) byParent.set(parent, [])
+        byParent.get(parent).push(node)
+      }
+      const out = []
+      const visit = (parent, depth) => {
+        for (const node of byParent.get(parent) || []) {
+          out.push({ ...node, depth })
+          visit(node.id, depth + 1)
+        }
+      }
+      visit('', 0)
+      for (const node of archive.value.nodes) {
+        if (!out.some(x => x.id === node.id)) out.push({ ...node, depth: 0 })
+      }
+      return out
+    })
 
     const sessionDisplay = computed({
       get() {
@@ -231,6 +253,7 @@ createApp({
           const bound = bindings.value.find(b => b.scope_type === 'session')
           if (bound) { debug.value.session_id = bound.scope_id; selectConversation() }
         }
+        if (!archive.value.session_id) archive.value.session_id = debug.value.session_id
         const warnings = x[4].data.warnings || []
         if (warnings.length) notice.value = warnings.join('；')
       } catch (e) {
@@ -343,6 +366,43 @@ createApp({
       if (!debug.value.session_id) { error.value = '请先选择会话。'; return }
       return runDownload(() => post('/session/' + encodeURIComponent(debug.value.session_id) + '/backup', {}))
     }
+
+    const refreshArchive = async () => {
+      clear()
+      const query = archive.value.session_id ? '?session_id=' + encodeURIComponent(archive.value.session_id) : ''
+      archive.value.nodes = (await request('/archive' + query)).data
+      if (archive.value.selected && !archive.value.nodes.some(x => x.id === archive.value.selected.id)) {
+        archive.value.selected = null
+      }
+    }
+
+    const selectArchiveNode = async node => {
+      clear()
+      archive.value.selected = (await request('/archive/' + encodeURIComponent(node.id))).data
+      archive.value.branch_name = archive.value.selected.branch_name || ''
+    }
+
+    const renameArchiveNode = async () => {
+      if (!archive.value.selected) return
+      await post('/archive/' + encodeURIComponent(archive.value.selected.id) + '/rename', {
+        title: archive.value.selected.title,
+        branch_name: archive.value.selected.branch_name,
+      })
+      await refreshArchive()
+      archive.value.selected = (await request('/archive/' + encodeURIComponent(archive.value.selected.id))).data
+      notice.value = '节点名称已更新。'
+    }
+
+    const branchFromArchiveNode = async () => {
+      if (!archive.value.selected) return
+      await post('/archive/' + encodeURIComponent(archive.value.selected.id) + '/branch', {
+        session_id: archive.value.session_id || archive.value.selected.session_id,
+        branch_name: archive.value.branch_name,
+      })
+      notice.value = '已设置从该节点继续；下一次真实对话会保存为新分支。'
+    }
+
+    const exportArchive = () => runDownload(() => post('/archive/export', { session_id: archive.value.session_id }))
 
     const applyAdvanced = () => {
       try {
@@ -549,15 +609,17 @@ createApp({
 
     return {
       tabs, labels, tab, overview, documents, bindings, personas, selected, pendingDeleteId, error, notice, busy,
-      downloadLocationHint,
+      downloadLocationHint, saveJson,
       advanced, binding, memoryDraft, memoryQuery, memories, filteredMemories,
       metricDays, metrics, metricItems, metricTotals, metricProviders, maxMetricTokens,
       retrievalTest, retrievalStats, retrievalResult,
+      archive, archiveTree,
       debug, debugResult, docsForTab, bindDocs, card, entries,
       sessionOptions, sFiltered, dFiltered, sessionDisplay, debugDisplay,
       sOpen, dOpen, pickSession, onSFocus, onSBlur, pickDebug, onDFocus, onDBlur,
       choose, createDoc, save, remove, duplicate, applyAdvanced, importData,
       exportSelected, exportKind, exportAll, exportMessages, backupSession,
+      refreshArchive, selectArchiveNode, renameArchiveNode, branchFromArchiveNode, exportArchive,
       setFile: e => file.value = e.target.files[0],
       updateScope, addBinding, unbind, scopeName, updateMemoryScope, resetMemoryDraft,
       saveMemory, editMemory, toggleMemory, deleteMemory, refreshMetrics,
@@ -591,7 +653,8 @@ createApp({
             <button v-if="tab==='home' || ['character','preset','lorebook','material','persona'].includes(tab)" @click="exportAll" :disabled="busy || !documents.length">全部资料 ZIP</button>
             <button v-if="tab==='debug'" @click="exportMessages" :disabled="busy || !debugResult?.messages">当前 messages[] JSON</button>
             <button v-if="tab==='debug'" @click="backupSession" :disabled="busy || !debug.session_id">当前会话备份 ZIP</button>
-            <p v-if="!['home','character','preset','lorebook','persona','debug'].includes(tab)" class="muted">当前页面没有可导出的内容。</p>
+            <button v-if="tab==='archive'" @click="exportArchive" :disabled="busy || !archive.nodes.length">当前分支树 JSON</button>
+            <p v-if="!['home','character','preset','lorebook','persona','debug','archive'].includes(tab)" class="muted">当前页面没有可导出的内容。</p>
             <small>{{downloadLocationHint}}</small>
           </div>
         </details>
@@ -802,6 +865,49 @@ createApp({
           <tr v-for="m in metricItems.slice().reverse().slice(0,50)"><td>{{formatTimestamp(m.created_at)}}</td><td>{{m.session_id}}</td><td>{{m.provider_id||'unknown'}}</td><td>{{m.mode}}</td><td>{{m.prompt_tokens}}</td><td>{{m.duration_ms}}ms</td><td>{{m.worldbook_hits}}</td><td>{{m.memory_hits}}</td><td>{{m.warning_count}}</td></tr>
         </table>
       </div>
+    </section>
+    <section v-else-if="tab==='archive'" class="workspace">
+      <div class="library">
+        <div class="library-actions">
+          <button class="primary" @click="refreshArchive">刷新分支树</button>
+        </div>
+        <label class="combo">会话 ID
+          <input v-model="archive.session_id" placeholder="留空显示全部节点">
+        </label>
+        <button v-for="n in archiveTree" :class="['doc',{active:archive.selected?.id===n.id}]" @click="selectArchiveNode(n)" :style="{paddingLeft: (16 + n.depth * 18) + 'px'}">
+          <b>{{n.title||'（无标题）'}}</b>
+          <small>轮次 {{n.turn_index}} · {{n.branch_name||'主线'}} · {{formatTimestamp(n.created_at)}}</small>
+          <small>{{n.id}}</small>
+        </button>
+        <p v-if="!archive.nodes.length" class="muted">还没有归档节点。真实请求完成后会自动保存。</p>
+      </div>
+      <article v-if="archive.selected" class="editor">
+        <div class="editor-title">
+          <input class="title-input" v-model="archive.selected.title" placeholder="节点标题">
+          <button class="primary" @click="renameArchiveNode">保存名称</button>
+        </div>
+        <div class="grid">
+          <label>分支名<input v-model="archive.selected.branch_name" placeholder="主线 / if线 / 存档名"></label>
+          <label>从此继续的新分支名<input v-model="archive.branch_name" placeholder="留空继承主线"></label>
+        </div>
+        <div class="actions"><button @click="branchFromArchiveNode">从此节点继续</button><button @click="saveJson(archive.selected,'story-node-'+archive.selected.id+'.json')">导出该节点 JSON</button></div>
+        <div class="effective">
+          <span>ID：{{archive.selected.id}}</span>
+          <span>父节点：{{archive.selected.parent_id||'无'}}</span>
+          <span>会话：{{archive.selected.session_id}}</span>
+          <span>轮次：{{archive.selected.turn_index}}</span>
+          <span>消息数：{{archive.selected.message_count}}</span>
+          <span>创建：{{formatTimestamp(archive.selected.created_at)}}</span>
+        </div>
+        <details open><summary>Assistant 回复</summary><pre>{{archive.selected.assistant_text||'（空）'}}</pre></details>
+        <details open><summary>请求 messages[]（{{archive.selected.request_messages?.length||0}}）</summary>
+          <div class="message" v-for="(m,i) in archive.selected.request_messages"><b>{{i}} · {{m.role}}</b><pre>{{m.content}}</pre></div>
+        </details>
+        <details><summary>绑定快照</summary><pre>{{JSON.stringify(archive.selected.bindings_snapshot,null,2)}}</pre></details>
+        <details><summary>检索与记忆命中</summary><pre>{{JSON.stringify({retrieval:archive.selected.retrieval_snapshot,memory:archive.selected.memory_snapshot},null,2)}}</pre></details>
+        <details><summary>会话状态快照</summary><pre>{{JSON.stringify(archive.selected.state_snapshot,null,2)}}</pre></details>
+      </article>
+      <article v-else class="empty"><h3>选择一个节点查看快照</h3><p>这里保存真实请求的 prompt、messages、绑定、检索命中和最终回复。</p></article>
     </section>
     <section v-else-if="tab==='debug'" class="debug">
       <div class="panel controls">
