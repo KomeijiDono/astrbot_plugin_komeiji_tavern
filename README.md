@@ -2,7 +2,7 @@
 
 # Komeiji's Tavern
 
-[![Version](https://img.shields.io/badge/version-0.6.0-7c5cff?style=for-the-badge)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.6.5-7c5cff?style=for-the-badge)](CHANGELOG.md)
 [![AstrBot](https://img.shields.io/badge/AstrBot-4.25%2B-4f9cff?style=for-the-badge)](https://github.com/AstrBotDevs/AstrBot)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-42b883?style=for-the-badge)](LICENSE)
 
@@ -16,6 +16,8 @@
 - 世界书扫描：主次关键词、正则、递归、概率、Sticky、Cooldown、Delay、Outlet 和深度注入。
 - 混合检索：世界书和创作素材支持关键词召回、向量召回、加权合并、分类去重和命中统计。
 - 创作素材库：支持 SQLite 知识库导入、默认向量化、禁用条目过滤、检索测试和统计面板。
+- 长期记忆治理：支持 pending/active/archived/rejected 状态、重要度权重、来源记录、精确去重和待确认批量处理。
+- 分支树归档：真实请求完成后保存请求快照与回复，可从历史节点另起分支继续 RP。
 - 会话级自动摘要：使用可选小模型压缩旧历史，将滚动摘要注入 Summary 块。
 - 上下文管理：固定历史条数、token 预算、近期消息保护和核心提示块保护。
 - 完整调试器：查看最终 `messages[]`、提示块、世界书激活原因、混合检索状态、裁剪项、摘要状态和警告。
@@ -48,6 +50,7 @@ http://127.0.0.1:6185/api/plug/astrbot_plugin_komeiji_tavern/v1/panel
 - **提示词预设**：调整块顺序、角色、注入位置、深度、裁剪优先级及覆盖规则。
 - **世界书**：配置关键词、扫描深度、递归、概率、生命周期和注入位置。
 - **创作素材**：维护可检索素材条目，支持分类、描述、禁用、向量化和默认深度注入。
+- **长期记忆**：维护自动提取或手动录入的长期事实，支持状态筛选、重要度、来源、批量确认、拒绝和归档。
 - **用户设定**：维护 Persona 内容并映射 AstrBot Persona。
 - **绑定管理**：单选资料按“会话 > Persona > 用户 > 群组 > 全局”覆盖，世界书和素材叠加去重。
 - **调试器**：只读模拟不会推进轮次或生命周期；“最近真实请求”展示实际发送结果；检索测试与统计用于检查关键词/向量召回效果。
@@ -101,20 +104,46 @@ FTS5 可用时优先使用 SQLite FTS5；不可用时自动降级为 LIKE 检索
 - `impersonate`：以用户口吻草拟下一条用户消息。
 - `quiet`：在深度 0 注入临时提示词，不改变长期预设。
 
+## 角色组与角色切换
+
+WebUI 的“角色组”页签可把多个角色卡组合成一个可绑定资源。把角色组绑定到会话、Persona 或全局后，插件会优先使用角色组；没有绑定角色组时继续使用普通单角色卡绑定。
+
+- `round_robin`：用户消息没有点名成员角色时，按成员顺序轮询切换。
+- `manual`：用户消息没有点名成员角色时，使用当前成员但不自动推进。
+- 用户消息中包含某个成员角色名时，本轮优先切到该角色。
+- 调试器会显示“本轮实际角色”和角色组切换状态，便于确认最终请求使用了谁。
+
+手动控制命令：
+
+```text
+/tavern character status
+/tavern character next
+/tavern character use <角色名>
+```
+
+`next` 推进到下一位并取消手动锁定；`use <角色名>` 锁定指定成员，直到再次 `next` 或重置会话状态。
+
 状态与调试命令：
 
 ```text
 /tavern status
 /tavern preview
 /tavern reset
+/tavern character status
+/tavern character next
+/tavern character use <角色名>
+/tavern archive list
+/tavern archive show <节点ID>
+/tavern archive branch <节点ID> [分支名]
 /tavern retrieval test <文本>
 /tavern retrieval stats
 ```
 
-`reset` 只清除当前会话的插件生命周期、状态变量、滚动摘要和请求预览，不删除 AstrBot 聊天或绑定资料。
+`reset` 只清除当前会话的插件生命周期、状态变量、滚动摘要和请求预览，不删除 AstrBot 聊天、绑定资料或分支树归档。
 
 - `retrieval test`：在当前会话绑定范围内测试输入文本会召回哪些世界书或素材条目。
 - `retrieval stats`：查看检索日志数量、高频命中条目和当前会话统计。
+- `archive list|show|branch`：查看当前会话分支树节点，或从指定节点快照继续生成新分支。
 
 ## 插件配置
 
@@ -123,7 +152,7 @@ FTS5 可用时优先使用 SQLite FTS5；不可用时自动降级为 LIKE 检索
 - **基础功能**：插件开关、发送工具引导。普通聊天建议关闭发送工具引导。
 - **上下文与裁剪**：上下文预算、输出预留、历史条数与裁剪顺序。
 - **自动摘要与历史压缩**：Provider、触发条数、输出上限、超时和提示词。
-- **会话数据生命周期**：自动清理、状态保留天数、预览保留天数和检查间隔。
+- **会话数据生命周期**：自动清理、状态保留天数、预览保留天数、分支树归档和检查间隔。
 - **世界书与向量**：扫描深度、递归、检索模式、候选数量、权重、分类去重和 Embedding Provider。
 - **QQ 普通消息分片 / 合并转发**：长回复发送策略。
 - **状态栏 / 自动配图**：可选创作扩展。
@@ -135,11 +164,11 @@ FTS5 可用时优先使用 SQLite FTS5；不可用时自动降级为 LIKE 检索
 - 支持 JSON、YAML、PNG 角色卡、纯文本提示词预设以及 SQLite 知识库素材。
 - 导入时保留未知原始字段，导出时与已编辑字段合并。
 - 资料编辑页可分别导出当前资料 JSON，也可按类别或一键导出全部资料 ZIP。
-- 调试器可导出当前显示的纯 `messages[]` JSON；“重置前备份 ZIP”还会保存完整请求预览与插件会话状态。
+- 调试器可导出当前显示的纯 `messages[]` JSON；“重置前备份 ZIP”还会保存完整请求预览、插件会话状态与分支树节点。
 - 创作素材、世界书和检索索引保存在同一个 SQLite 数据库中；删除资料时会同步清理绑定和索引。
-- 会话备份不包含 AstrBot 原始聊天记录；`/tavern reset` 本身也不会删除这些聊天记录。
+- 会话备份不包含 AstrBot 原始聊天记录；`/tavern reset` 本身也不会删除这些聊天记录或分支树归档。
 - SQLite 文件位于 `data/astrbot_plugin_komeiji_tavern/tavern.db`。
-- 自动清理仅删除 `sessions` 和 `previews` 中的过期行，不删除 documents、bindings 或聊天数据。
+- 自动清理仅删除 `sessions` 和 `previews` 中的过期行，不删除 documents、bindings、story_nodes 或聊天数据。
 - SQLite 页面会被后续数据复用，插件不会在运行时自动执行 `VACUUM`。
 
 ## 常见问题

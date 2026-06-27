@@ -62,10 +62,11 @@ const labels = {
 const tabs = [
   ['home', '开始'],
   ['character', '角色卡'],
-    ['preset', '提示词预设'],
-    ['lorebook', '世界书'],
-    ['material', '创作素材'],
-    ['persona', '用户设定'],
+  ['character_group', '角色组'],
+  ['preset', '提示词预设'],
+  ['lorebook', '世界书'],
+  ['material', '创作素材'],
+  ['persona', '用户设定'],
   ['bindings', '绑定管理'],
   ['memories', '长期记忆'],
   ['metrics', '运行仪表盘'],
@@ -145,6 +146,8 @@ createApp({
     const dOpen = ref(false)
     const dFocused = ref(false)
     const memoryQuery = ref('')
+    const memoryStatusFilter = ref('')
+    const selectedMemoryIds = ref([])
     const metricDays = ref(7)
     const retrievalTest = ref({ text: '' })
     const retrievalStats = ref(null)
@@ -152,15 +155,19 @@ createApp({
     const archive = ref({ session_id: '', nodes: [], selected: null, branch_name: '' })
 
     const binding = ref({ scope_type: 'session', scope_id: '', kind: 'character', target_id: '', priority: 0 })
-    const memoryDraft = ref({ id: '', scope_type: 'session', scope_id: '', category: 'status', content: '', enabled: true })
+    const newMemoryDraft = () => ({ id: '', scope_type: 'session', scope_id: '', category: 'status', content: '', enabled: true, status: 'active', importance: 1, source_type: 'manual', source_ref: '', expires_at: 0 })
+    const memoryDraft = ref(newMemoryDraft())
     const debug = ref({ session_id: '', persona_id: '', prompt: '', system_prompt: '', mode: 'normal', quiet_prompt: '', seed: 1 })
     const debugResult = ref(null)
     const formatTimestamp = value => value ? new Date(Number(value) * 1000).toLocaleString() : '无'
 
     const docsForTab = computed(() => documents.value.filter(x => x.kind === tab.value))
     const bindDocs = computed(() => documents.value.filter(x => x.kind === binding.value.kind))
+    const characterDocs = computed(() => documents.value.filter(x => x.kind === 'character'))
     const card = computed(() => selected.value?.data?.data && typeof selected.value.data.data === 'object' ? selected.value.data.data : selected.value?.data || {})
     const entries = computed(() => { const x = selected.value?.data?.entries || []; return Array.isArray(x) ? x : Object.values(x) })
+    const groupMembers = computed(() => (selected.value?.data?.members || []).map(id => characterDocs.value.find(x => x.id === id)).filter(Boolean))
+    const availableGroupMembers = computed(() => characterDocs.value.filter(x => !(selected.value?.data?.members || []).includes(x.id)))
 
     const sFiltered = computed(() => {
       const q = sQuery.value.toLowerCase()
@@ -184,8 +191,16 @@ createApp({
     })
     const filteredMemories = computed(() => {
       const q = memoryQuery.value.toLowerCase()
-      return memories.value.filter(x => !q || (x.content + ' ' + x.category + ' ' + x.scope_id).toLowerCase().includes(q))
+      const status = memoryStatusFilter.value
+      return memories.value.filter(x => {
+        const itemStatus = x.status || (x.enabled ? 'active' : 'archived')
+        const matchedStatus = !status || itemStatus === status
+        const matchedQuery = !q || (x.content + ' ' + x.category + ' ' + x.scope_id + ' ' + itemStatus + ' ' + x.source_type).toLowerCase().includes(q)
+        return matchedStatus && matchedQuery
+      })
     })
+    const visibleMemoryIds = computed(() => filteredMemories.value.map(x => x.id))
+    const allVisibleMemoriesSelected = computed(() => visibleMemoryIds.value.length > 0 && visibleMemoryIds.value.every(id => selectedMemoryIds.value.includes(id)))
     const metricItems = computed(() => metrics.value.items || [])
     const metricTotals = computed(() => metrics.value.totals || {})
     const metricProviders = computed(() => Object.entries(metrics.value.providers || {}).sort((a, b) => b[1] - a[1]))
@@ -248,6 +263,7 @@ createApp({
         personas.value = x[3].data
         conversations.value = x[4].data.items || []
         memories.value = x[5].data
+        selectedMemoryIds.value = selectedMemoryIds.value.filter(id => memories.value.some(item => item.id === id))
         metrics.value = x[6].data
         if (!debug.value.session_id) {
           const bound = bindings.value.find(b => b.scope_type === 'session')
@@ -280,6 +296,7 @@ createApp({
     const createDoc = kind => {
       const t = {
         character: { data: { name: '新角色', description: '', personality: '', scenario: '', first_mes: '', mes_example: '', system_prompt: '', post_history_instructions: '' } },
+        character_group: { members: [], selection: 'round_robin' },
         preset: { main_prompt: '{{original_system}}', post_history_instructions: '', allow_character_main_override: false, allow_character_phi_override: true, blocks: JSON.parse(JSON.stringify(blocks)) },
         lorebook: { entries: [] },
         material: { entries: [] },
@@ -469,7 +486,7 @@ createApp({
     }
 
     const resetMemoryDraft = () => {
-      memoryDraft.value = { id: '', scope_type: 'session', scope_id: debug.value.session_id || '', category: 'status', content: '', enabled: true }
+      memoryDraft.value = { ...newMemoryDraft(), scope_id: debug.value.session_id || '' }
     }
 
     const saveMemory = async () => {
@@ -490,6 +507,11 @@ createApp({
         category: item.category,
         content: item.content,
         enabled: item.enabled,
+        status: item.status || (item.enabled ? 'active' : 'archived'),
+        importance: Number(item.importance || 1),
+        source_type: item.source_type || 'manual',
+        source_ref: item.source_ref || '',
+        expires_at: Number(item.expires_at || 0),
       }
       tab.value = 'memories'
     }
@@ -497,6 +519,23 @@ createApp({
     const toggleMemory = async item => {
       await post('/memories/' + encodeURIComponent(item.id) + '/toggle', { enabled: !item.enabled })
       await load()
+    }
+
+    const toggleAllVisibleMemories = () => {
+      if (allVisibleMemoriesSelected.value) {
+        selectedMemoryIds.value = selectedMemoryIds.value.filter(id => !visibleMemoryIds.value.includes(id))
+      } else {
+        selectedMemoryIds.value = Array.from(new Set([...selectedMemoryIds.value, ...visibleMemoryIds.value]))
+      }
+    }
+
+    const updateSelectedMemoryStatus = async status => {
+      clear()
+      if (!selectedMemoryIds.value.length) { error.value = '请先选择长期记忆。'; return }
+      const out = await post('/memories/status', { ids: selectedMemoryIds.value, status })
+      selectedMemoryIds.value = []
+      await load()
+      notice.value = '已更新 ' + out.data.updated + ' 条长期记忆。'
     }
 
     const deleteMemory = async item => {
@@ -555,6 +594,17 @@ createApp({
       if (j >= 0 && j < b.length) [b[i], b[j]] = [b[j], b[i]]
     }
 
+    const moveMember = (i, n) => {
+      const b = selected.value.data.members
+      const j = i + n
+      if (j >= 0 && j < b.length) [b[i], b[j]] = [b[j], b[i]]
+    }
+
+    const addMember = id => {
+      if (!id) return
+      selected.value.data.members = [...(selected.value.data.members || []), id]
+    }
+
     const addBlock = () => selected.value.data.blocks.push({
       identifier: 'custom_' + Date.now(),
       name: '自定义提示词',
@@ -610,11 +660,13 @@ createApp({
     return {
       tabs, labels, tab, overview, documents, bindings, personas, selected, pendingDeleteId, error, notice, busy,
       downloadLocationHint, saveJson,
-      advanced, binding, memoryDraft, memoryQuery, memories, filteredMemories,
+      advanced, binding, memoryDraft, memoryQuery, memoryStatusFilter, selectedMemoryIds,
+      memories, filteredMemories, allVisibleMemoriesSelected,
       metricDays, metrics, metricItems, metricTotals, metricProviders, maxMetricTokens,
       retrievalTest, retrievalStats, retrievalResult,
       archive, archiveTree,
-      debug, debugResult, docsForTab, bindDocs, card, entries,
+      debug, debugResult, docsForTab, bindDocs, characterDocs, card, entries,
+      groupMembers, availableGroupMembers,
       sessionOptions, sFiltered, dFiltered, sessionDisplay, debugDisplay,
       sOpen, dOpen, pickSession, onSFocus, onSBlur, pickDebug, onDFocus, onDBlur,
       choose, createDoc, save, remove, duplicate, applyAdvanced, importData,
@@ -622,9 +674,10 @@ createApp({
       refreshArchive, selectArchiveNode, renameArchiveNode, branchFromArchiveNode, exportArchive,
       setFile: e => file.value = e.target.files[0],
       updateScope, addBinding, unbind, scopeName, updateMemoryScope, resetMemoryDraft,
-      saveMemory, editMemory, toggleMemory, deleteMemory, refreshMetrics,
+      saveMemory, editMemory, toggleMemory, toggleAllVisibleMemories,
+      updateSelectedMemoryStatus, deleteMemory, refreshMetrics,
       refreshRetrievalStats, runRetrievalTest,
-      move, addBlock, keyText, setKeys,
+      move, moveMember, addMember, addBlock, keyText, setKeys,
       addEntry: () => selected.value.data.entries.push(newEntry(tab.value)),
       selectConversation, simulate, actual, formatTimestamp,
     }
@@ -635,7 +688,7 @@ createApp({
     <div class="brand">
       <small>ASTRBOT 角色扮演工作台</small>
       <h1>Komeiji's<br>Tavern</h1>
-      <span>v0.6.0</span>
+      <span>v0.6.5</span>
     </div>
     <button v-for="t in tabs" :class="{active:tab===t[0]}" @click="tab=t[0];selected=null">{{t[1]}}</button>
   </aside>
@@ -648,13 +701,13 @@ createApp({
           <summary>导出</summary>
           <div class="export-popover">
             <strong>导出内容</strong>
-            <button v-if="['character','preset','lorebook','material','persona'].includes(tab) && selected?.id" @click="exportSelected" :disabled="busy">当前资料 JSON</button>
-            <button v-if="['character','preset','lorebook','material','persona'].includes(tab)" @click="exportKind" :disabled="busy || !docsForTab.length">当前类别 ZIP</button>
-            <button v-if="tab==='home' || ['character','preset','lorebook','material','persona'].includes(tab)" @click="exportAll" :disabled="busy || !documents.length">全部资料 ZIP</button>
+            <button v-if="['character','character_group','preset','lorebook','material','persona'].includes(tab) && selected?.id" @click="exportSelected" :disabled="busy">当前资料 JSON</button>
+            <button v-if="['character','character_group','preset','lorebook','material','persona'].includes(tab)" @click="exportKind" :disabled="busy || !docsForTab.length">当前类别 ZIP</button>
+            <button v-if="tab==='home' || ['character','character_group','preset','lorebook','material','persona'].includes(tab)" @click="exportAll" :disabled="busy || !documents.length">全部资料 ZIP</button>
             <button v-if="tab==='debug'" @click="exportMessages" :disabled="busy || !debugResult?.messages">当前 messages[] JSON</button>
             <button v-if="tab==='debug'" @click="backupSession" :disabled="busy || !debug.session_id">当前会话备份 ZIP</button>
             <button v-if="tab==='archive'" @click="exportArchive" :disabled="busy || !archive.nodes.length">当前分支树 JSON</button>
-            <p v-if="!['home','character','preset','lorebook','persona','debug','archive'].includes(tab)" class="muted">当前页面没有可导出的内容。</p>
+            <p v-if="!['home','character','character_group','preset','lorebook','material','persona','debug','archive'].includes(tab)" class="muted">当前页面没有可导出的内容。</p>
             <small>{{downloadLocationHint}}</small>
           </div>
         </details>
@@ -681,7 +734,7 @@ createApp({
       </div>
       <div class="panel"><h3>待完成</h3><p v-if="!overview.tasks?.length">没有必须处理的事项。</p><ul><li v-for="x in overview.tasks">{{x}}</li></ul></div>
     </section>
-    <section v-else-if="['character','preset','lorebook','material','persona'].includes(tab)" class="workspace">
+    <section v-else-if="['character','character_group','preset','lorebook','material','persona'].includes(tab)" class="workspace">
       <div class="library">
         <div class="library-actions">
           <button class="primary" @click="createDoc(tab)">新建{{labels[tab]}}</button>
@@ -704,6 +757,25 @@ createApp({
           <div class="grid"><label>性格<textarea v-model="card.personality"></textarea></label><label>场景<textarea v-model="card.scenario"></textarea></label></div>
           <label>示例对话<textarea v-model="card.mes_example"></textarea></label>
           <div class="grid"><label>角色 Main Prompt<textarea v-model="card.system_prompt"></textarea></label><label>历史后指令（PHI）<textarea v-model="card.post_history_instructions"></textarea></label></div>
+        </template>
+        <template v-if="tab==='character_group'">
+          <div class="grid">
+            <label>选择策略<select v-model="selected.data.selection"><option value="round_robin">round_robin：未点名时自动轮询</option><option value="manual">manual：不自动推进</option></select></label>
+            <label>添加成员<select @change="addMember($event.target.value); $event.target.value=''">
+              <option value="">请选择角色卡</option>
+              <option v-for="d in availableGroupMembers" :value="d.id">{{d.name}}</option>
+            </select></label>
+          </div>
+          <p class="muted">真实请求会优先匹配用户消息中点名的成员；未点名时按下方顺序选择。</p>
+          <div class="block" v-for="(m,i) in groupMembers">
+            <div class="block-head">
+              <b>{{i+1}}. {{m.name}}</b>
+              <button @click="moveMember(i,-1)">↑</button><button @click="moveMember(i,1)">↓</button>
+              <button class="danger" @click="selected.data.members.splice(i,1)">移除</button>
+            </div>
+            <small>{{m.id}}</small>
+          </div>
+          <p v-if="!groupMembers.length" class="muted">还没有成员，请先创建角色卡再添加到角色组。</p>
         </template>
         <template v-if="tab==='preset'">
           <div class="grid"><label>主提示词<textarea v-model="selected.data.main_prompt"></textarea></label><label>预设 PHI<textarea v-model="selected.data.post_history_instructions"></textarea></label></div>
@@ -800,11 +872,14 @@ createApp({
     <section v-else-if="tab==='memories'" class="stack">
       <div class="panel">
         <h3>{{memoryDraft.id?'编辑长期记忆':'新增长期记忆'}}</h3>
-        <p>自动提取的记忆会出现在这里。你可以手动新增、禁用或删除，禁用后不会再注入 Prompt。</p>
+        <p>自动提取的记忆会出现在这里。只有 active 且启用的记忆会注入 Prompt；pending 记忆需要确认后才会参与检索。</p>
         <div class="binding-form">
           <label>作用域<select v-model="memoryDraft.scope_type" @change="updateMemoryScope"><option value="session">会话</option><option value="user">用户</option><option value="group">群组</option><option value="persona">Persona</option><option value="global">全局</option></select></label>
           <label>作用域 ID<input v-model="memoryDraft.scope_id" placeholder="会话 ID / 用户 ID / *"></label>
           <label>分类<select v-model="memoryDraft.category"><option value="preference">用户偏好</option><option value="relationship">角色关系</option><option value="plot">剧情节点</option><option value="status">长期状态</option></select></label>
+          <label>状态<select v-model="memoryDraft.status"><option value="active">active</option><option value="pending">pending</option><option value="archived">archived</option><option value="rejected">rejected</option></select></label>
+          <label>重要度<input type="number" min="0" step="0.1" v-model.number="memoryDraft.importance"></label>
+          <label>来源<input v-model="memoryDraft.source_type" placeholder="manual / auto_extract"></label>
           <label><input type="checkbox" v-model="memoryDraft.enabled">启用</label>
         </div>
         <label>记忆内容<textarea v-model="memoryDraft.content" placeholder="一条具体、可长期复用的事实。"></textarea></label>
@@ -813,13 +888,20 @@ createApp({
       <div class="panel">
         <div class="result-head">
           <h3>长期记忆列表</h3>
-          <input v-model="memoryQuery" placeholder="搜索内容、分类或作用域">
+          <div class="actions">
+            <select v-model="memoryStatusFilter"><option value="">全部状态</option><option value="pending">pending</option><option value="active">active</option><option value="archived">archived</option><option value="rejected">rejected</option></select>
+            <input v-model="memoryQuery" placeholder="搜索内容、分类或作用域">
+          </div>
         </div>
-        <table><tr><th>状态</th><th>作用域</th><th>分类</th><th>内容</th><th>更新时间</th><th></th></tr>
+        <div class="actions"><button @click="toggleAllVisibleMemories">{{allVisibleMemoriesSelected?'取消全选':'全选当前列表'}}</button><button @click="updateSelectedMemoryStatus('active')" :disabled="!selectedMemoryIds.length">确认为 active</button><button @click="updateSelectedMemoryStatus('rejected')" :disabled="!selectedMemoryIds.length">拒绝</button><button @click="updateSelectedMemoryStatus('archived')" :disabled="!selectedMemoryIds.length">归档</button><span class="muted">已选择 {{selectedMemoryIds.length}} 条</span></div>
+        <table><tr><th></th><th>状态</th><th>作用域</th><th>分类</th><th>重要度</th><th>来源</th><th>内容</th><th>更新时间</th><th></th></tr>
           <tr v-for="m in filteredMemories">
-            <td>{{m.enabled?'启用':'禁用'}}</td>
+            <td><input type="checkbox" :value="m.id" v-model="selectedMemoryIds"></td>
+            <td>{{m.status || (m.enabled?'active':'archived')}}</td>
             <td>{{m.scope_type}}: {{m.scope_id}}</td>
             <td>{{m.category}}</td>
+            <td>{{Number(m.importance || 1).toFixed(1)}}</td>
+            <td>{{m.source_type || 'manual'}}</td>
             <td>{{m.content}}</td>
             <td>{{formatTimestamp(m.updated_at)}}</td>
             <td class="actions"><button @click="editMemory(m)">编辑</button><button @click="toggleMemory(m)">{{m.enabled?'禁用':'启用'}}</button><button class="danger" @click="deleteMemory(m)">删除</button></td>
@@ -935,8 +1017,21 @@ createApp({
           <b>当前有效配置</b>
           <span>预设：{{debugResult.effective.single?.preset?.name||'无'}}</span>
           <span>角色：{{debugResult.effective.single?.character?.name||'无'}}</span>
+          <span>角色组：{{debugResult.effective.single?.character_group?.name||'无'}}</span>
+          <span>本轮实际角色：{{debugResult.character_selection?.character?.card_name||debugResult.character_selection?.character?.name||'无'}}</span>
+          <span>选择原因：{{debugResult.character_selection?.reason||'无'}}</span>
           <span>世界书：{{debugResult.effective.additive?.lorebook?.map(x=>x.name).join('、')||'无'}}</span>
         </div>
+        <details v-if="debugResult.character_selection"><summary>角色组切换状态</summary>
+          <div class="effective">
+            <span>绑定组：{{debugResult.character_selection.group?.name||'无'}}</span>
+            <span>策略：{{debugResult.character_selection.group?.selection||'无'}}</span>
+            <span>当前下标：{{debugResult.character_selection.index ?? '无'}}</span>
+            <span>下轮下标：{{debugResult.character_selection.next_index ?? '无'}}</span>
+            <span>手动锁定：{{debugResult.character_selection.forced?'是':'否'}}</span>
+          </div>
+          <div class="activation" v-for="m in debugResult.character_selection.members"><b>{{m.card_name||m.name}}</b><small> · {{m.id}}</small></div>
+        </details>
         <details v-if="debugResult.summary" open><summary>自动摘要状态</summary>
           <div class="effective">
             <span>状态：{{debugResult.summary.enabled?'已启用':'未启用'}}</span>
@@ -964,6 +1059,19 @@ createApp({
           <div v-if="debugResult.retrieval.matches?.length" class="activation" v-for="m in debugResult.retrieval.matches">
             <b>{{m.name||m.uid}}</b> · {{m.reason}}<span v-if="m.scanner_reason"> / {{m.scanner_reason}}</span> · 分数 {{m.score?.toFixed(3)}}
           </div>
+        </details>
+        <details v-if="debugResult.memory" open><summary>长期记忆注入</summary>
+          <div class="effective">
+            <span>状态：{{debugResult.memory.enabled?'已启用':'未启用'}}</span>
+            <span>作用域：{{debugResult.memory.scopes?.map(x=>x.join(':')).join('、')||'无'}}</span>
+            <span>注入条数：{{debugResult.memory.injected_count||0}}</span>
+          </div>
+          <pre v-if="debugResult.memory.query">{{debugResult.memory.query}}</pre>
+          <div v-if="debugResult.memory.matches?.length" class="activation" v-for="m in debugResult.memory.matches">
+            <b>{{m.category||'memory'}}</b> · {{m.scope_type}}:{{m.scope_id}} · 分数 {{m.score?.toFixed(3)}} · 重要度 {{Number(m.importance||1).toFixed(1)}} · {{m.status||'active'}} · {{m.source_type||'manual'}}
+            <pre>{{m.content}}</pre>
+          </div>
+          <p v-if="!debugResult.memory.matches?.length" class="muted">本轮没有注入长期记忆。</p>
         </details>
         <details open><summary>检索测试与统计</summary>
           <div class="binding-form">
@@ -1021,6 +1129,9 @@ createApp({
 /tavern continue [补充要求]
 /tavern impersonate [补充要求]
 /tavern quiet [静默提示词]
+/tavern character status
+/tavern character next
+/tavern character use <角色名>
 /tavern retrieval test <文本>
 /tavern retrieval stats</pre>
     </section>

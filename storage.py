@@ -13,7 +13,7 @@ from typing import Any, Iterable
 
 
 class TavernStorage:
-    SCHEMA_VERSION = 7
+    SCHEMA_VERSION = 8
 
     def __init__(self, path: str | Path):
         self.path = Path(path)
@@ -68,9 +68,17 @@ class TavernStorage:
             category TEXT NOT NULL,
             content TEXT NOT NULL,
             embedding TEXT NOT NULL DEFAULT '[]',
+            embedding_model TEXT NOT NULL DEFAULT '',
             enabled INTEGER NOT NULL DEFAULT 1,
+            status TEXT NOT NULL DEFAULT 'active',
+            importance REAL NOT NULL DEFAULT 1.0,
+            source_type TEXT NOT NULL DEFAULT 'manual',
+            source_ref TEXT NOT NULL DEFAULT '',
             source_session_id TEXT NOT NULL DEFAULT '',
             source_turn INTEGER NOT NULL DEFAULT 0,
+            expires_at REAL NOT NULL DEFAULT 0,
+            content_hash TEXT NOT NULL DEFAULT '',
+            metadata_json TEXT NOT NULL DEFAULT '{}',
             created_at REAL NOT NULL,
             updated_at REAL NOT NULL
         );
@@ -174,6 +182,22 @@ class TavernStorage:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
     def _migrate_schema(self, conn: sqlite3.Connection) -> None:
+        self._ensure_column(conn, "memories", "embedding_model", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column(conn, "memories", "status", "TEXT NOT NULL DEFAULT 'active'")
+        self._ensure_column(conn, "memories", "importance", "REAL NOT NULL DEFAULT 1.0")
+        self._ensure_column(conn, "memories", "source_type", "TEXT NOT NULL DEFAULT 'manual'")
+        self._ensure_column(conn, "memories", "source_ref", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column(conn, "memories", "expires_at", "REAL NOT NULL DEFAULT 0")
+        self._ensure_column(conn, "memories", "content_hash", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column(conn, "memories", "metadata_json", "TEXT NOT NULL DEFAULT '{}'")
+        conn.execute("UPDATE memories SET status='archived' WHERE enabled=0 AND status='active'")
+        rows = conn.execute("SELECT id, content FROM memories WHERE content_hash='' OR content_hash IS NULL").fetchall()
+        for row in rows:
+            content_hash = hashlib.sha1(str(row["content"]).encode("utf-8")).hexdigest()
+            conn.execute("UPDATE memories SET content_hash=? WHERE id=?", (content_hash, row["id"]))
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_memories_status ON memories(status, updated_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_memories_hash ON memories(content_hash)")
+
         self._ensure_column(conn, "entry_index", "category", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column(conn, "entry_index", "description", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column(conn, "entry_index", "aliases_json", "TEXT NOT NULL DEFAULT '[]'")
@@ -762,25 +786,51 @@ class TavernStorage:
         category: str,
         content: str,
         embedding: list[float] | None = None,
+        embedding_model: str = "",
         memory_id: str | None = None,
         enabled: bool = True,
+        status: str | None = None,
+        importance: float = 1.0,
+        source_type: str = "manual",
+        source_ref: str = "",
         source_session_id: str = "",
         source_turn: int = 0,
+        expires_at: float = 0,
+        metadata: dict[str, Any] | None = None,
     ) -> str:
-        memory_id = memory_id or str(uuid.uuid4())
+        explicit_id = bool(memory_id)
+        status = status or ("active" if enabled else "archived")
+        if status not in {"pending", "active", "archived", "rejected"}:
+            status = "active"
+        enabled = enabled and status == "active"
+        content_hash = hashlib.sha1(content.encode("utf-8")).hexdigest()
         now = time.time()
         with self._lock, self._connection() as conn:
+            if not explicit_id:
+                row = conn.execute(
+                    """SELECT id FROM memories
+                    WHERE scope_type=? AND scope_id=? AND category=? AND content_hash=?
+                    ORDER BY updated_at DESC LIMIT 1""",
+                    (scope_type, scope_id, category, content_hash),
+                ).fetchone()
+                memory_id = str(row["id"]) if row else str(uuid.uuid4())
             conn.execute(
                 """INSERT INTO memories(
-                    id,scope_type,scope_id,category,content,embedding,enabled,
-                    source_session_id,source_turn,created_at,updated_at
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
+                    id,scope_type,scope_id,category,content,embedding,embedding_model,enabled,
+                    status,importance,source_type,source_ref,source_session_id,source_turn,
+                    expires_at,content_hash,metadata_json,created_at,updated_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(id) DO UPDATE SET
                     scope_type=excluded.scope_type,scope_id=excluded.scope_id,
                     category=excluded.category,content=excluded.content,
-                    embedding=excluded.embedding,enabled=excluded.enabled,
+                    embedding=excluded.embedding,embedding_model=excluded.embedding_model,
+                    enabled=excluded.enabled,status=excluded.status,
+                    importance=excluded.importance,source_type=excluded.source_type,
+                    source_ref=excluded.source_ref,
                     source_session_id=excluded.source_session_id,
-                    source_turn=excluded.source_turn,updated_at=excluded.updated_at""",
+                    source_turn=excluded.source_turn,expires_at=excluded.expires_at,
+                    content_hash=excluded.content_hash,metadata_json=excluded.metadata_json,
+                    updated_at=excluded.updated_at""",
                 (
                     memory_id,
                     scope_type,
@@ -788,9 +838,17 @@ class TavernStorage:
                     category,
                     content,
                     json.dumps(embedding or []),
+                    embedding_model,
                     1 if enabled else 0,
+                    status,
+                    float(importance or 1.0),
+                    source_type,
+                    source_ref,
                     source_session_id,
                     int(source_turn or 0),
+                    float(expires_at or 0),
+                    content_hash,
+                    json.dumps(metadata or {}, ensure_ascii=False),
                     now,
                     now,
                 ),
@@ -803,7 +861,10 @@ class TavernStorage:
         scope_type: str | None = None,
         scope_id: str | None = None,
         enabled: bool | None = None,
+        status: str | None = None,
+        source_type: str | None = None,
         query: str | None = None,
+        include_expired: bool = True,
         limit: int = 200,
     ) -> list[dict[str, Any]]:
         clauses: list[str] = []
@@ -817,10 +878,19 @@ class TavernStorage:
         if enabled is not None:
             clauses.append("enabled=?")
             params.append(1 if enabled else 0)
+        if status:
+            clauses.append("status=?")
+            params.append(status)
+        if source_type:
+            clauses.append("source_type=?")
+            params.append(source_type)
+        if not include_expired:
+            clauses.append("(expires_at=0 OR expires_at>?)")
+            params.append(time.time())
         if query:
-            clauses.append("(content LIKE ? OR category LIKE ? OR scope_id LIKE ?)")
+            clauses.append("(content LIKE ? OR category LIKE ? OR scope_id LIKE ? OR source_type LIKE ?)")
             needle = f"%{query}%"
-            params.extend([needle, needle, needle])
+            params.extend([needle, needle, needle, needle])
         where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
         params.append(max(1, int(limit)))
         with self._connection() as conn:
@@ -831,12 +901,37 @@ class TavernStorage:
         return [self._decode_memory(row) for row in rows]
 
     def set_memory_enabled(self, memory_id: str, enabled: bool) -> bool:
+        status = "active" if enabled else "archived"
         with self._lock, self._connection() as conn:
             result = conn.execute(
-                "UPDATE memories SET enabled=?,updated_at=? WHERE id=?",
-                (1 if enabled else 0, time.time(), memory_id),
+                "UPDATE memories SET enabled=?,status=?,updated_at=? WHERE id=?",
+                (1 if enabled else 0, status, time.time(), memory_id),
             )
         return bool(result.rowcount)
+
+    def set_memory_status(self, memory_id: str, status: str) -> bool:
+        if status not in {"pending", "active", "archived", "rejected"}:
+            return False
+        with self._lock, self._connection() as conn:
+            result = conn.execute(
+                "UPDATE memories SET status=?,enabled=?,updated_at=? WHERE id=?",
+                (status, 1 if status == "active" else 0, time.time(), memory_id),
+            )
+        return bool(result.rowcount)
+
+    def set_memory_status_many(self, memory_ids: list[str], status: str) -> int:
+        if status not in {"pending", "active", "archived", "rejected"}:
+            return 0
+        ids = [str(memory_id) for memory_id in memory_ids if str(memory_id)]
+        if not ids:
+            return 0
+        placeholders = ",".join("?" for _ in ids)
+        with self._lock, self._connection() as conn:
+            result = conn.execute(
+                f"UPDATE memories SET status=?,enabled=?,updated_at=? WHERE id IN ({placeholders})",
+                [status, 1 if status == "active" else 0, time.time(), *ids],
+            )
+        return int(result.rowcount)
 
     def delete_memory(self, memory_id: str) -> bool:
         with self._lock, self._connection() as conn:
@@ -851,6 +946,10 @@ class TavernStorage:
         except json.JSONDecodeError:
             result["embedding"] = []
         result["enabled"] = bool(result.get("enabled"))
+        try:
+            result["metadata"] = json.loads(result.get("metadata_json") or "{}")
+        except json.JSONDecodeError:
+            result["metadata"] = {}
         return result
 
     def record_metric(self, payload: dict[str, Any]) -> str:
@@ -941,6 +1040,9 @@ class TavernStorage:
                 result = conn.execute("DELETE FROM runtime_metrics WHERE created_at < ?", (metric_cutoff,))
                 deleted["metrics"] = int(result.rowcount)
             if memory_cutoff is not None:
-                result = conn.execute("DELETE FROM memories WHERE updated_at < ?", (memory_cutoff,))
+                result = conn.execute(
+                    "DELETE FROM memories WHERE expires_at > 0 AND expires_at < ?",
+                    (time.time(),),
+                )
                 deleted["memories"] = int(result.rowcount)
         return deleted

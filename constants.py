@@ -1,6 +1,6 @@
 PLUGIN_ID = "astrbot_plugin_komeiji_tavern"
 DISPLAY_NAME = "Komeiji's Tavern"
-PLUGIN_VERSION = "0.6.0"
+PLUGIN_VERSION = "0.6.5"
 DESCRIPTION = "为 AstrBot 提供角色卡、提示词编排、世界书、创作素材与最终请求预览的一体化角色扮演工具。"
 PLUGIN_TAG = f"[{DISPLAY_NAME}]"
 API_PREFIX = f"/{PLUGIN_ID}/v1"
