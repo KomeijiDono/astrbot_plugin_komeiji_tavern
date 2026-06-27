@@ -75,6 +75,16 @@ const tabs = [
   ['help', '使用说明'],
 ]
 
+const navGroups = [
+  ['创作资料', ['home', 'character', 'character_group', 'preset', 'lorebook', 'material', 'persona']],
+  ['生效与调试', ['bindings', 'debug', 'metrics']],
+  ['长期系统', ['memories', 'archive']],
+  ['帮助', ['help']],
+].map(group => ({
+  name: group[0],
+  items: group[1].map(key => tabs.find(item => item[0] === key)).filter(Boolean),
+}))
+
 const blocks = [
   ['main', '主提示词', 0],
   ['world_before', '世界书（角色前）', 10],
@@ -226,6 +236,21 @@ createApp({
         if (!out.some(x => x.id === node.id)) out.push({ ...node, depth: 0 })
       }
       return out
+    })
+    const homeGuide = computed(() => {
+      const counts = overview.value.counts || {}
+      const hasPresetBinding = bindings.value.some(x => x.kind === 'preset')
+      const hasCharacterBinding = bindings.value.some(x => x.kind === 'character' || x.kind === 'character_group')
+      const hasAdditiveBinding = bindings.value.some(x => x.kind === 'lorebook' || x.kind === 'material')
+      const hasSession = Boolean(debug.value.session_id || bindings.value.some(x => x.scope_type === 'session'))
+      return [
+        { title: '准备角色', state: counts.character || counts.character_group ? 'ready' : 'todo', detail: `角色卡 ${counts.character || 0} · 角色组 ${counts.character_group || 0}`, action: '创建角色', tab: 'character', create: 'character' },
+        { title: '选择预设', state: hasPresetBinding ? 'ready' : (counts.preset ? 'warn' : 'todo'), detail: hasPresetBinding ? '已有提示词预设绑定' : `可用预设 ${counts.preset || 0}，尚未绑定`, action: counts.preset ? '去绑定' : '新建预设', tab: counts.preset ? 'bindings' : 'preset', create: counts.preset ? '' : 'preset' },
+        { title: '绑定主角', state: hasCharacterBinding ? 'ready' : 'todo', detail: hasCharacterBinding ? '角色或角色组已进入生效链路' : '还没有角色绑定到会话、Persona 或全局', action: '打开绑定管理', tab: 'bindings' },
+        { title: '补充设定', state: hasAdditiveBinding ? 'ready' : 'idle', detail: `世界书 ${counts.lorebook || 0} · 创作素材 ${counts.material || 0}`, action: '导入或编辑素材', tab: counts.material ? 'material' : 'lorebook' },
+        { title: '长期状态', state: memories.value.some(x => x.enabled && (x.status || 'active') === 'active') ? 'ready' : 'idle', detail: `长期记忆 ${memories.value.length} 条 · 分支节点 ${archive.value.nodes.length} 个`, action: '管理记忆', tab: 'memories' },
+        { title: '请求验证', state: hasSession ? 'ready' : 'warn', detail: hasSession ? '已有会话可用于模拟或读取最近请求' : '建议先选择或绑定一个具体会话', action: '打开调试器', tab: 'debug' },
+      ]
     })
 
     const sessionDisplay = computed({
@@ -672,13 +697,13 @@ createApp({
     onMounted(load)
 
     return {
-      tabs, labels, tab, overview, documents, bindings, personas, selected, pendingDeleteId, pendingImport, pendingMemoryDeleteId, error, notice, busy,
+      tabs, navGroups, labels, tab, overview, documents, bindings, personas, selected, pendingDeleteId, pendingImport, pendingMemoryDeleteId, error, notice, busy,
       downloadLocationHint, saveJson,
       advanced, binding, memoryDraft, memoryQuery, memoryStatusFilter, selectedMemoryIds,
       memories, filteredMemories, allVisibleMemoriesSelected,
       metricDays, metrics, metricItems, metricTotals, metricProviders, maxMetricTokens,
       retrievalTest, retrievalStats, retrievalResult,
-      archive, archiveTree,
+      archive, archiveTree, homeGuide,
       debug, debugResult, docsForTab, bindDocs, characterDocs, card, entries,
       groupMembers, availableGroupMembers,
       sessionOptions, sFiltered, dFiltered, sessionDisplay, debugDisplay,
@@ -704,7 +729,10 @@ createApp({
       <h1>Komeiji's<br>Tavern</h1>
       <span>v0.6.5</span>
     </div>
-    <button v-for="t in tabs" :class="{active:tab===t[0]}" @click="tab=t[0];selected=null">{{t[1]}}</button>
+    <div class="nav-group" v-for="group in navGroups">
+      <strong>{{group.name}}</strong>
+      <button v-for="t in group.items" :class="{active:tab===t[0]}" @click="tab=t[0];selected=null">{{t[1]}}</button>
+    </div>
   </aside>
   <main>
     <header>
@@ -731,12 +759,21 @@ createApp({
     <div v-if="notice" class="alert ok">{{notice}}</div>
     <section v-if="tab==='home'" class="home">
       <div class="hero">
-        <h3>{{overview.ready?'核心配置已就绪':'从这里开始'}}</h3>
-        <p>资料只有绑定后才会参与模型请求。先准备角色，再绑定到 AstrBot 会话，最后确认最终提示词。</p>
+        <small>配置向导</small>
+        <h3>{{overview.ready?'工作台已具备基础配置':'从一个可验证的角色会话开始'}}</h3>
+        <p>资料只有进入绑定链路后才会参与模型请求。这里会告诉你当前缺什么，以及下一步应该去哪里处理。</p>
         <div class="steps">
           <button @click="createDoc('character')"><b>1</b>创建角色</button>
-          <button @click="tab='bindings'"><b>2</b>绑定会话</button>
-          <button @click="tab='debug'"><b>3</b>检查请求</button>
+          <button @click="tab='bindings'"><b>2</b>确认生效配置</button>
+          <button @click="tab='debug'"><b>3</b>模拟请求</button>
+        </div>
+      </div>
+      <div class="guide-grid">
+        <div v-for="item in homeGuide" :class="['guide-card', item.state]">
+          <span>{{item.state==='ready'?'已就绪':item.state==='warn'?'需确认':item.state==='todo'?'待处理':'可选'}}</span>
+          <h3>{{item.title}}</h3>
+          <p>{{item.detail}}</p>
+          <button @click="item.create ? createDoc(item.create) : tab=item.tab">{{item.action}}</button>
         </div>
       </div>
       <div class="panel">

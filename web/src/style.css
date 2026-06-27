@@ -58,6 +58,16 @@ body {
 .nav button.active {
   box-shadow:inset 3px 0 #cf789d;
 }
+.nav-group {
+  margin:0 0 18px;
+}
+.nav-group strong {
+  display:block;
+  padding:0 12px 6px;
+  color:#7f7284;
+  font-size:11px;
+  letter-spacing:.12em;
+}
 main {
   padding:28px;
   min-width:0;
@@ -155,6 +165,11 @@ header p {
   padding:28px;
   background:linear-gradient(120deg,#2d1d2b,#1c1821);
 }
+.hero small {
+  color:#d895af;
+  letter-spacing:.14em;
+  font-size:11px;
+}
 .hero h3 {
   font-size:25px;
   margin:0 0 9px;
@@ -179,6 +194,41 @@ header p {
   border-radius:50%;
   background:#8d4768;
   margin-right:8px;
+}
+.guide-grid {
+  display:grid;
+  grid-template-columns:repeat(3,minmax(0,1fr));
+  gap:12px;
+  margin:14px 0;
+}
+.guide-card {
+  padding:18px;
+  background:#19161e;
+  border:1px solid #392f3d;
+  border-radius:13px;
+}
+.guide-card span {
+  display:inline-block;
+  padding:3px 8px;
+  border-radius:99px;
+  background:#2c2631;
+  color:#bcb1c1;
+  font-size:11px;
+}
+.guide-card.ready span {
+  background:#1d3d31;
+  color:#aee8c5;
+}
+.guide-card.warn span,.guide-card.todo span {
+  background:#4a2b32;
+  color:#ffbfcb;
+}
+.guide-card h3 {
+  margin:12px 0 8px;
+}
+.guide-card p {
+  min-height:44px;
+  color:#9f94a2;
 }
 .cards {
   display:grid;
@@ -486,6 +536,9 @@ th,td {
   .cards {
     grid-template-columns:repeat(3,1fr);
   }
+  .guide-grid {
+    grid-template-columns:repeat(2,1fr);
+  }
   .debug {
     grid-template-columns:1fr;
   }
@@ -502,6 +555,15 @@ th,td {
     height:auto;
     display:flex;
     overflow:auto;
+  }
+  .nav-group {
+    display:flex;
+    align-items:center;
+    margin:0 12px 0 0;
+  }
+  .nav-group strong {
+    white-space:nowrap;
+    padding:0 8px;
   }
   .brand {
     display:none;
@@ -546,6 +608,9 @@ th,td {
   }
   .cards {
     grid-template-columns:repeat(2,1fr);
+  }
+  .guide-grid {
+    grid-template-columns:1fr;
   }
 }
 .combo {
