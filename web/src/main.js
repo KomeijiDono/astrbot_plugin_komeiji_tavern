@@ -252,6 +252,35 @@ createApp({
         { title: '请求验证', state: hasSession ? 'ready' : 'warn', detail: hasSession ? '已有会话可用于模拟或读取最近请求' : '建议先选择或绑定一个具体会话', action: '打开调试器', tab: 'debug' },
       ]
     })
+    const bindingTargetTitle = computed(() => {
+      const c = sessionOptions.value.find(x => x.id === debug.value.session_id)
+      if (c) return c.title + ' · ' + c.platform
+      if (debug.value.session_id) return debug.value.session_id
+      return '未选择会话，仅显示全局与 Persona 绑定'
+    })
+    const bindingsForTarget = computed(() => {
+      const sessionId = debug.value.session_id || ''
+      const personaId = debug.value.persona_id || ''
+      return bindings.value.filter(item => {
+        if (item.scope_type === 'global') return true
+        if (item.scope_type === 'session') return sessionId && item.scope_id === sessionId
+        if (item.scope_type === 'persona') return personaId && item.scope_id === personaId
+        return false
+      })
+    })
+    const bindingSummary = computed(() => {
+      const singleKinds = ['preset', 'character', 'character_group', 'persona']
+      const additiveKinds = ['lorebook', 'material']
+      const rank = { global: 1, persona: 2, session: 3 }
+      const out = { single: {}, additive: {} }
+      for (const kind of singleKinds) {
+        out.single[kind] = bindingsForTarget.value
+          .filter(item => item.kind === kind)
+          .sort((a, b) => (rank[b.scope_type] || 0) - (rank[a.scope_type] || 0) || Number(b.priority || 0) - Number(a.priority || 0))[0] || null
+      }
+      for (const kind of additiveKinds) out.additive[kind] = bindingsForTarget.value.filter(item => item.kind === kind)
+      return out
+    })
 
     const sessionDisplay = computed({
       get() {
@@ -706,7 +735,7 @@ createApp({
       archive, archiveTree, homeGuide,
       debug, debugResult, docsForTab, bindDocs, characterDocs, card, entries,
       groupMembers, availableGroupMembers,
-      sessionOptions, sFiltered, dFiltered, sessionDisplay, debugDisplay,
+      sessionOptions, sFiltered, dFiltered, sessionDisplay, debugDisplay, bindingTargetTitle, bindingsForTarget, bindingSummary,
       sOpen, dOpen, pickSession, onSFocus, onSBlur, pickDebug, onDFocus, onDBlur,
       choose, createDoc, save, remove, duplicate, applyAdvanced, importData,
       exportSelected, exportKind, exportAll, exportMessages, backupSession,
@@ -896,8 +925,43 @@ createApp({
     </section>
     <section v-else-if="tab==='bindings'" class="stack">
       <div class="panel">
+        <div class="result-head">
+          <div>
+            <h3>当前目标的有效配置</h3>
+            <p class="muted">{{bindingTargetTitle}}</p>
+          </div>
+          <button @click="tab='debug'">去调试器验证</button>
+        </div>
+        <label class="combo">用于查看生效结果的会话
+          <input v-model="debugDisplay" @focus="onDFocus" @blur="onDBlur" placeholder="搜索或输入会话 ID">
+          <div class="combo-panel" v-if="dOpen">
+            <div v-for="c in dFiltered" class="combo-option" @mousedown.prevent="pickDebug(c)">{{c.title}} · {{c.platform}}</div>
+            <div v-if="!dFiltered.length" class="combo-option muted">无匹配，可直接输入 ID</div>
+          </div>
+        </label>
+        <div class="binding-summary">
+          <div class="binding-slot" v-for="kind in ['preset','character','character_group','persona']">
+            <span>{{labels[kind]}}</span>
+            <b>{{bindingSummary.single[kind]?.target_name || '未生效'}}</b>
+            <small>{{bindingSummary.single[kind] ? scopeName(bindingSummary.single[kind]) : '没有匹配当前目标的绑定'}}</small>
+          </div>
+        </div>
+        <div class="grid">
+          <div class="binding-stack">
+            <h4>叠加世界书</h4>
+            <div class="activation" v-for="i in bindingSummary.additive.lorebook"><b>{{i.target_name}}</b><small> · {{scopeName(i)}}</small></div>
+            <p v-if="!bindingSummary.additive.lorebook.length" class="muted">当前目标没有叠加世界书。</p>
+          </div>
+          <div class="binding-stack">
+            <h4>叠加创作素材</h4>
+            <div class="activation" v-for="i in bindingSummary.additive.material"><b>{{i.target_name}}</b><small> · {{scopeName(i)}}</small></div>
+            <p v-if="!bindingSummary.additive.material.length" class="muted">当前目标没有叠加创作素材。</p>
+          </div>
+        </div>
+      </div>
+      <div class="panel">
         <h3>新增绑定</h3>
-        <p>单选资源按"会话 → Persona → 用户 → 群组 → 全局"覆盖；世界书按作用域叠加。</p>
+        <p>角色、角色组、预设、用户设定按“会话 → Persona → 全局”覆盖；世界书和创作素材会按作用域叠加。</p>
         <div class="binding-form">
           <label>资料类型<select v-model="binding.kind"><option v-for="(v,k) in labels" :value="k">{{v}}</option></select></label>
           <label>资料<select v-model="binding.target_id"><option value="">请选择</option><option v-for="d in bindDocs" :value="d.id">{{d.name}}</option></select></label>
@@ -914,7 +978,7 @@ createApp({
         </div>
       </div>
       <div class="panel">
-        <h3>当前绑定</h3>
+        <h3>全部绑定记录</h3>
         <table><tr><th>范围</th><th>类型</th><th>资料</th><th></th></tr>
           <tr v-for="i in bindings"><td>{{scopeName(i)}}</td><td>{{labels[i.kind]||i.kind}}</td><td>{{i.target_name}}</td><td><button class="danger" @click="unbind(i)">移除</button></td></tr>
         </table>

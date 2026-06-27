@@ -442,6 +442,33 @@ button:disabled {
 .binding-form button {
   height:40px;
 }
+.binding-summary {
+  display:grid;
+  grid-template-columns:repeat(4,minmax(0,1fr));
+  gap:10px;
+  margin:14px 0;
+}
+.binding-slot,.binding-stack {
+  padding:14px;
+  border:1px solid #403544;
+  border-radius:10px;
+  background:#15121a;
+}
+.binding-slot span {
+  color:#8f8493;
+  font-size:12px;
+}
+.binding-slot b {
+  display:block;
+  margin:8px 0 6px;
+  color:#f0d8df;
+}
+.binding-slot small,.binding-stack small {
+  color:#93899a;
+}
+.binding-stack h4 {
+  margin:0 0 10px;
+}
 table {
   width:100%;
   border-collapse:collapse;
@@ -539,6 +566,9 @@ th,td {
   .guide-grid {
     grid-template-columns:repeat(2,1fr);
   }
+  .binding-summary {
+    grid-template-columns:repeat(2,1fr);
+  }
   .debug {
     grid-template-columns:1fr;
   }
@@ -610,6 +640,9 @@ th,td {
     grid-template-columns:repeat(2,1fr);
   }
   .guide-grid {
+    grid-template-columns:1fr;
+  }
+  .binding-summary {
     grid-template-columns:1fr;
   }
 }
