@@ -148,6 +148,8 @@ createApp({
     const memoryQuery = ref('')
     const memoryStatusFilter = ref('')
     const selectedMemoryIds = ref([])
+    const pendingMemoryDeleteId = ref('')
+    const pendingImport = ref(null)
     const metricDays = ref(7)
     const retrievalTest = ref({ text: '' })
     const retrievalStats = ref(null)
@@ -434,6 +436,16 @@ createApp({
       if (!file.value) return
       busy.value = true; clear()
       try {
+        if (pendingImport.value?.file_name === file.value.name) {
+          const out = await post('/import/commit', { parsed: pendingImport.value.parsed, file_name: file.value.name })
+          pendingImport.value = null
+          await load()
+          binding.value.kind = out.data.kind
+          binding.value.target_id = out.data.id
+          tab.value = 'bindings'
+          notice.value = '导入完成。请选择目标并绑定，当前尚未影响任何会话。'
+          return
+        }
         const lowerName = file.value.name.toLowerCase()
         if (['.db', '.sqlite', '.sqlite3'].some(suffix => lowerName.endsWith(suffix))) {
           const base64 = await new Promise((ok, fail) => {
@@ -461,13 +473,8 @@ createApp({
         }) : ''
         const pre = await post('/import/preview', { content, base64, file_name: file.value.name })
         const info = pre.data.preview
-        if (!confirm('识别为' + (labels[info.kind] || info.kind) + '"' + info.name + '"，共 ' + info.count + ' 项。确认导入？')) return
-        const out = await post('/import/commit', { parsed: pre.data.parsed, file_name: file.value.name })
-        await load()
-        binding.value.kind = out.data.kind
-        binding.value.target_id = out.data.id
-        tab.value = 'bindings'
-        notice.value = '导入完成。请选择目标并绑定，当前尚未影响任何会话。'
+        pendingImport.value = { file_name: file.value.name, parsed: pre.data.parsed, preview: info }
+        notice.value = '识别为' + (labels[info.kind] || info.kind) + '“' + info.name + '”，共 ' + info.count + ' 项。再次点击“确认导入”完成写入。'
       } catch (e) {
         error.value = e.message
       } finally {
@@ -539,9 +546,16 @@ createApp({
     }
 
     const deleteMemory = async item => {
-      if (!confirm('确定删除这条长期记忆吗？')) return
+      if (pendingMemoryDeleteId.value !== item.id) {
+        pendingMemoryDeleteId.value = item.id
+        notice.value = '再次点击删除以确认删除这条长期记忆。'
+        error.value = ''
+        return
+      }
       await post('/memories/' + encodeURIComponent(item.id) + '/delete', {})
+      pendingMemoryDeleteId.value = ''
       await load()
+      notice.value = '长期记忆已删除。'
     }
 
     const refreshMetrics = async () => {
@@ -658,7 +672,7 @@ createApp({
     onMounted(load)
 
     return {
-      tabs, labels, tab, overview, documents, bindings, personas, selected, pendingDeleteId, error, notice, busy,
+      tabs, labels, tab, overview, documents, bindings, personas, selected, pendingDeleteId, pendingImport, pendingMemoryDeleteId, error, notice, busy,
       downloadLocationHint, saveJson,
       advanced, binding, memoryDraft, memoryQuery, memoryStatusFilter, selectedMemoryIds,
       memories, filteredMemories, allVisibleMemoriesSelected,
@@ -672,7 +686,7 @@ createApp({
       choose, createDoc, save, remove, duplicate, applyAdvanced, importData,
       exportSelected, exportKind, exportAll, exportMessages, backupSession,
       refreshArchive, selectArchiveNode, renameArchiveNode, branchFromArchiveNode, exportArchive,
-      setFile: e => file.value = e.target.files[0],
+      setFile: e => { file.value = e.target.files[0]; pendingImport.value = null },
       updateScope, addBinding, unbind, scopeName, updateMemoryScope, resetMemoryDraft,
       saveMemory, editMemory, toggleMemory, toggleAllVisibleMemories,
       updateSelectedMemoryStatus, deleteMemory, refreshMetrics,
@@ -696,7 +710,7 @@ createApp({
     <header>
       <div><h2>{{tabs.find(x=>x[0]===tab)?.[1]}}</h2><p>创建或导入 → 编辑 → 绑定 → 扫描测试 → 检查 messages[]</p></div>
       <div class="header-actions">
-        <label class="import"><input type="file" accept=".json,.yaml,.yml,.png,.txt,.md,.db,.sqlite,.sqlite3" @change="setFile"><button @click="importData" :disabled="busy">解析并导入</button></label>
+        <label class="import"><input type="file" accept=".json,.yaml,.yml,.png,.txt,.md,.db,.sqlite,.sqlite3" @change="setFile"><button @click="importData" :disabled="busy">{{pendingImport?'确认导入':'解析并导入'}}</button></label>
         <details class="export-menu">
           <summary>导出</summary>
           <div class="export-popover">
@@ -904,7 +918,7 @@ createApp({
             <td>{{m.source_type || 'manual'}}</td>
             <td>{{m.content}}</td>
             <td>{{formatTimestamp(m.updated_at)}}</td>
-            <td class="actions"><button @click="editMemory(m)">编辑</button><button @click="toggleMemory(m)">{{m.enabled?'禁用':'启用'}}</button><button class="danger" @click="deleteMemory(m)">删除</button></td>
+            <td class="actions"><button @click="editMemory(m)">编辑</button><button @click="toggleMemory(m)">{{m.enabled?'禁用':'启用'}}</button><button class="danger" @click="deleteMemory(m)">{{pendingMemoryDeleteId===m.id?'确认删除':'删除'}}</button></td>
           </tr>
         </table>
         <p v-if="!filteredMemories.length" class="muted">还没有长期记忆。</p>
