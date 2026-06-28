@@ -807,7 +807,7 @@ createApp({
     <div class="brand">
       <small>ASTRBOT 角色扮演工作台</small>
       <h1>Komeiji's<br>Tavern</h1>
-      <span>v0.6.5</span>
+      <span v-if="overview.version">v{{overview.version}}</span>
     </div>
     <div class="nav-group" v-for="group in navGroups">
       <strong>{{group.name}}</strong>
@@ -1071,7 +1071,7 @@ createApp({
           <label>状态<select v-model="memoryDraft.status"><option value="active">active</option><option value="pending">pending</option><option value="archived">archived</option><option value="rejected">rejected</option></select></label>
           <label>重要度<input type="number" min="0" step="0.1" v-model.number="memoryDraft.importance"></label>
           <label>来源<input v-model="memoryDraft.source_type" placeholder="manual / auto_extract"></label>
-          <label><input type="checkbox" v-model="memoryDraft.enabled">启用</label>
+          <label class="check-field"><input type="checkbox" v-model="memoryDraft.enabled">启用</label>
         </div>
         <label>记忆内容<textarea v-model="memoryDraft.content" placeholder="一条具体、可长期复用的事实。"></textarea></label>
         <div class="actions"><button class="primary" @click="saveMemory">保存记忆</button><button @click="resetMemoryDraft">清空表单</button></div>

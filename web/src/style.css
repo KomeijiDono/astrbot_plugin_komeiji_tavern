@@ -10,15 +10,55 @@ body {
   margin:0;
   background:radial-gradient(circle at 10% 0,#392238 0,transparent 28%),#100e14;
 }
+.nav,
+main,
+.library,
+.result,
+.combo-panel {
+  scrollbar-width:thin;
+  scrollbar-color:#5e5367 #17131b;
+}
+.nav::-webkit-scrollbar,
+main::-webkit-scrollbar,
+.library::-webkit-scrollbar,
+.result::-webkit-scrollbar,
+.combo-panel::-webkit-scrollbar {
+  width:7px;
+  height:7px;
+}
+.nav::-webkit-scrollbar-track,
+main::-webkit-scrollbar-track,
+.library::-webkit-scrollbar-track,
+.result::-webkit-scrollbar-track,
+.combo-panel::-webkit-scrollbar-track {
+  background:#17131b;
+}
+.nav::-webkit-scrollbar-thumb,
+main::-webkit-scrollbar-thumb,
+.library::-webkit-scrollbar-thumb,
+.result::-webkit-scrollbar-thumb,
+.combo-panel::-webkit-scrollbar-thumb {
+  background:#5e5367;
+  border-radius:999px;
+  border:2px solid #17131b;
+}
+.nav::-webkit-scrollbar-thumb:hover,
+main::-webkit-scrollbar-thumb:hover,
+.library::-webkit-scrollbar-thumb:hover,
+.result::-webkit-scrollbar-thumb:hover,
+.combo-panel::-webkit-scrollbar-thumb:hover {
+  background:#7b6d85;
+}
 .shell {
   display:grid;
   grid-template-columns:220px minmax(0,1fr);
-  min-height:100vh;
+  height:100vh;
+  overflow:hidden;
 }
 .nav {
-  position:sticky;
-  top:0;
   height:100vh;
+  overflow-y:auto;
+  overscroll-behavior:contain;
   padding:22px 14px;
   background:#17131b;
   border-right:1px solid #362c39;
@@ -71,9 +111,13 @@ body {
 main {
   padding:28px;
   min-width:0;
+  min-height:0;
+  height:100vh;
   max-width:1550px;
   width:100%;
-  margin:auto;
+  margin:0 auto;
+  overflow-y:auto;
+  overscroll-behavior:contain;
 }
 header {
   display:flex;
@@ -93,15 +137,26 @@ header p {
 .import {
   display:flex;
   gap:8px;
-  align-items:center;
+  align-items:stretch;
 }
 .import input {
   max-width:210px;
+  height:54px;
+}
+.import button {
+  white-space:nowrap;
 }
 .header-actions {
   display:flex;
-  align-items:flex-start;
+  align-items:stretch;
+  justify-content:flex-end;
   gap:10px;
+}
+.header-actions button,
+.export-menu>summary {
+  min-height:54px;
+  display:inline-flex;
+  align-items:center;
 }
 .export-menu {
   position:relative;
@@ -120,13 +175,14 @@ header p {
   display:none;
 }
 .export-menu>summary::after {
-  content:'▾';
+  content:'\25BE';
   position:absolute;
   right:11px;
-  top:9px;
+  top:50%;
+  transform:translateY(-50%);
 }
 .export-menu[open]>summary::after {
-  transform:rotate(180deg);
+  transform:translateY(-50%) rotate(180deg);
 }
 .export-popover {
   position:absolute;
@@ -368,12 +424,33 @@ textarea {
   min-width:105px;
   flex:1;
 }
+.inline label:has(input[type=checkbox]) {
+  display:flex;
+  align-items:center;
+  gap:8px;
+  min-height:40px;
+  padding-bottom:1px;
+}
+.check-field {
+  display:flex;
+  align-items:center;
+  gap:8px;
+  min-height:40px;
+  padding-bottom:1px;
+}
 .checks label {
   display:flex;
+  align-items:center;
   gap:7px;
 }
-.checks input,.entry-head input[type=checkbox] {
+input[type=checkbox],
+.checks input,
+.entry-head input[type=checkbox] {
+  display:inline-block;
   width:auto;
+  margin:0;
+  padding:0;
+  flex:0 0 auto;
 }
 .block,.entry {
   border:1px solid #403544;
@@ -717,12 +794,15 @@ th,td {
 @media(max-width:760px) {
   .shell {
     grid-template-columns:1fr;
+    height:auto;
+    min-height:100vh;
+    overflow:visible;
   }
   .nav {
     position:static;
     height:auto;
     display:flex;
-    overflow:auto;
+    overflow:auto hidden;
   }
   .nav-group {
     display:flex;
@@ -763,6 +843,7 @@ th,td {
   }
   main {
     padding:15px;
+    overflow:visible;
   }
   header {
     display:block;
