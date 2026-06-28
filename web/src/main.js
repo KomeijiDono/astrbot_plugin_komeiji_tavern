@@ -75,6 +75,16 @@ const tabs = [
   ['help', '使用说明'],
 ]
 
+const navGroups = [
+  ['创作资料', ['home', 'character', 'character_group', 'preset', 'lorebook', 'material', 'persona']],
+  ['生效与调试', ['bindings', 'debug', 'metrics']],
+  ['长期系统', ['memories', 'archive']],
+  ['帮助', ['help']],
+].map(group => ({
+  name: group[0],
+  items: group[1].map(key => tabs.find(item => item[0] === key)).filter(Boolean),
+}))
+
 const blocks = [
   ['main', '主提示词', 0],
   ['world_before', '世界书（角色前）', 10],
@@ -145,9 +155,14 @@ createApp({
     const dQuery = ref('')
     const dOpen = ref(false)
     const dFocused = ref(false)
+    const entryQuery = ref('')
+    const entryFilter = ref('all')
+    const openEntryUid = ref('')
     const memoryQuery = ref('')
     const memoryStatusFilter = ref('')
     const selectedMemoryIds = ref([])
+    const pendingMemoryDeleteId = ref('')
+    const pendingImport = ref(null)
     const metricDays = ref(7)
     const retrievalTest = ref({ text: '' })
     const retrievalStats = ref(null)
@@ -166,6 +181,21 @@ createApp({
     const characterDocs = computed(() => documents.value.filter(x => x.kind === 'character'))
     const card = computed(() => selected.value?.data?.data && typeof selected.value.data.data === 'object' ? selected.value.data.data : selected.value?.data || {})
     const entries = computed(() => { const x = selected.value?.data?.entries || []; return Array.isArray(x) ? x : Object.values(x) })
+    const filteredEntries = computed(() => {
+      const q = entryQuery.value.toLowerCase().trim()
+      return entries.value.filter(item => {
+        const category = item.extensions?.category || item.category || item.group || ''
+        const haystack = [item.comment, item.content, category, keyText(item.key), keyText(item.keysecondary)].join(' ').toLowerCase()
+        const matchedQuery = !q || haystack.includes(q)
+        const matchedFilter = entryFilter.value === 'all'
+          || (entryFilter.value === 'enabled' && !item.disable)
+          || (entryFilter.value === 'disabled' && item.disable)
+          || (entryFilter.value === 'vectorized' && item.vectorized)
+          || (entryFilter.value === 'constant' && item.constant)
+          || (entryFilter.value === 'no_keys' && !keyText(item.key))
+        return matchedQuery && matchedFilter
+      })
+    })
     const groupMembers = computed(() => (selected.value?.data?.members || []).map(id => characterDocs.value.find(x => x.id === id)).filter(Boolean))
     const availableGroupMembers = computed(() => characterDocs.value.filter(x => !(selected.value?.data?.members || []).includes(x.id)))
 
@@ -201,6 +231,14 @@ createApp({
     })
     const visibleMemoryIds = computed(() => filteredMemories.value.map(x => x.id))
     const allVisibleMemoriesSelected = computed(() => visibleMemoryIds.value.length > 0 && visibleMemoryIds.value.every(id => selectedMemoryIds.value.includes(id)))
+    const memoryGroups = computed(() => {
+      const order = ['session', 'user', 'group', 'persona', 'global']
+      return order.map(scope => ({
+        scope,
+        title: scope === 'session' ? '会话记忆' : scope === 'user' ? '用户记忆' : scope === 'group' ? '群组记忆' : scope === 'persona' ? 'Persona 记忆' : '全局记忆',
+        items: filteredMemories.value.filter(item => item.scope_type === scope),
+      })).filter(group => group.items.length)
+    })
     const metricItems = computed(() => metrics.value.items || [])
     const metricTotals = computed(() => metrics.value.totals || {})
     const metricProviders = computed(() => Object.entries(metrics.value.providers || {}).sort((a, b) => b[1] - a[1]))
@@ -224,6 +262,69 @@ createApp({
         if (!out.some(x => x.id === node.id)) out.push({ ...node, depth: 0 })
       }
       return out
+    })
+    const homeGuide = computed(() => {
+      const counts = overview.value.counts || {}
+      const hasPresetBinding = bindings.value.some(x => x.kind === 'preset')
+      const hasCharacterBinding = bindings.value.some(x => x.kind === 'character' || x.kind === 'character_group')
+      const hasAdditiveBinding = bindings.value.some(x => x.kind === 'lorebook' || x.kind === 'material')
+      const hasSession = Boolean(debug.value.session_id || bindings.value.some(x => x.scope_type === 'session'))
+      return [
+        { title: '准备角色', state: counts.character || counts.character_group ? 'ready' : 'todo', detail: `角色卡 ${counts.character || 0} · 角色组 ${counts.character_group || 0}`, action: '创建角色', tab: 'character', create: 'character' },
+        { title: '选择预设', state: hasPresetBinding ? 'ready' : (counts.preset ? 'warn' : 'todo'), detail: hasPresetBinding ? '已有提示词预设绑定' : `可用预设 ${counts.preset || 0}，尚未绑定`, action: counts.preset ? '去绑定' : '新建预设', tab: counts.preset ? 'bindings' : 'preset', create: counts.preset ? '' : 'preset' },
+        { title: '绑定主角', state: hasCharacterBinding ? 'ready' : 'todo', detail: hasCharacterBinding ? '角色或角色组已进入生效链路' : '还没有角色绑定到会话、Persona 或全局', action: '打开绑定管理', tab: 'bindings' },
+        { title: '补充设定', state: hasAdditiveBinding ? 'ready' : 'idle', detail: `世界书 ${counts.lorebook || 0} · 创作素材 ${counts.material || 0}`, action: '导入或编辑素材', tab: counts.material ? 'material' : 'lorebook' },
+        { title: '长期状态', state: memories.value.some(x => x.enabled && (x.status || 'active') === 'active') ? 'ready' : 'idle', detail: `长期记忆 ${memories.value.length} 条 · 分支节点 ${archive.value.nodes.length} 个`, action: '管理记忆', tab: 'memories' },
+        { title: '请求验证', state: hasSession ? 'ready' : 'warn', detail: hasSession ? '已有会话可用于模拟或读取最近请求' : '建议先选择或绑定一个具体会话', action: '打开调试器', tab: 'debug' },
+      ]
+    })
+    const bindingTargetTitle = computed(() => {
+      const c = sessionOptions.value.find(x => x.id === debug.value.session_id)
+      if (c) return c.title + ' · ' + c.platform
+      if (debug.value.session_id) return debug.value.session_id
+      return '未选择会话，仅显示全局与 Persona 绑定'
+    })
+    const bindingsForTarget = computed(() => {
+      const sessionId = debug.value.session_id || ''
+      const personaId = debug.value.persona_id || ''
+      return bindings.value.filter(item => {
+        if (item.scope_type === 'global') return true
+        if (item.scope_type === 'session') return sessionId && item.scope_id === sessionId
+        if (item.scope_type === 'persona') return personaId && item.scope_id === personaId
+        return false
+      })
+    })
+    const bindingSummary = computed(() => {
+      const singleKinds = ['preset', 'character', 'character_group', 'persona']
+      const additiveKinds = ['lorebook', 'material']
+      const rank = { global: 1, persona: 2, session: 3 }
+      const out = { single: {}, additive: {} }
+      for (const kind of singleKinds) {
+        out.single[kind] = bindingsForTarget.value
+          .filter(item => item.kind === kind)
+          .sort((a, b) => (rank[b.scope_type] || 0) - (rank[a.scope_type] || 0) || Number(b.priority || 0) - Number(a.priority || 0))[0] || null
+      }
+      for (const kind of additiveKinds) out.additive[kind] = bindingsForTarget.value.filter(item => item.kind === kind)
+      return out
+    })
+    const debugSummary = computed(() => {
+      const result = debugResult.value || {}
+      const effective = result.effective || {}
+      const single = effective.single || {}
+      const additive = effective.additive || {}
+      const messages = Array.isArray(result.messages) ? result.messages : []
+      const tokens = messages.reduce((sum, item) => sum + Math.ceil(String(item.content || '').length / 4), 0)
+      return [
+        { label: '预设', value: single.preset?.name || '未绑定', state: single.preset ? 'ready' : 'warn' },
+        { label: '本轮角色', value: result.character_selection?.character?.card_name || result.character_selection?.character?.name || single.character?.name || '未绑定', state: (result.character_selection?.character || single.character) ? 'ready' : 'warn' },
+        { label: '角色选择', value: result.character_selection?.reason || '无角色组状态', state: result.character_selection ? 'ready' : 'idle' },
+        { label: '世界书', value: String((result.activated || []).length || (additive.lorebook || []).length || 0) + ' 条', state: ((result.activated || []).length || (additive.lorebook || []).length) ? 'ready' : 'idle' },
+        { label: '创作素材', value: String(result.retrieval?.matches?.length || 0) + ' 条', state: result.retrieval?.matches?.length ? 'ready' : 'idle' },
+        { label: '长期记忆', value: String(result.memory?.injected_count || result.memory?.matches?.length || 0) + ' 条', state: (result.memory?.injected_count || result.memory?.matches?.length) ? 'ready' : 'idle' },
+        { label: '自动摘要', value: result.summary?.included ? '已注入' : result.summary?.enabled ? '已启用' : '未启用', state: result.summary?.included ? 'ready' : result.summary?.enabled ? 'idle' : 'warn' },
+        { label: '消息与 Token', value: messages.length + ' 条 / ≈ ' + tokens, state: messages.length ? 'ready' : 'warn' },
+        { label: '警告', value: String((result.warnings || []).length) + ' 个', state: (result.warnings || []).length ? 'warn' : 'ready' },
+      ]
     })
 
     const sessionDisplay = computed({
@@ -434,6 +535,16 @@ createApp({
       if (!file.value) return
       busy.value = true; clear()
       try {
+        if (pendingImport.value?.file_name === file.value.name) {
+          const out = await post('/import/commit', { parsed: pendingImport.value.parsed, file_name: file.value.name })
+          pendingImport.value = null
+          await load()
+          binding.value.kind = out.data.kind
+          binding.value.target_id = out.data.id
+          tab.value = 'bindings'
+          notice.value = '导入完成。请选择目标并绑定，当前尚未影响任何会话。'
+          return
+        }
         const lowerName = file.value.name.toLowerCase()
         if (['.db', '.sqlite', '.sqlite3'].some(suffix => lowerName.endsWith(suffix))) {
           const base64 = await new Promise((ok, fail) => {
@@ -461,13 +572,8 @@ createApp({
         }) : ''
         const pre = await post('/import/preview', { content, base64, file_name: file.value.name })
         const info = pre.data.preview
-        if (!confirm('识别为' + (labels[info.kind] || info.kind) + '"' + info.name + '"，共 ' + info.count + ' 项。确认导入？')) return
-        const out = await post('/import/commit', { parsed: pre.data.parsed, file_name: file.value.name })
-        await load()
-        binding.value.kind = out.data.kind
-        binding.value.target_id = out.data.id
-        tab.value = 'bindings'
-        notice.value = '导入完成。请选择目标并绑定，当前尚未影响任何会话。'
+        pendingImport.value = { file_name: file.value.name, parsed: pre.data.parsed, preview: info }
+        notice.value = '识别为' + (labels[info.kind] || info.kind) + '“' + info.name + '”，共 ' + info.count + ' 项。再次点击“确认导入”完成写入。'
       } catch (e) {
         error.value = e.message
       } finally {
@@ -539,9 +645,16 @@ createApp({
     }
 
     const deleteMemory = async item => {
-      if (!confirm('确定删除这条长期记忆吗？')) return
+      if (pendingMemoryDeleteId.value !== item.id) {
+        pendingMemoryDeleteId.value = item.id
+        notice.value = '再次点击删除以确认删除这条长期记忆。'
+        error.value = ''
+        return
+      }
       await post('/memories/' + encodeURIComponent(item.id) + '/delete', {})
+      pendingMemoryDeleteId.value = ''
       await load()
+      notice.value = '长期记忆已删除。'
     }
 
     const refreshMetrics = async () => {
@@ -616,6 +729,12 @@ createApp({
       priority: 50,
     })
 
+    const addEntry = () => {
+      const item = newEntry(tab.value)
+      selected.value.data.entries.push(item)
+      openEntryUid.value = item.uid
+    }
+
     const keyText = v => Array.isArray(v) ? v.join(', ') : String(v || '')
     const setKeys = (e, f, v) => e[f] = v.split(',').map(x => x.trim()).filter(Boolean)
 
@@ -658,27 +777,27 @@ createApp({
     onMounted(load)
 
     return {
-      tabs, labels, tab, overview, documents, bindings, personas, selected, pendingDeleteId, error, notice, busy,
+      tabs, navGroups, labels, tab, overview, documents, bindings, personas, selected, pendingDeleteId, pendingImport, pendingMemoryDeleteId, error, notice, busy,
       downloadLocationHint, saveJson,
       advanced, binding, memoryDraft, memoryQuery, memoryStatusFilter, selectedMemoryIds,
-      memories, filteredMemories, allVisibleMemoriesSelected,
+      memories, filteredMemories, memoryGroups, allVisibleMemoriesSelected,
       metricDays, metrics, metricItems, metricTotals, metricProviders, maxMetricTokens,
       retrievalTest, retrievalStats, retrievalResult,
-      archive, archiveTree,
-      debug, debugResult, docsForTab, bindDocs, characterDocs, card, entries,
+      archive, archiveTree, homeGuide,
+      debug, debugResult, debugSummary, docsForTab, bindDocs, characterDocs, card, entries, filteredEntries,
       groupMembers, availableGroupMembers,
-      sessionOptions, sFiltered, dFiltered, sessionDisplay, debugDisplay,
+      sessionOptions, sFiltered, dFiltered, sessionDisplay, debugDisplay, bindingTargetTitle, bindingsForTarget, bindingSummary,
+      entryQuery, entryFilter, openEntryUid,
       sOpen, dOpen, pickSession, onSFocus, onSBlur, pickDebug, onDFocus, onDBlur,
       choose, createDoc, save, remove, duplicate, applyAdvanced, importData,
       exportSelected, exportKind, exportAll, exportMessages, backupSession,
       refreshArchive, selectArchiveNode, renameArchiveNode, branchFromArchiveNode, exportArchive,
-      setFile: e => file.value = e.target.files[0],
+      setFile: e => { file.value = e.target.files[0]; pendingImport.value = null },
       updateScope, addBinding, unbind, scopeName, updateMemoryScope, resetMemoryDraft,
       saveMemory, editMemory, toggleMemory, toggleAllVisibleMemories,
       updateSelectedMemoryStatus, deleteMemory, refreshMetrics,
       refreshRetrievalStats, runRetrievalTest,
-      move, moveMember, addMember, addBlock, keyText, setKeys,
-      addEntry: () => selected.value.data.entries.push(newEntry(tab.value)),
+      move, moveMember, addMember, addBlock, addEntry, keyText, setKeys,
       selectConversation, simulate, actual, formatTimestamp,
     }
   },
@@ -690,13 +809,16 @@ createApp({
       <h1>Komeiji's<br>Tavern</h1>
       <span>v0.6.5</span>
     </div>
-    <button v-for="t in tabs" :class="{active:tab===t[0]}" @click="tab=t[0];selected=null">{{t[1]}}</button>
+    <div class="nav-group" v-for="group in navGroups">
+      <strong>{{group.name}}</strong>
+      <button v-for="t in group.items" :class="{active:tab===t[0]}" @click="tab=t[0];selected=null">{{t[1]}}</button>
+    </div>
   </aside>
   <main>
     <header>
       <div><h2>{{tabs.find(x=>x[0]===tab)?.[1]}}</h2><p>创建或导入 → 编辑 → 绑定 → 扫描测试 → 检查 messages[]</p></div>
       <div class="header-actions">
-        <label class="import"><input type="file" accept=".json,.yaml,.yml,.png,.txt,.md,.db,.sqlite,.sqlite3" @change="setFile"><button @click="importData" :disabled="busy">解析并导入</button></label>
+        <label class="import"><input type="file" accept=".json,.yaml,.yml,.png,.txt,.md,.db,.sqlite,.sqlite3" @change="setFile"><button @click="importData" :disabled="busy">{{pendingImport?'确认导入':'解析并导入'}}</button></label>
         <details class="export-menu">
           <summary>导出</summary>
           <div class="export-popover">
@@ -717,12 +839,21 @@ createApp({
     <div v-if="notice" class="alert ok">{{notice}}</div>
     <section v-if="tab==='home'" class="home">
       <div class="hero">
-        <h3>{{overview.ready?'核心配置已就绪':'从这里开始'}}</h3>
-        <p>资料只有绑定后才会参与模型请求。先准备角色，再绑定到 AstrBot 会话，最后确认最终提示词。</p>
+        <small>配置向导</small>
+        <h3>{{overview.ready?'工作台已具备基础配置':'从一个可验证的角色会话开始'}}</h3>
+        <p>资料只有进入绑定链路后才会参与模型请求。这里会告诉你当前缺什么，以及下一步应该去哪里处理。</p>
         <div class="steps">
           <button @click="createDoc('character')"><b>1</b>创建角色</button>
-          <button @click="tab='bindings'"><b>2</b>绑定会话</button>
-          <button @click="tab='debug'"><b>3</b>检查请求</button>
+          <button @click="tab='bindings'"><b>2</b>确认生效配置</button>
+          <button @click="tab='debug'"><b>3</b>模拟请求</button>
+        </div>
+      </div>
+      <div class="guide-grid">
+        <div v-for="item in homeGuide" :class="['guide-card', item.state]">
+          <span>{{item.state==='ready'?'已就绪':item.state==='warn'?'需确认':item.state==='todo'?'待处理':'可选'}}</span>
+          <h3>{{item.title}}</h3>
+          <p>{{item.detail}}</p>
+          <button @click="item.create ? createDoc(item.create) : tab=item.tab">{{item.action}}</button>
         </div>
       </div>
       <div class="panel">
@@ -801,38 +932,63 @@ createApp({
           <button @click="addBlock">添加自定义块</button>
         </template>
         <template v-if="tab==='lorebook' || tab==='material'">
-          <div class="entry" v-for="(e,i) in entries">
-            <div class="entry-head">
-              <input v-model="e.comment"><label><input type="checkbox" v-model="e.constant">常驻</label>
-              <label><input type="checkbox" v-model="e.disable">禁用</label>
-              <label><input type="checkbox" v-model="e.vectorized">向量化</label>
-              <button class="danger" @click="selected.data.entries.splice(i,1)">删除</button>
-            </div>
-            <div class="grid">
-              <label>主关键词<input :value="keyText(e.key)" @input="setKeys(e,'key',$event.target.value)"></label>
-              <label>次关键词<input :value="keyText(e.keysecondary)" @input="setKeys(e,'keysecondary',$event.target.value)"></label>
-            </div>
-            <div class="inline">
-              <label><input type="checkbox" v-model="e.selective">次关键词</label>
-              <label>逻辑<select v-model.number="e.selectiveLogic"><option :value="0">且任一</option><option :value="3">且全部</option><option :value="2">且无</option><option :value="1">且非全部</option></select></label>
-              <label>位置<select v-model.number="e.position"><option :value="0">角色前</option><option :value="1">角色后</option><option :value="2">作者注顶部</option><option :value="3">作者注底部</option><option :value="4">聊天深度</option><option :value="5">示例顶部</option><option :value="6">示例底部</option><option :value="7">Outlet</option></select></label>
-              <label>角色<select v-model="e.role"><option>system</option><option>user</option><option>assistant</option></select></label>
-            </div>
-            <div class="inline">
-              <label>深度<input type="number" v-model.number="e.depth"></label>
-              <label>顺序<input type="number" v-model.number="e.order"></label>
-              <label>概率<input type="number" min="0" max="100" v-model.number="e.probability"></label>
-              <label>Sticky<input type="number" v-model.number="e.sticky"></label>
-              <label>Cooldown<input type="number" v-model.number="e.cooldown"></label>
-              <label>Delay<input type="number" v-model.number="e.delay"></label>
-            </div>
-            <div class="grid" v-if="tab==='material'">
-              <label>分类<input v-model="e.extensions.category"></label>
-              <label>描述<input v-model="e.extensions.description"></label>
-            </div>
-            <label>注入内容<textarea v-model="e.content"></textarea></label>
+          <div class="entry-toolbar">
+            <input v-model="entryQuery" placeholder="搜索标题、关键词、分类或内容">
+            <select v-model="entryFilter"><option value="all">全部条目</option><option value="enabled">只看启用</option><option value="disabled">只看禁用</option><option value="vectorized">只看向量化</option><option value="constant">只看常驻</option><option value="no_keys">无主关键词</option></select>
+            <button @click="openEntryUid=''">全部收起</button>
+            <button class="primary" @click="addEntry">添加条目</button>
           </div>
-          <button @click="addEntry">添加条目</button>
+          <p class="muted">显示 {{filteredEntries.length}} / {{entries.length}} 条。点击条目卡片展开编辑；保存后会自动重建检索索引。</p>
+          <div class="entry-card" v-for="e in filteredEntries" :class="{open:openEntryUid===e.uid, disabled:e.disable}">
+            <div class="entry-summary" @click="openEntryUid = openEntryUid===e.uid ? '' : e.uid">
+              <div>
+                <b>{{e.comment || '未命名条目'}}</b>
+                <p>{{(e.extensions?.description || e.content || '没有内容').slice(0,120)}}</p>
+              </div>
+              <div class="entry-tags">
+                <span v-if="tab==='material'">{{e.extensions?.category || '未分类'}}</span>
+                <span>{{keyText(e.key) || '无主关键词'}}</span>
+                <span v-if="e.vectorized">向量化</span>
+                <span v-if="e.constant">常驻</span>
+                <span v-if="e.disable">禁用</span>
+              </div>
+            </div>
+            <div class="entry-detail" v-if="openEntryUid===e.uid">
+              <div class="entry-head">
+                <input v-model="e.comment"><label><input type="checkbox" v-model="e.constant">常驻</label>
+                <label><input type="checkbox" v-model="e.disable">禁用</label>
+                <label><input type="checkbox" v-model="e.vectorized">向量化</label>
+                <button class="danger" @click="selected.data.entries.splice(entries.indexOf(e),1)">删除</button>
+              </div>
+              <div class="grid" v-if="tab==='material'">
+                <label>分类<input v-model="e.extensions.category"></label>
+                <label>描述<input v-model="e.extensions.description"></label>
+              </div>
+              <div class="grid">
+                <label>主关键词<input :value="keyText(e.key)" @input="setKeys(e,'key',$event.target.value)"></label>
+                <label>次关键词<input :value="keyText(e.keysecondary)" @input="setKeys(e,'keysecondary',$event.target.value)"></label>
+              </div>
+              <label>注入内容<textarea v-model="e.content"></textarea></label>
+              <details class="advanced entry-advanced">
+                <summary>高级触发设置</summary>
+                <div class="inline">
+                  <label><input type="checkbox" v-model="e.selective">启用次关键词逻辑</label>
+                  <label>逻辑<select v-model.number="e.selectiveLogic"><option :value="0">且任一</option><option :value="3">且全部</option><option :value="2">且无</option><option :value="1">且非全部</option></select></label>
+                  <label>位置<select v-model.number="e.position"><option :value="0">角色前</option><option :value="1">角色后</option><option :value="2">作者注顶部</option><option :value="3">作者注底部</option><option :value="4">聊天深度</option><option :value="5">示例顶部</option><option :value="6">示例底部</option><option :value="7">Outlet</option></select></label>
+                  <label>角色<select v-model="e.role"><option>system</option><option>user</option><option>assistant</option></select></label>
+                </div>
+                <div class="inline">
+                  <label>深度<input type="number" v-model.number="e.depth"></label>
+                  <label>顺序<input type="number" v-model.number="e.order"></label>
+                  <label>概率<input type="number" min="0" max="100" v-model.number="e.probability"></label>
+                  <label>Sticky<input type="number" v-model.number="e.sticky"></label>
+                  <label>Cooldown<input type="number" v-model.number="e.cooldown"></label>
+                  <label>Delay<input type="number" v-model.number="e.delay"></label>
+                </div>
+              </details>
+            </div>
+          </div>
+          <p v-if="!filteredEntries.length" class="muted">没有匹配当前筛选条件的条目。</p>
         </template>
         <template v-if="tab==='persona'"><label>用户设定内容<textarea class="tall" v-model="selected.data.content"></textarea></label></template>
         <details class="advanced">
@@ -845,8 +1001,43 @@ createApp({
     </section>
     <section v-else-if="tab==='bindings'" class="stack">
       <div class="panel">
+        <div class="result-head">
+          <div>
+            <h3>当前目标的有效配置</h3>
+            <p class="muted">{{bindingTargetTitle}}</p>
+          </div>
+          <button @click="tab='debug'">去调试器验证</button>
+        </div>
+        <label class="combo">用于查看生效结果的会话
+          <input v-model="debugDisplay" @focus="onDFocus" @blur="onDBlur" placeholder="搜索或输入会话 ID">
+          <div class="combo-panel" v-if="dOpen">
+            <div v-for="c in dFiltered" class="combo-option" @mousedown.prevent="pickDebug(c)">{{c.title}} · {{c.platform}}</div>
+            <div v-if="!dFiltered.length" class="combo-option muted">无匹配，可直接输入 ID</div>
+          </div>
+        </label>
+        <div class="binding-summary">
+          <div class="binding-slot" v-for="kind in ['preset','character','character_group','persona']">
+            <span>{{labels[kind]}}</span>
+            <b>{{bindingSummary.single[kind]?.target_name || '未生效'}}</b>
+            <small>{{bindingSummary.single[kind] ? scopeName(bindingSummary.single[kind]) : '没有匹配当前目标的绑定'}}</small>
+          </div>
+        </div>
+        <div class="grid">
+          <div class="binding-stack">
+            <h4>叠加世界书</h4>
+            <div class="activation" v-for="i in bindingSummary.additive.lorebook"><b>{{i.target_name}}</b><small> · {{scopeName(i)}}</small></div>
+            <p v-if="!bindingSummary.additive.lorebook.length" class="muted">当前目标没有叠加世界书。</p>
+          </div>
+          <div class="binding-stack">
+            <h4>叠加创作素材</h4>
+            <div class="activation" v-for="i in bindingSummary.additive.material"><b>{{i.target_name}}</b><small> · {{scopeName(i)}}</small></div>
+            <p v-if="!bindingSummary.additive.material.length" class="muted">当前目标没有叠加创作素材。</p>
+          </div>
+        </div>
+      </div>
+      <div class="panel">
         <h3>新增绑定</h3>
-        <p>单选资源按"会话 → Persona → 用户 → 群组 → 全局"覆盖；世界书按作用域叠加。</p>
+        <p>角色、角色组、预设、用户设定按“会话 → Persona → 全局”覆盖；世界书和创作素材会按作用域叠加。</p>
         <div class="binding-form">
           <label>资料类型<select v-model="binding.kind"><option v-for="(v,k) in labels" :value="k">{{v}}</option></select></label>
           <label>资料<select v-model="binding.target_id"><option value="">请选择</option><option v-for="d in bindDocs" :value="d.id">{{d.name}}</option></select></label>
@@ -863,7 +1054,7 @@ createApp({
         </div>
       </div>
       <div class="panel">
-        <h3>当前绑定</h3>
+        <h3>全部绑定记录</h3>
         <table><tr><th>范围</th><th>类型</th><th>资料</th><th></th></tr>
           <tr v-for="i in bindings"><td>{{scopeName(i)}}</td><td>{{labels[i.kind]||i.kind}}</td><td>{{i.target_name}}</td><td><button class="danger" @click="unbind(i)">移除</button></td></tr>
         </table>
@@ -894,19 +1085,23 @@ createApp({
           </div>
         </div>
         <div class="actions"><button @click="toggleAllVisibleMemories">{{allVisibleMemoriesSelected?'取消全选':'全选当前列表'}}</button><button @click="updateSelectedMemoryStatus('active')" :disabled="!selectedMemoryIds.length">确认为 active</button><button @click="updateSelectedMemoryStatus('rejected')" :disabled="!selectedMemoryIds.length">拒绝</button><button @click="updateSelectedMemoryStatus('archived')" :disabled="!selectedMemoryIds.length">归档</button><span class="muted">已选择 {{selectedMemoryIds.length}} 条</span></div>
-        <table><tr><th></th><th>状态</th><th>作用域</th><th>分类</th><th>重要度</th><th>来源</th><th>内容</th><th>更新时间</th><th></th></tr>
-          <tr v-for="m in filteredMemories">
-            <td><input type="checkbox" :value="m.id" v-model="selectedMemoryIds"></td>
-            <td>{{m.status || (m.enabled?'active':'archived')}}</td>
-            <td>{{m.scope_type}}: {{m.scope_id}}</td>
-            <td>{{m.category}}</td>
-            <td>{{Number(m.importance || 1).toFixed(1)}}</td>
-            <td>{{m.source_type || 'manual'}}</td>
-            <td>{{m.content}}</td>
-            <td>{{formatTimestamp(m.updated_at)}}</td>
-            <td class="actions"><button @click="editMemory(m)">编辑</button><button @click="toggleMemory(m)">{{m.enabled?'禁用':'启用'}}</button><button class="danger" @click="deleteMemory(m)">删除</button></td>
-          </tr>
-        </table>
+        <div v-for="group in memoryGroups" class="memory-group">
+          <h4>{{group.title}} <span>{{group.items.length}} 条</span></h4>
+          <div class="memory-card" v-for="m in group.items" :class="{inactive:!m.enabled || ['archived','rejected'].includes(m.status)}">
+            <label class="memory-check"><input type="checkbox" :value="m.id" v-model="selectedMemoryIds"></label>
+            <div>
+              <div class="memory-meta">
+                <span>{{m.status || (m.enabled?'active':'archived')}}</span>
+                <span>{{m.category}}</span>
+                <span>重要度 {{Number(m.importance || 1).toFixed(1)}}</span>
+                <span>{{m.source_type || 'manual'}}</span>
+              </div>
+              <p>{{m.content}}</p>
+              <small>{{m.scope_type}}: {{m.scope_id}} · {{formatTimestamp(m.updated_at)}}</small>
+            </div>
+            <div class="actions"><button @click="editMemory(m)">编辑</button><button @click="toggleMemory(m)">{{m.enabled?'禁用':'启用'}}</button><button class="danger" @click="deleteMemory(m)">{{pendingMemoryDeleteId===m.id?'确认删除':'删除'}}</button></div>
+          </div>
+        </div>
         <p v-if="!filteredMemories.length" class="muted">还没有长期记忆。</p>
       </div>
     </section>
@@ -973,13 +1168,13 @@ createApp({
           <label>从此继续的新分支名<input v-model="archive.branch_name" placeholder="留空继承主线"></label>
         </div>
         <div class="actions"><button @click="branchFromArchiveNode">从此节点继续</button><button @click="saveJson(archive.selected,'story-node-'+archive.selected.id+'.json')">导出该节点 JSON</button></div>
-        <div class="effective">
-          <span>ID：{{archive.selected.id}}</span>
-          <span>父节点：{{archive.selected.parent_id||'无'}}</span>
-          <span>会话：{{archive.selected.session_id}}</span>
-          <span>轮次：{{archive.selected.turn_index}}</span>
-          <span>消息数：{{archive.selected.message_count}}</span>
-          <span>创建：{{formatTimestamp(archive.selected.created_at)}}</span>
+        <div class="summary-grid archive-summary">
+          <div class="summary-card ready"><span>分支</span><b>{{archive.selected.branch_name||'主线'}}</b></div>
+          <div class="summary-card ready"><span>轮次</span><b>{{archive.selected.turn_index}}</b></div>
+          <div class="summary-card ready"><span>消息数</span><b>{{archive.selected.message_count}}</b></div>
+          <div class="summary-card"><span>父节点</span><b>{{archive.selected.parent_id||'无'}}</b></div>
+          <div class="summary-card"><span>会话</span><b>{{archive.selected.session_id}}</b></div>
+          <div class="summary-card"><span>创建时间</span><b>{{formatTimestamp(archive.selected.created_at)}}</b></div>
         </div>
         <details open><summary>Assistant 回复</summary><pre>{{archive.selected.assistant_text||'（空）'}}</pre></details>
         <details open><summary>请求 messages[]（{{archive.selected.request_messages?.length||0}}）</summary>
@@ -1010,6 +1205,17 @@ createApp({
       </div>
       <div class="panel result" v-if="debugResult">
         <div class="result-head">
+          <h3>本轮结论</h3>
+          <span>先看结论，再展开细节</span>
+        </div>
+        <div class="summary-grid">
+          <div v-for="item in debugSummary" :class="['summary-card', item.state]">
+            <span>{{item.label}}</span>
+            <b>{{item.value}}</b>
+          </div>
+        </div>
+        <div class="alert error" v-for="w in debugResult.warnings">{{w}}</div>
+        <div class="result-head compact">
           <h3>最终 messages[]</h3>
           <span>Token 为近似估算</span>
         </div>
@@ -1100,7 +1306,6 @@ createApp({
             </div>
           </div>
         </details>
-        <div class="alert error" v-for="w in debugResult.warnings">{{w}}</div>
         <div class="message" v-for="(m,i) in debugResult.messages"><b>{{i}} · {{m.role}}</b><pre>{{m.content}}</pre></div>
         <details open><summary>提示词块（{{debugResult.blocks?.length||0}}）</summary>
           <table><tr v-for="b in debugResult.blocks"><td>{{b.name}}</td><td>{{b.role}} / {{b.position}} / depth {{b.depth}}</td><td>≈ {{b.tokens}}</td><td>{{b.source}}</td></tr></table>
