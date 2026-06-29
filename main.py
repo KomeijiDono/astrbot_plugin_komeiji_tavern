@@ -428,6 +428,41 @@ class KomeijiTavernPlugin(Star):
                 return
             yield event.plain_result("用法：/tavern character status|next|use <角色名>")
             return
+        if action in {"qr", "quick", "quickreply"}:
+            scopes = self.service.scopes(event, None)
+            parts = rest.strip().split(" ", 1)
+            query = parts[0] if parts and parts[0] else ""
+            extra = parts[1] if len(parts) > 1 else ""
+            if not query or query in {"list", "status"}:
+                replies = await asyncio.to_thread(self.service.quick_replies, scopes)
+                if not replies:
+                    yield event.plain_result("当前作用域没有绑定快捷回复集。请在管理页新建快捷回复并绑定到会话、Persona 或全局。")
+                    return
+                lines = ["可用快捷回复："]
+                for item in replies[:30]:
+                    alias = f" / {item.get('alias')}" if item.get("alias") else ""
+                    mode = str(item.get("mode", "normal"))
+                    lines.append(f"{item.get('index')}. {item.get('label')}{alias} [{mode}] - {item.get('document_name')}")
+                lines.append("用法：/tavern qr <编号/别名/名称> [补充文本]")
+                yield event.plain_result("\n".join(lines))
+                return
+            item = await asyncio.to_thread(self.service.find_quick_reply, scopes, query)
+            if not item:
+                yield event.plain_result("找不到这个快捷回复。发送 /tavern qr list 查看可用项。")
+                return
+            mode, prompt, quiet_prompt = self.service.quick_reply_prompt(item, extra)
+            if not prompt:
+                yield event.plain_result("这个快捷回复没有内容。")
+                return
+            if mode != "normal":
+                event.set_extra("_kt_mode", mode)
+            if quiet_prompt:
+                event.set_extra("_kt_quiet_prompt", quiet_prompt)
+            manager = self.context.conversation_manager
+            conversation_id = await manager.get_curr_conversation_id(event.unified_msg_origin)
+            conversation = await manager.get_conversation(event.unified_msg_origin, conversation_id) if conversation_id else None
+            yield event.request_llm(prompt=prompt, conversation=conversation)
+            return
         if action not in {"continue", "impersonate", "quiet"}:
             yield event.plain_result("用法：/tavern status|preview|reset|continue|impersonate|quiet|retrieval|character|archive [补充提示]")
             return

@@ -648,6 +648,23 @@ class CoreTests(unittest.TestCase):
             selected = service._bound_one("preset", [("global", "*"), ("session", "s1"), ("persona", "p1")])
             self.assertEqual(selected["id"], session_id)
 
+    def test_ensure_defaults_creates_and_binds_quick_replies(self):
+        with tempfile.TemporaryDirectory() as directory:
+            storage = TavernStorage(Path(directory) / "state.db")
+            service = TavernService(storage, object(), {})
+            service.ensure_defaults()
+
+            documents = storage.list_documents("quick_reply")
+            self.assertEqual(len(documents), 1)
+            self.assertEqual(documents[0]["name"], "默认快捷回复")
+            self.assertEqual(len(documents[0]["data"]["items"]), 6)
+            self.assertEqual(documents[0]["data"]["items"][0]["label"], "继续剧情")
+            bindings = storage.list_bindings(scope_type="global", scope_id="*", kind="quick_reply")
+            self.assertEqual(bindings[0]["target_id"], documents[0]["id"])
+
+            service.ensure_defaults()
+            self.assertEqual(len(storage.list_documents("quick_reply")), 1)
+
     def test_finalize_story_snapshot_updates_current_node(self):
         with tempfile.TemporaryDirectory() as directory:
             storage = TavernStorage(Path(directory) / "state.db")

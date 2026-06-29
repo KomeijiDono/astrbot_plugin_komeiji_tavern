@@ -57,6 +57,7 @@ const labels = {
   persona: '用户设定',
   character_group: '角色组',
   material: '创作素材',
+  quick_reply: '快捷回复',
 }
 
 const tabs = [
@@ -67,6 +68,7 @@ const tabs = [
   ['lorebook', '世界书'],
   ['material', '创作素材'],
   ['persona', '用户设定'],
+  ['quick_reply', '快捷回复'],
   ['bindings', '绑定管理'],
   ['memories', '长期记忆'],
   ['metrics', '运行仪表盘'],
@@ -76,7 +78,7 @@ const tabs = [
 ]
 
 const navGroups = [
-  ['创作资料', ['home', 'character', 'character_group', 'preset', 'lorebook', 'material', 'persona']],
+  ['创作资料', ['home', 'character', 'character_group', 'preset', 'lorebook', 'material', 'persona', 'quick_reply']],
   ['生效与调试', ['bindings', 'debug', 'metrics']],
   ['长期系统', ['memories', 'archive']],
   ['帮助', ['help']],
@@ -108,6 +110,26 @@ const blocks = [
   depth: 0,
 }))
 
+const newQuickReply = () => ({
+  id: crypto.randomUUID(),
+  label: '新快捷回复',
+  alias: '',
+  content: '',
+  mode: 'normal',
+  enabled: true,
+  append_input: true,
+  order: 100,
+})
+
+const defaultQuickReplies = () => [
+  { id: crypto.randomUUID(), label: '继续剧情', alias: 'continue', content: '继续上一条助手回复，从中断处自然衔接。推进当前场景，避免复述已有内容，也不要替用户决定行动或台词。', mode: 'continue', enabled: true, append_input: true, order: 10 },
+  { id: crypto.randomUUID(), label: '丰富描写', alias: 'detail', content: '结合当前上下文继续回应，并加强动作、神态、环境与感官细节。保持人物性格和既有设定，不要无故改变剧情事实。', mode: 'normal', enabled: true, append_input: true, order: 20 },
+  { id: crypto.randomUUID(), label: '代写我的回复', alias: 'reply', content: '根据当前对话和用户设定，拟写一条自然的下一步用户消息。保持用户的口吻，只输出可直接发送的消息正文。', mode: 'impersonate', enabled: true, append_input: true, order: 30 },
+  { id: crypto.randomUUID(), label: '润色重写', alias: 'polish', content: '润色并重写上一条助手回复，保留原意和事实，提高语言自然度、画面感与节奏。只输出重写后的正文。', mode: 'normal', enabled: true, append_input: true, order: 40 },
+  { id: crypto.randomUUID(), label: '总结当前剧情', alias: 'summary', content: '总结截至目前的剧情进展、人物关系、重要信息、当前状态和未解决事项。不要续写剧情，不要添加上下文中不存在的信息。', mode: 'normal', enabled: true, append_input: true, order: 50 },
+  { id: crypto.randomUUID(), label: '严格保持角色', alias: 'incharacter', content: '本轮必须严格遵守角色卡、世界书与既有剧情事实，保持角色口吻和行为逻辑，不要跳出角色解释。', mode: 'quiet', enabled: true, append_input: true, order: 60 },
+]
+
 const newEntry = kind => ({
   uid: crypto.randomUUID(),
   comment: '新条目',
@@ -132,8 +154,32 @@ const newEntry = kind => ({
   extensions: { category: '', description: '' },
 })
 
+const readThemePreference = () => {
+  try {
+    const stored = window.localStorage?.getItem('komeiji-tavern-theme')
+    if (stored === 'light' || stored === 'dark') return stored
+  } catch {
+  }
+  try {
+    const requested = new URLSearchParams(window.location.search).get('theme')
+    return requested === 'light' ? 'light' : requested === 'dark' ? 'dark' : null
+  } catch {
+    return null
+  }
+}
+
+const writeThemePreference = value => {
+  try {
+    window.localStorage?.setItem('komeiji-tavern-theme', value)
+  } catch {
+    // AstrBot hosts plugin pages in a sandboxed frame, where storage may be unavailable.
+  }
+}
+
 createApp({
   setup() {
+    const storedTheme = readThemePreference()
+    const theme = ref(storedTheme === 'light' ? 'light' : 'dark')
     const tab = ref('home')
     const overview = ref({ counts: {}, tasks: [] })
     const documents = ref([])
@@ -148,6 +194,7 @@ createApp({
     const notice = ref('')
     const busy = ref(false)
     const file = ref(null)
+    const fileLabel = computed(() => file.value?.name || '未选择文件')
     const advanced = ref('')
     const sQuery = ref('')
     const sOpen = ref(false)
@@ -168,12 +215,18 @@ createApp({
     const retrievalStats = ref(null)
     const retrievalResult = ref(null)
     const archive = ref({ session_id: '', nodes: [], selected: null, branch_name: '' })
+    const selectedQuickReplyId = ref('')
 
     const binding = ref({ scope_type: 'session', scope_id: '', kind: 'character', target_id: '', priority: 0 })
     const newMemoryDraft = () => ({ id: '', scope_type: 'session', scope_id: '', category: 'status', content: '', enabled: true, status: 'active', importance: 1, source_type: 'manual', source_ref: '', expires_at: 0 })
     const memoryDraft = ref(newMemoryDraft())
     const debug = ref({ session_id: '', persona_id: '', prompt: '', system_prompt: '', mode: 'normal', quiet_prompt: '', seed: 1 })
     const debugResult = ref(null)
+    const themeSwitch = ref(null)
+    const toggleTheme = () => {
+      theme.value = theme.value === 'dark' ? 'light' : 'dark'
+      writeThemePreference(theme.value)
+    }
     const formatTimestamp = value => value ? new Date(Number(value) * 1000).toLocaleString() : '无'
 
     const docsForTab = computed(() => documents.value.filter(x => x.kind === tab.value))
@@ -198,6 +251,8 @@ createApp({
     })
     const groupMembers = computed(() => (selected.value?.data?.members || []).map(id => characterDocs.value.find(x => x.id === id)).filter(Boolean))
     const availableGroupMembers = computed(() => characterDocs.value.filter(x => !(selected.value?.data?.members || []).includes(x.id)))
+    const quickReplies = computed(() => Array.isArray(selected.value?.data?.items) ? selected.value.data.items.slice().sort((a, b) => Number(a.order || 0) - Number(b.order || 0)) : [])
+    const effectiveQuickReplies = computed(() => debugResult.value?.effective?.additive?.quick_reply || bindingSummary.value.additive.quick_reply || [])
 
     const sFiltered = computed(() => {
       const q = sQuery.value.toLowerCase()
@@ -296,7 +351,7 @@ createApp({
     })
     const bindingSummary = computed(() => {
       const singleKinds = ['preset', 'character', 'character_group', 'persona']
-      const additiveKinds = ['lorebook', 'material']
+      const additiveKinds = ['lorebook', 'material', 'quick_reply']
       const rank = { global: 1, persona: 2, session: 3 }
       const out = { single: {}, additive: {} }
       for (const kind of singleKinds) {
@@ -381,6 +436,7 @@ createApp({
     const choose = d => {
       selected.value = JSON.parse(JSON.stringify(d))
       pendingDeleteId.value = ''
+      if (d.kind === 'quick_reply' && !Array.isArray(selected.value.data.items)) selected.value.data.items = []
       if (['lorebook', 'material'].includes(d.kind) && !Array.isArray(selected.value.data.entries)) {
         selected.value.data.entries = Object.values(selected.value.data.entries || {})
       }
@@ -402,6 +458,7 @@ createApp({
         lorebook: { entries: [] },
         material: { entries: [] },
         persona: { content: '' },
+        quick_reply: { items: defaultQuickReplies() },
       }
       choose({ kind, name: '新' + labels[kind], data: t[kind] })
       tab.value = kind
@@ -729,6 +786,26 @@ createApp({
       priority: 50,
     })
 
+    const addQuickReply = () => {
+      const item = newQuickReply()
+      selected.value.data.items = [...(selected.value.data.items || []), item]
+      selectedQuickReplyId.value = item.id
+    }
+
+    const removeQuickReply = item => {
+      selected.value.data.items = (selected.value.data.items || []).filter(x => x !== item)
+      if (selectedQuickReplyId.value === item.id) selectedQuickReplyId.value = ''
+    }
+
+    const applyQuickReply = item => {
+      const content = String(item.content || '').trim()
+      const existing = String(debug.value.prompt || '').trim()
+      debug.value.prompt = item.append_input && existing ? content + '\n\n' + existing : content
+      debug.value.mode = item.mode || 'normal'
+      debug.value.quiet_prompt = item.mode === 'quiet' ? content : ''
+      tab.value = 'debug'
+    }
+
     const addEntry = () => {
       const item = newEntry(tab.value)
       selected.value.data.entries.push(item)
@@ -774,17 +851,22 @@ createApp({
       }
     }
 
-    onMounted(load)
+    onMounted(() => {
+      themeSwitch.value?.addEventListener('click', toggleTheme)
+      load()
+    })
 
     return {
       tabs, navGroups, labels, tab, overview, documents, bindings, personas, selected, pendingDeleteId, pendingImport, pendingMemoryDeleteId, error, notice, busy,
+      theme, themeSwitch, toggleTheme,
+      fileLabel,
       downloadLocationHint, saveJson,
       advanced, binding, memoryDraft, memoryQuery, memoryStatusFilter, selectedMemoryIds,
       memories, filteredMemories, memoryGroups, allVisibleMemoriesSelected,
       metricDays, metrics, metricItems, metricTotals, metricProviders, maxMetricTokens,
       retrievalTest, retrievalStats, retrievalResult,
-      archive, archiveTree, homeGuide,
-      debug, debugResult, debugSummary, docsForTab, bindDocs, characterDocs, card, entries, filteredEntries,
+      archive, archiveTree, homeGuide, selectedQuickReplyId,
+      debug, debugResult, debugSummary, docsForTab, bindDocs, characterDocs, card, entries, filteredEntries, quickReplies, effectiveQuickReplies,
       groupMembers, availableGroupMembers,
       sessionOptions, sFiltered, dFiltered, sessionDisplay, debugDisplay, bindingTargetTitle, bindingsForTarget, bindingSummary,
       entryQuery, entryFilter, openEntryUid,
@@ -797,17 +879,17 @@ createApp({
       saveMemory, editMemory, toggleMemory, toggleAllVisibleMemories,
       updateSelectedMemoryStatus, deleteMemory, refreshMetrics,
       refreshRetrievalStats, runRetrievalTest,
-      move, moveMember, addMember, addBlock, addEntry, keyText, setKeys,
+      move, moveMember, addMember, addBlock, addEntry, addQuickReply, removeQuickReply, applyQuickReply, keyText, setKeys,
       selectConversation, simulate, actual, formatTimestamp,
     }
   },
   template: `
-<div class="shell">
+<div class="shell" :class="'theme-' + theme">
   <aside class="nav">
     <div class="brand">
       <small>ASTRBOT 角色扮演工作台</small>
       <h1>Komeiji's<br>Tavern</h1>
-      <span v-if="overview.version">v{{overview.version}}</span>
+      <span v-if="overview?.version">v{{overview.version}}</span>
     </div>
     <div class="nav-group" v-for="group in navGroups">
       <strong>{{group.name}}</strong>
@@ -818,18 +900,25 @@ createApp({
     <header>
       <div><h2>{{tabs.find(x=>x[0]===tab)?.[1]}}</h2><p>创建或导入 → 编辑 → 绑定 → 扫描测试 → 检查 messages[]</p></div>
       <div class="header-actions">
-        <label class="import"><input type="file" accept=".json,.yaml,.yml,.png,.txt,.md,.db,.sqlite,.sqlite3" @change="setFile"><button @click="importData" :disabled="busy">{{pendingImport?'确认导入':'解析并导入'}}</button></label>
+        <button ref="themeSwitch" class="theme-switch" :class="'is-' + theme" type="button" :aria-label="theme==='dark'?'切换到浅色':'切换到深色'">
+          <span class="theme-switch-track"><span class="theme-switch-thumb"></span></span>
+          <span class="theme-switch-label">{{theme==='dark'?'深色':'浅色'}}</span>
+        </button>
+        <div class="import toolbar-group">
+          <label class="file-picker"><input type="file" accept=".json,.yaml,.yml,.png,.txt,.md,.db,.sqlite,.sqlite3" @change="setFile"><span>选择文件</span><b>{{fileLabel}}</b></label>
+          <button class="toolbar-button" @click="importData" :disabled="busy">{{pendingImport?'确认导入':'解析并导入'}}</button>
+        </div>
         <details class="export-menu">
           <summary>导出</summary>
           <div class="export-popover">
             <strong>导出内容</strong>
-            <button v-if="['character','character_group','preset','lorebook','material','persona'].includes(tab) && selected?.id" @click="exportSelected" :disabled="busy">当前资料 JSON</button>
-            <button v-if="['character','character_group','preset','lorebook','material','persona'].includes(tab)" @click="exportKind" :disabled="busy || !docsForTab.length">当前类别 ZIP</button>
-            <button v-if="tab==='home' || ['character','character_group','preset','lorebook','material','persona'].includes(tab)" @click="exportAll" :disabled="busy || !documents.length">全部资料 ZIP</button>
+            <button v-if="['character','character_group','preset','lorebook','material','persona','quick_reply'].includes(tab) && selected?.id" @click="exportSelected" :disabled="busy">当前资料 JSON</button>
+            <button v-if="['character','character_group','preset','lorebook','material','persona','quick_reply'].includes(tab)" @click="exportKind" :disabled="busy || !docsForTab.length">当前类别 ZIP</button>
+            <button v-if="tab==='home' || ['character','character_group','preset','lorebook','material','persona','quick_reply'].includes(tab)" @click="exportAll" :disabled="busy || !documents.length">全部资料 ZIP</button>
             <button v-if="tab==='debug'" @click="exportMessages" :disabled="busy || !debugResult?.messages">当前 messages[] JSON</button>
             <button v-if="tab==='debug'" @click="backupSession" :disabled="busy || !debug.session_id">当前会话备份 ZIP</button>
             <button v-if="tab==='archive'" @click="exportArchive" :disabled="busy || !archive.nodes.length">当前分支树 JSON</button>
-            <p v-if="!['home','character','character_group','preset','lorebook','material','persona','debug','archive'].includes(tab)" class="muted">当前页面没有可导出的内容。</p>
+            <p v-if="!['home','character','character_group','preset','lorebook','material','persona','quick_reply','debug','archive'].includes(tab)" class="muted">当前页面没有可导出的内容。</p>
             <small>{{downloadLocationHint}}</small>
           </div>
         </details>
@@ -865,7 +954,7 @@ createApp({
       </div>
       <div class="panel"><h3>待完成</h3><p v-if="!overview.tasks?.length">没有必须处理的事项。</p><ul><li v-for="x in overview.tasks">{{x}}</li></ul></div>
     </section>
-    <section v-else-if="['character','character_group','preset','lorebook','material','persona'].includes(tab)" class="workspace">
+    <section v-else-if="['character','character_group','preset','lorebook','material','persona','quick_reply'].includes(tab)" class="workspace">
       <div class="library">
         <div class="library-actions">
           <button class="primary" @click="createDoc(tab)">新建{{labels[tab]}}</button>
@@ -991,6 +1080,35 @@ createApp({
           <p v-if="!filteredEntries.length" class="muted">没有匹配当前筛选条件的条目。</p>
         </template>
         <template v-if="tab==='persona'"><label>用户设定内容<textarea class="tall" v-model="selected.data.content"></textarea></label></template>
+        <template v-if="tab==='quick_reply'">
+          <div class="panel">
+            <h3>快捷回复怎么用</h3>
+            <p>快捷回复是可复用的 AI 提示词模板，不会把固定文字原样发送。保存后请在“绑定管理”中绑定到全局、Persona 或具体会话。</p>
+            <p><code>/tavern qr list</code> 查看当前可用项；使用 <code>/tavern qr 编号</code>、<code>/tavern qr 别名</code> 或 <code>/tavern qr 名称</code> 触发。命令末尾可以追加本次要求，例如 <code>/tavern qr detail 更侧重环境气氛</code>。</p>
+          </div>
+          <div class="entry-toolbar">
+            <button class="primary" @click="addQuickReply">新增快捷回复</button>
+            <span class="muted">保存并绑定后，可通过聊天命令或调试器使用。</span>
+          </div>
+          <div class="block quick-reply-block" v-for="item in quickReplies" :class="{inactive:!item.enabled}">
+            <div class="block-head">
+              <label><input type="checkbox" v-model="item.enabled">启用</label>
+              <input v-model="item.label" placeholder="快捷回复名称">
+              <button @click="selectedQuickReplyId = selectedQuickReplyId===item.id ? '' : item.id">{{selectedQuickReplyId===item.id?'收起':'编辑'}}</button>
+              <button @click="applyQuickReply(item)">在调试器中使用</button>
+              <button class="danger" @click="removeQuickReply(item)">删除</button>
+            </div>
+            <div class="inline">
+              <label>命令别名<input v-model="item.alias" placeholder="例如 continue（不要带空格）"></label>
+              <label>生成模式<select v-model="item.mode"><option value="normal">普通生成</option><option value="continue">继续生成</option><option value="impersonate">代写用户回复</option><option value="quiet">静默提示词</option></select></label>
+              <label>排序<input type="number" v-model.number="item.order"></label>
+              <label class="check-field"><input type="checkbox" v-model="item.append_input">拼接命令后的补充文本</label>
+            </div>
+            <label v-if="selectedQuickReplyId===item.id">提示词内容<textarea v-model="item.content" placeholder="例如：继续当前剧情，加强动作与环境描写，不要替用户决定行动。"></textarea></label>
+            <p v-else class="muted">{{(item.content || '暂无内容').slice(0,160)}}</p>
+          </div>
+          <p v-if="!quickReplies.length" class="muted">还没有快捷回复，点击上方按钮新增。</p>
+        </template>
         <details class="advanced">
           <summary>高级 JSON（保留未知扩展字段）</summary>
           <div><button @click="advanced=JSON.stringify(selected.data,null,2)">从表单刷新</button><button @click="applyAdvanced">应用 JSON</button></div>
@@ -1327,6 +1445,15 @@ createApp({
       </ol>
       <h3>生命周期</h3>
       <p><b>Sticky</b> 激活后保持若干轮；<b>Cooldown</b> 在保持结束后阻止再次触发；<b>Delay</b> 让条目延迟启用。</p>
+      <h3>快捷回复</h3>
+      <p>快捷回复是保存好的 AI 提示词模板。插件首次运行时会创建并全局绑定“默认快捷回复”，包含继续剧情、丰富描写、代写回复、润色重写、剧情总结和严格保持角色。</p>
+      <ol>
+        <li>进入“快捷回复”页面编辑模板，填写名称、命令别名、生成模式和提示词。</li>
+        <li>新建的快捷回复集需要前往“绑定管理”，绑定到全局、Persona 或具体会话；默认套装已经全局绑定。</li>
+        <li>发送 <code>/tavern qr list</code> 查看可用项。</li>
+        <li>发送 <code>/tavern qr &lt;编号/别名/名称&gt; [补充文本]</code> 触发生成，例如 <code>/tavern qr detail 更侧重环境气氛</code>。</li>
+      </ol>
+      <p><b>普通生成</b>正常回复；<b>继续生成</b>续写上一条助手消息；<b>代写用户回复</b>替你起草下一句话；<b>静默提示词</b>把模板作为本轮额外约束。</p>
       <h3>命令</h3>
       <pre>/tavern status
 /tavern preview
@@ -1334,6 +1461,8 @@ createApp({
 /tavern continue [补充要求]
 /tavern impersonate [补充要求]
 /tavern quiet [静默提示词]
+/tavern qr list
+/tavern qr &lt;编号/别名/名称&gt; [补充文本]
 /tavern character status
 /tavern character next
 /tavern character use <角色名>
