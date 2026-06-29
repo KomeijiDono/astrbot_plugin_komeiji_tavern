@@ -2,7 +2,7 @@
 
 # Komeiji's Tavern
 
-[![Version](https://img.shields.io/badge/version-0.7.1-7c5cff?style=for-the-badge)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.7.2-7c5cff?style=for-the-badge)](CHANGELOG.md)
 [![AstrBot](https://img.shields.io/badge/AstrBot-4.25%2B-4f9cff?style=for-the-badge)](https://github.com/AstrBotDevs/AstrBot)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-42b883?style=for-the-badge)](LICENSE)
 
@@ -31,11 +31,11 @@
 
 ## 最新更新
 
-### 0.7.1
+### 0.7.2
 
-- 快捷回复页签统一改为中文“快捷回复”，减少英文术语混用带来的理解成本。
-- 新增默认快捷回复预设，首次初始化即可直接使用常见操作，不再需要从空白开始手动配置。
-- 补充快捷回复使用说明和命令示例，方便快速理解绑定方式、触发方式和生成模式。
+- 剥离 assistant 历史消息中的 `thinking` / `reasoning` 片段，真实请求不再把这类无效内容带进发送上下文。
+- 统一净化真实请求、只读模拟和分支树回放使用的历史消息结构，预览与实际行为保持一致。
+- 增补回归测试，覆盖带 `think` / `reasoning` 消息结构的上下文处理。
 
 ## 快速开始
 

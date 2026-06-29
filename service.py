@@ -683,14 +683,65 @@ class TavernService:
         return entries
 
     @staticmethod
-    def _message_text(message: dict[str, Any]) -> str:
-        content = message.get("content", "")
+    def _content_text(content: Any) -> str:
+        if content is None:
+            return ""
+        if isinstance(content, str):
+            return content
         if isinstance(content, list):
-            return "".join(
-                str(item.get("text", item.get("content", ""))) if isinstance(item, dict) else str(item)
-                for item in content
-            )
+            parts: list[str] = []
+            for item in content:
+                if isinstance(item, dict):
+                    item_type = str(item.get("type", "") or "").lower()
+                    if item_type in {"reasoning", "think", "thinking"}:
+                        continue
+                    if isinstance(item.get("message"), list):
+                        parts.append(TavernService._content_text(item.get("message")))
+                        continue
+                    text = item.get("text")
+                    if text is None and "content" in item:
+                        text = item.get("content")
+                    parts.append(TavernService._content_text(text))
+                else:
+                    parts.append(str(item))
+            return "".join(part for part in parts if part)
+        if isinstance(content, dict):
+            content_type = str(content.get("type", "") or "").lower()
+            if content_type in {"reasoning", "think", "thinking"}:
+                return ""
+            if isinstance(content.get("message"), list):
+                return TavernService._content_text(content.get("message"))
+            if "content" in content:
+                nested = content.get("content")
+                if nested is not content:
+                    return TavernService._content_text(nested)
+            if "text" in content:
+                return TavernService._content_text(content.get("text"))
+            if isinstance(content.get("message"), str):
+                return str(content.get("message") or "")
         return str(content)
+
+    @classmethod
+    def _message_text(cls, message: dict[str, Any]) -> str:
+        return cls._content_text(message.get("content", ""))
+
+    @classmethod
+    def _normalize_message(cls, message: Any) -> dict[str, Any] | None:
+        if not isinstance(message, dict):
+            return None
+        role = str(message.get("role", "") or "user")
+        if not role:
+            role = "user"
+        return {"role": role, "content": cls._message_text(message)}
+
+    @classmethod
+    def _normalize_messages(cls, messages: list[Any]) -> list[dict[str, Any]]:
+        result: list[dict[str, Any]] = []
+        for message in messages:
+            normalized = cls._normalize_message(message)
+            if normalized is not None:
+                result.append(normalized)
+        return result
 
     @staticmethod
     def _story_context_from_node(node: dict[str, Any]) -> list[dict[str, Any]]:
@@ -702,7 +753,9 @@ class TavernService:
             role = str(message.get("role", ""))
             if role == "system" or message.get("_kt_injected") or message.get("_kt_example"):
                 continue
-            result.append({"role": role or "user", "content": message.get("content", "")})
+            normalized = TavernService._normalize_message(message)
+            if normalized is not None:
+                result.append(normalized)
         assistant_text = str(node.get("assistant_text", "") or "").strip()
         if assistant_text:
             result.append({"role": "assistant", "content": assistant_text})
@@ -913,7 +966,7 @@ class TavernService:
                     branch_contexts = self._story_context_from_node(node)
             await asyncio.to_thread(self.storage.save_session, session_id, state)
             entries = await self._collect_entries(scopes)
-            source_contexts = branch_contexts if branch_contexts is not None else list(req.contexts or [])
+            source_contexts = branch_contexts if branch_contexts is not None else self._normalize_messages(list(req.contexts or []))
             scan_messages = list(source_contexts)
             if req.prompt:
                 scan_messages.append({"role": "user", "content": req.prompt})
@@ -1085,7 +1138,7 @@ class TavernService:
             if value:
                 scopes.append((scope_type, value))
         state = copy.deepcopy(await asyncio.to_thread(self.storage.get_session, session_id))
-        messages = [item for item in payload.get("contexts", []) if isinstance(item, dict)]
+        messages = self._normalize_messages(list(payload.get("contexts", [])))
         history, summary_meta, summary_warnings, apply_history_limit = await self._prepare_history(
             messages, state, session_id=session_id, generate=False
         )

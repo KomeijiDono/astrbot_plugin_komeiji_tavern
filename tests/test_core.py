@@ -745,6 +745,63 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(result["activated"][0]["uid"], "material-x")
             self.assertEqual(result["activated"][0]["content"], "material content")
 
+    def test_message_text_strips_reasoning_parts_and_fields(self):
+        message = {
+            "role": "assistant",
+            "content": {
+                "type": "bot",
+                "message": [
+                    {"type": "think", "think": "internal chain"},
+                    {"type": "reasoning", "text": "legacy chain"},
+                    {"type": "plain", "text": "Visible answer."},
+                ],
+                "reasoning": "internal chainlegacy chain",
+            },
+        }
+        self.assertEqual(TavernService._message_text(message), "Visible answer.")
+
+    def test_process_strips_assistant_reasoning_from_real_request_messages(self):
+        with tempfile.TemporaryDirectory() as directory:
+            storage = TavernStorage(Path(directory) / "state.db")
+            preset_id = storage.put_document("preset", "Default", {"main_prompt": "base"})
+            storage.bind("global", "*", "preset", preset_id)
+            service = TavernService(storage, object(), {})
+            req = _MockReq()
+            req.contexts = [
+                {
+                    "role": "assistant",
+                    "content": {
+                        "type": "bot",
+                        "message": [
+                            {"type": "think", "think": "secret reasoning"},
+                            {"type": "plain", "text": "Visible answer."},
+                        ],
+                        "reasoning": "secret reasoning",
+                        "reasoning_content": "secret reasoning",
+                    },
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "plain", "text": "Follow-up question."},
+                    ],
+                },
+            ]
+
+            result = run(service.process(_MockEvent(), req))
+            self.assertEqual(result.messages, [
+                {"role": "system", "content": "base"},
+                {"role": "assistant", "content": "Visible answer."},
+                {"role": "user", "content": "Follow-up question."},
+                {"role": "user", "content": "hello"},
+            ])
+
+            preview = storage.get_preview("s1")
+            self.assertEqual(preview["messages"], result.messages)
+            serialized = json.dumps(preview["messages"], ensure_ascii=False)
+            self.assertNotIn("reasoning", serialized)
+            self.assertNotIn("secret reasoning", serialized)
+
     def test_simulation_uses_character_group_selection_without_persisting(self):
         with tempfile.TemporaryDirectory() as directory:
             storage = TavernStorage(Path(directory) / "state.db")

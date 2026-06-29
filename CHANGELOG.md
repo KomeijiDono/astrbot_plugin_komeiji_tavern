@@ -1,5 +1,11 @@
 # 版本更新说明
 
+## 0.7.2：历史消息净化
+
+- 剥离 assistant 历史消息中的 `thinking`、`reasoning`、`reasoning_content` 及 `think` / `reasoning` message parts，避免它们混入真实请求的最终 `messages[]`。
+- 为真实请求、只读模拟和分支树回放统一增加历史消息归一化逻辑，只向构建器传入 `role + 纯文本 content`。
+- 补充回归测试，覆盖 AstrBot `bot/message` 结构、`think` 片段和 reasoning 字段共存时的上下文净化行为。
+
 ## 0.7.1：快捷回复体验补全
 
 - 将 WebUI 中的 `Quick Replies` 页签和相关操作文案统一调整为中文标签，减少术语混用。
