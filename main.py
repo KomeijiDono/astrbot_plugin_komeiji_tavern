@@ -41,6 +41,28 @@ def _flatten_config(config: dict[str, Any] | None) -> dict[str, Any]:
     return flattened
 
 
+def _remove_last_completed_turn(history: list[Any]) -> tuple[list[Any], int]:
+    """Remove the latest user turn and everything produced for it."""
+    assistant_index = -1
+    for index in range(len(history) - 1, -1, -1):
+        message = history[index]
+        if isinstance(message, dict) and str(message.get("role", "")) == "assistant":
+            assistant_index = index
+            break
+    if assistant_index < 0:
+        return list(history), 0
+
+    user_index = -1
+    for index in range(assistant_index - 1, -1, -1):
+        message = history[index]
+        if isinstance(message, dict) and str(message.get("role", "")) == "user":
+            user_index = index
+            break
+    if user_index < 0:
+        return list(history), 0
+    return list(history[:user_index]), len(history) - user_index
+
+
 @register(PLUGIN_ID, "KomeijiDono", DESCRIPTION, PLUGIN_VERSION)
 class KomeijiTavernPlugin(Star):
     def __init__(self, context: Context, config: dict[str, Any] | None = None):
@@ -342,6 +364,38 @@ class KomeijiTavernPlugin(Star):
             await self.service.reset_session(session_id)
             yield event.plain_result("当前会话的世界书生命周期和预览状态已清除。")
             return
+        if action in {"undo", "rollback", "撤回"}:
+            manager = self.context.conversation_manager
+            conversation_id = await manager.get_curr_conversation_id(event.unified_msg_origin)
+            if not conversation_id:
+                yield event.plain_result("当前没有可撤回的 AstrBot 会话。")
+                return
+            conversation = await manager.get_conversation(event.unified_msg_origin, conversation_id)
+            if not conversation:
+                yield event.plain_result("当前会话不存在，无法撤回。")
+                return
+            try:
+                history = json.loads(conversation.history or "[]")
+            except (json.JSONDecodeError, TypeError):
+                yield event.plain_result("当前会话历史格式异常，未执行撤回。")
+                return
+            if not isinstance(history, list):
+                yield event.plain_result("当前会话历史格式异常，未执行撤回。")
+                return
+            updated, removed = _remove_last_completed_turn(history)
+            if not removed:
+                yield event.plain_result("当前会话里没有完整的上一轮用户消息和助手回复。")
+                return
+            await manager.update_conversation(
+                event.unified_msg_origin,
+                conversation_id,
+                updated,
+            )
+            await self.service.rollback_history_state(session_id)
+            yield event.plain_result(
+                f"已撤回上一轮对话（移除 {removed} 条历史记录）。现在可以重新发送剧情指令。"
+            )
+            return
         if action == "status":
             state = await asyncio.to_thread(self.storage.get_session, session_id)
             yield event.plain_result(
@@ -464,7 +518,7 @@ class KomeijiTavernPlugin(Star):
             yield event.request_llm(prompt=prompt, conversation=conversation)
             return
         if action not in {"continue", "impersonate", "quiet"}:
-            yield event.plain_result("用法：/tavern status|preview|reset|continue|impersonate|quiet|retrieval|character|archive [补充提示]")
+            yield event.plain_result("用法：/tavern status|preview|reset|undo|continue|impersonate|quiet|retrieval|character|archive [补充提示]")
             return
         event.set_extra("_kt_mode", action)
         event.set_extra("_kt_quiet_prompt", str(rest) if action == "quiet" else "")
@@ -478,13 +532,19 @@ class KomeijiTavernPlugin(Star):
 
     @filter.command("tavern")
     async def tavern(self, event: AstrMessageEvent, action: str = "status", rest: GreedyStr = ""):
-        """Komeiji's Tavern: status, preview, reset, continue, impersonate, quiet, character, archive."""
+        """Komeiji's Tavern: status, preview, reset, undo, continue, impersonate, quiet, character, archive."""
         async for result in self._handle_tavern(event, action, str(rest)):
             yield result
 
-    @filter.regex(r"^/tavern(?:\s|$)")
+    @filter.command("tv")
+    async def tv(self, event: AstrMessageEvent, action: str = "status", rest: GreedyStr = ""):
+        """Short alias for /tavern."""
+        async for result in self._handle_tavern(event, action, str(rest)):
+            yield result
+
+    @filter.regex(r"^/(?:tavern|tv)(?:\s|$)")
     async def tavern_mentioned(self, event: AstrMessageEvent):
-        """Handle AstrBot's unstripped slash when a QQ command starts with @bot."""
+        """Handle AstrBot's unstripped /tavern or /tv when a QQ command starts with @bot."""
         is_at_self = any(
             isinstance(component, At)
             and str(component.qq) == str(event.get_self_id())
@@ -495,8 +555,9 @@ class KomeijiTavernPlugin(Star):
 
         command = re.sub(r"\s+", " ", event.get_message_str().strip())
         parts = command[1:].split(" ", 2)
+        command_name = parts[0] if parts else "tavern"
         action = parts[1] if len(parts) > 1 else "status"
         rest = parts[2] if len(parts) > 2 else ""
-        logger.info("[%s] 已兼容处理 @机器人 /tavern %s", DISPLAY_NAME, action)
+        logger.info("[%s] 已兼容处理 @机器人 /%s %s", DISPLAY_NAME, command_name, action)
         async for result in self._handle_tavern(event, action, rest):
             yield result

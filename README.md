@@ -2,7 +2,7 @@
 
 # Komeiji's Tavern
 
-[![Version](https://img.shields.io/badge/version-0.7.2-7c5cff?style=for-the-badge)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.7.5-7c5cff?style=for-the-badge)](CHANGELOG.md)
 [![AstrBot](https://img.shields.io/badge/AstrBot-4.25%2B-4f9cff?style=for-the-badge)](https://github.com/AstrBotDevs/AstrBot)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-42b883?style=for-the-badge)](LICENSE)
 
@@ -31,11 +31,12 @@
 
 ## 最新更新
 
-### 0.7.2
+### 0.7.5
 
-- 剥离 assistant 历史消息中的 `thinking` / `reasoning` 片段，真实请求不再把这类无效内容带进发送上下文。
-- 统一净化真实请求、只读模拟和分支树回放使用的历史消息结构，预览与实际行为保持一致。
-- 增补回归测试，覆盖带 `think` / `reasoning` 消息结构的上下文处理。
+- 新增 `/tv` 作为 `/tavern` 的短别名，并兼容 QQ `@机器人 /tv ...` 与 `@机器人 /tavern ...` 的未剥离命令格式。
+- 新增 `/tavern undo`，可撤回最近一轮用户消息和对应助手回复，并同步回退插件状态、请求预览和该轮自动提取的长期记忆。
+- 修复 AstrBot `/reset` 后旧会话滚动摘要仍可能注入新会话的问题；当摘要边界不属于当前历史时会自动丢弃旧摘要。
+- 补充回归测试，覆盖命令别名、撤回回滚和 reset 后摘要边界失效三类场景。
 
 ## 快速开始
 
@@ -135,10 +136,13 @@ WebUI 的“角色组”页签可把多个角色卡组合成一个可绑定资�
 
 状态与调试命令：
 
+以下所有 `/tavern` 命令都可以缩写为 `/tv`，例如 `/tv status`、`/tv undo`、`/tv qr list`。
+
 ```text
 /tavern status
 /tavern preview
 /tavern reset
+/tavern undo
 /tavern character status
 /tavern character next
 /tavern character use <角色名>
@@ -150,6 +154,8 @@ WebUI 的“角色组”页签可把多个角色卡组合成一个可绑定资�
 ```
 
 `reset` 只清除当前会话的插件生命周期、状态变量、滚动摘要和请求预览，不删除 AstrBot 聊天、绑定资料或分支树归档。
+
+`undo`（也可写作 `rollback` 或 `撤回`）会删除当前 AstrBot 会话中最近一次用户消息和对应的助手回复，并回退该轮产生的插件状态、滚动摘要、请求预览和自动提取记忆。分支树快照仍会保留，便于误操作后找回；执行后可直接重新发送剧情指令。
 
 - `retrieval test`：在当前会话绑定范围内测试输入文本会召回哪些世界书或素材条目。
 - `retrieval stats`：查看检索日志数量、高频命中条目和当前会话统计。
@@ -176,7 +182,7 @@ WebUI 的“角色组”页签可把多个角色卡组合成一个可绑定资�
 - 资料编辑页可分别导出当前资料 JSON，也可按类别或一键导出全部资料 ZIP。
 - 调试器可导出当前显示的纯 `messages[]` JSON；“重置前备份 ZIP”还会保存完整请求预览、插件会话状态与分支树节点。
 - 创作素材、世界书和检索索引保存在同一个 SQLite 数据库中；删除资料时会同步清理绑定和索引。
-- 会话备份不包含 AstrBot 原始聊天记录；`/tavern reset` 本身也不会删除这些聊天记录或分支树归档。
+- 会话备份不包含 AstrBot 原始聊天记录；`/tavern reset` 本身也不会删除这些聊天记录或分支树归档。需要撤回最近一轮聊天时使用 `/tavern undo`。
 - SQLite 文件位于 `data/astrbot_plugin_komeiji_tavern/tavern.db`。
 - 自动清理仅删除 `sessions` 和 `previews` 中的过期行，不删除 documents、bindings、story_nodes 或聊天数据。
 - SQLite 页面会被后续数据复用，插件不会在运行时自动执行 `VACUUM`。

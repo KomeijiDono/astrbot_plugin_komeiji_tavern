@@ -81,6 +81,31 @@ class TavernService:
         async with self._session_lock(session_id):
             await asyncio.to_thread(self.storage.reset_session, session_id)
 
+    async def rollback_history_state(self, session_id: str) -> None:
+        """Discard derived state from the removed turn while keeping its archive node recoverable."""
+        async with self._session_lock(session_id):
+            state = await asyncio.to_thread(self.storage.get_session, session_id)
+            removed_turn = int(state.get("turn", 0) or 0)
+            current_id = str(state.get("current_story_node_id", "") or "")
+            current = await asyncio.to_thread(self.storage.get_story_node, current_id) if current_id else None
+            parent_id = str((current or {}).get("parent_id", "") or "")
+            parent = await asyncio.to_thread(self.storage.get_story_node, parent_id) if parent_id else None
+            if parent and isinstance(parent.get("state_snapshot"), dict):
+                state = copy.deepcopy(parent["state_snapshot"])
+                state["current_story_node_id"] = parent_id
+            else:
+                state.pop("history_summary", None)
+                state.pop("pending_generation", None)
+                state.pop("pending_branch", None)
+                state["current_story_node_id"] = parent_id
+                state["turn"] = max(0, int(state.get("turn", 0) or 0) - 1)
+            await asyncio.to_thread(self.storage.save_session, session_id, state)
+            await asyncio.to_thread(self.storage.delete_preview, session_id)
+            if removed_turn > 0:
+                await asyncio.to_thread(
+                    self.storage.delete_auto_memories_for_turn, session_id, removed_turn
+                )
+
     async def set_pending_branch(self, session_id: str, node_id: str, branch_name: str = "") -> bool:
         node = await asyncio.to_thread(self.storage.get_story_node, node_id)
         if not node:
@@ -831,6 +856,13 @@ class TavernService:
     ) -> tuple[list[dict[str, Any]], dict[str, Any], list[str], bool]:
         enabled = bool(self.config.get("summary_enabled", False))
         saved = state.get("history_summary", {}) if isinstance(state.get("history_summary"), dict) else {}
+        marker = str(saved.get("covered_until", "") or "")
+        if marker and not any(self._message_fingerprint(message) == marker for message in messages):
+            # AstrBot's /reset starts a fresh conversation while unified_msg_origin stays
+            # unchanged.  The summary is keyed by that stable origin, so its boundary is
+            # the reliable signal that the stored summary belongs to a different history.
+            state.pop("history_summary", None)
+            saved = {}
         previous_summary = str(saved.get("content", "") or "")
         unseen = self._unsummarized_history(messages, state) if enabled else list(messages)
         keep = max(1, int(self.config.get("history_max_messages", 12) or 12))

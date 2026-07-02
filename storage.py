@@ -778,6 +778,10 @@ class TavernStorage:
             row = conn.execute("SELECT payload FROM previews WHERE session_id=?", (session_id,)).fetchone()
         return json.loads(row["payload"]) if row else None
 
+    def delete_preview(self, session_id: str) -> None:
+        with self._lock, self._connection() as conn:
+            conn.execute("DELETE FROM previews WHERE session_id=?", (session_id,))
+
     def put_memory(
         self,
         *,
@@ -937,6 +941,14 @@ class TavernStorage:
         with self._lock, self._connection() as conn:
             result = conn.execute("DELETE FROM memories WHERE id=?", (memory_id,))
         return bool(result.rowcount)
+
+    def delete_auto_memories_for_turn(self, session_id: str, turn: int) -> int:
+        with self._lock, self._connection() as conn:
+            result = conn.execute(
+                "DELETE FROM memories WHERE source_type='auto_extract' AND source_session_id=? AND source_turn=?",
+                (session_id, int(turn)),
+            )
+        return int(result.rowcount)
 
     @staticmethod
     def _decode_memory(row: sqlite3.Row) -> dict[str, Any]:

@@ -87,6 +87,32 @@ const navGroups = [
   items: group[1].map(key => tabs.find(item => item[0] === key)).filter(Boolean),
 }))
 
+const tabMeta = {
+  home: { icon: '🌌', subtitle: '向导与就绪总览' },
+  character: { icon: '🎴', subtitle: '角色档案编构' },
+  character_group: { icon: '👥', subtitle: '多角色协奏' },
+  preset: { icon: '⚡', subtitle: '提示词积木装配' },
+  lorebook: { icon: '📖', subtitle: '世界规则检索' },
+  material: { icon: '🎨', subtitle: '创作素材灵感包' },
+  persona: { icon: '🧙', subtitle: '观测者档案' },
+  quick_reply: { icon: '💬', subtitle: '快捷回复宏' },
+  bindings: { icon: '🔗', subtitle: '会话与资料映射' },
+  memories: { icon: '🧠', subtitle: '长期神经记忆' },
+  metrics: { icon: '📊', subtitle: 'Token 与运行指标' },
+  archive: { icon: '🌳', subtitle: '多元分支快照' },
+  debug: { icon: '🔬', subtitle: '请求推演沙盒' },
+  help: { icon: '📜', subtitle: '操作秘术手册' },
+}
+
+const twistSeeds = [
+  '让当前场景突然出现一个只有角色本人能感知到的旧日约定，并要求 TA 用行动而非解释回应。',
+  '把一条长期记忆变成当轮剧情的暗线证据，但不要直接揭露，只让角色通过细节试探。',
+  '让世界书中的地点规则短暂失效三分钟，观察角色如何维持人设与秩序。',
+  '让用户收到一封来自未来分支线的短消息，内容必须与当前会话的情绪核心相冲突。',
+  '让角色误以为自己刚刚重复经历过这一轮对话，并在回复里留下一个温柔的破绽。',
+  '把一个普通物件升级为剧情锚点：它记录了上一条 assistant 回复中没说出口的真实意图。',
+]
+
 const blocks = [
   ['main', '主提示词', 0],
   ['world_before', '世界书（角色前）', 10],
@@ -216,13 +242,14 @@ createApp({
     const retrievalResult = ref(null)
     const archive = ref({ session_id: '', nodes: [], selected: null, branch_name: '' })
     const selectedQuickReplyId = ref('')
+    const twistOpen = ref(false)
+    const twistText = ref(twistSeeds[0])
 
     const binding = ref({ scope_type: 'session', scope_id: '', kind: 'character', target_id: '', priority: 0 })
     const newMemoryDraft = () => ({ id: '', scope_type: 'session', scope_id: '', category: 'status', content: '', enabled: true, status: 'active', importance: 1, source_type: 'manual', source_ref: '', expires_at: 0 })
     const memoryDraft = ref(newMemoryDraft())
     const debug = ref({ session_id: '', persona_id: '', prompt: '', system_prompt: '', mode: 'normal', quiet_prompt: '', seed: 1 })
     const debugResult = ref(null)
-    const themeSwitch = ref(null)
     const toggleTheme = () => {
       theme.value = theme.value === 'dark' ? 'light' : 'dark'
       writeThemePreference(theme.value)
@@ -298,6 +325,31 @@ createApp({
     const metricTotals = computed(() => metrics.value.totals || {})
     const metricProviders = computed(() => Object.entries(metrics.value.providers || {}).sort((a, b) => b[1] - a[1]))
     const maxMetricTokens = computed(() => Math.max(1, ...metricItems.value.map(x => Number(x.prompt_tokens || 0))))
+    const currentTabMeta = computed(() => tabMeta[tab.value] || { icon: '?', subtitle: '' })
+    const documentCount = kind => overview.value.counts?.[kind] ?? documents.value.filter(x => x.kind === kind).length
+    const tabCount = key => {
+      if (labels[key]) return documentCount(key)
+      if (key === 'bindings') return bindings.value.length
+      if (key === 'memories') return memories.value.length
+      if (key === 'metrics') return metricTotals.value.requests || 0
+      if (key === 'archive') return archive.value.nodes.length
+      return null
+    }
+    const activeSingleCount = computed(() => ['preset', 'character', 'character_group', 'persona'].filter(kind => bindingSummary.value.single[kind]).length)
+    const additiveBindingCount = computed(() => (bindingSummary.value.additive.lorebook?.length || 0) + (bindingSummary.value.additive.material?.length || 0) + (bindingSummary.value.additive.quick_reply?.length || 0))
+    const enabledMemoryCount = computed(() => memories.value.filter(x => x.enabled && (x.status || 'active') === 'active').length)
+    const promptAssembly = computed(() => {
+      const blocks = selected.value?.data?.blocks
+      if (!Array.isArray(blocks)) return []
+      return blocks.filter(x => x.enabled).map(x => ({
+        name: x.name || x.identifier || '未命名提示块',
+        role: x.role || 'system',
+        position: x.position || 'system',
+        depth: x.depth ?? 0,
+        priority: x.priority ?? 0,
+        content: x.content || '',
+      }))
+    })
     const archiveTree = computed(() => {
       const byParent = new Map()
       for (const node of archive.value.nodes.slice().reverse()) {
@@ -806,6 +858,24 @@ createApp({
       tab.value = 'debug'
     }
 
+    const openTwist = () => {
+      twistOpen.value = true
+      twistText.value = twistSeeds[Math.floor(Math.random() * twistSeeds.length)]
+    }
+
+    const rerollTwist = () => {
+      const next = twistSeeds[Math.floor(Math.random() * twistSeeds.length)]
+      twistText.value = next === twistText.value ? twistSeeds[(twistSeeds.indexOf(next) + 1) % twistSeeds.length] : next
+    }
+
+    const useTwist = () => {
+      const existing = String(debug.value.prompt || '').trim()
+      const content = '第三只眼灵感：' + twistText.value
+      debug.value.prompt = existing ? existing + '\n\n' + content : content
+      twistOpen.value = false
+      tab.value = 'debug'
+    }
+
     const addEntry = () => {
       const item = newEntry(tab.value)
       selected.value.data.entries.push(item)
@@ -852,20 +922,20 @@ createApp({
     }
 
     onMounted(() => {
-      themeSwitch.value?.addEventListener('click', toggleTheme)
       load()
     })
 
     return {
-      tabs, navGroups, labels, tab, overview, documents, bindings, personas, selected, pendingDeleteId, pendingImport, pendingMemoryDeleteId, error, notice, busy,
-      theme, themeSwitch, toggleTheme,
+      tabs, navGroups, labels, tab, tabMeta, currentTabMeta, tabCount, activeSingleCount, additiveBindingCount, enabledMemoryCount,
+      overview, documents, bindings, personas, selected, pendingDeleteId, pendingImport, pendingMemoryDeleteId, error, notice, busy,
+      theme, toggleTheme,
       fileLabel,
       downloadLocationHint, saveJson,
       advanced, binding, memoryDraft, memoryQuery, memoryStatusFilter, selectedMemoryIds,
       memories, filteredMemories, memoryGroups, allVisibleMemoriesSelected,
       metricDays, metrics, metricItems, metricTotals, metricProviders, maxMetricTokens,
       retrievalTest, retrievalStats, retrievalResult,
-      archive, archiveTree, homeGuide, selectedQuickReplyId,
+      archive, archiveTree, homeGuide, selectedQuickReplyId, promptAssembly, twistOpen, twistText,
       debug, debugResult, debugSummary, docsForTab, bindDocs, characterDocs, card, entries, filteredEntries, quickReplies, effectiveQuickReplies,
       groupMembers, availableGroupMembers,
       sessionOptions, sFiltered, dFiltered, sessionDisplay, debugDisplay, bindingTargetTitle, bindingsForTarget, bindingSummary,
@@ -879,7 +949,8 @@ createApp({
       saveMemory, editMemory, toggleMemory, toggleAllVisibleMemories,
       updateSelectedMemoryStatus, deleteMemory, refreshMetrics,
       refreshRetrievalStats, runRetrievalTest,
-      move, moveMember, addMember, addBlock, addEntry, addQuickReply, removeQuickReply, applyQuickReply, keyText, setKeys,
+      move, moveMember, addMember, addBlock, addEntry, addQuickReply, removeQuickReply, applyQuickReply,
+      openTwist, rerollTwist, useTwist, keyText, setKeys,
       selectConversation, simulate, actual, formatTimestamp,
     }
   },
@@ -887,23 +958,39 @@ createApp({
 <div class="shell" :class="'theme-' + theme">
   <aside class="nav">
     <div class="brand">
-      <small>ASTRBOT 角色扮演工作台</small>
+      <button class="third-eye" type="button" @click="openTwist" title="唤醒第三只眼灵感助手"><span>眼</span></button>
+      <small>ASTRBOT 角色扮演神经引擎</small>
       <h1>Komeiji's<br>Tavern</h1>
-      <span v-if="overview?.version">v{{overview.version}}</span>
+      <span v-if="overview?.version">v{{overview.version}} · 深渊星穹</span>
     </div>
-    <div class="nav-group" v-for="group in navGroups">
-      <strong>{{group.name}}</strong>
-      <button v-for="t in group.items" :class="{active:tab===t[0]}" @click="tab=t[0];selected=null">{{t[1]}}</button>
+    <div class="nav-scroll">
+      <div class="nav-group" v-for="group in navGroups">
+        <strong>{{group.name}}</strong>
+        <button v-for="t in group.items" :class="{active:tab===t[0]}" @click="tab=t[0];selected=null">
+          <span><i>{{tabMeta[t[0]]?.icon || '·'}}</i>{{t[1]}}</span>
+          <em v-if="tabCount(t[0]) !== null">{{tabCount(t[0])}}</em>
+        </button>
+      </div>
+    </div>
+    <div class="nav-footer">
+      <button class="theme-switch" :class="'is-' + theme" type="button" :aria-label="theme==='dark'?'切换到浅色':'切换到深色'" @click="toggleTheme">
+        <span class="theme-switch-track"><span class="theme-switch-thumb"></span></span>
+        <span class="theme-switch-label">{{theme==='dark'?'深渊星穹':'日光酒馆'}}</span>
+      </button>
     </div>
   </aside>
   <main>
     <header>
-      <div><h2>{{tabs.find(x=>x[0]===tab)?.[1]}}</h2><p>创建或导入 → 编辑 → 绑定 → 扫描测试 → 检查 messages[]</p></div>
+      <div class="page-title">
+        <span class="page-glyph">{{currentTabMeta.icon}}</span>
+        <div><h2>{{tabs.find(x=>x[0]===tab)?.[1]}}<span>{{currentTabMeta.subtitle}}</span></h2></div>
+      </div>
       <div class="header-actions">
-        <button ref="themeSwitch" class="theme-switch" :class="'is-' + theme" type="button" :aria-label="theme==='dark'?'切换到浅色':'切换到深色'">
-          <span class="theme-switch-track"><span class="theme-switch-thumb"></span></span>
-          <span class="theme-switch-label">{{theme==='dark'?'深色':'浅色'}}</span>
-        </button>
+        <div class="status-strip">
+          <span><i></i>神经链接：同步</span>
+          <span>会话 {{sessionOptions.length}}</span>
+          <span>绑定 {{bindings.length}}</span>
+        </div>
         <div class="import toolbar-group">
           <label class="file-picker"><input type="file" accept=".json,.yaml,.yml,.png,.txt,.md,.db,.sqlite,.sqlite3" @change="setFile"><span>选择文件</span><b>{{fileLabel}}</b></label>
           <button class="toolbar-button" @click="importData" :disabled="busy">{{pendingImport?'确认导入':'解析并导入'}}</button>
@@ -924,18 +1011,40 @@ createApp({
         </details>
       </div>
     </header>
+    <div v-if="twistOpen" class="modal-backdrop" @click.self="twistOpen=false">
+      <div class="twist-modal">
+        <div class="result-head"><h3>第三只眼灵感助手</h3><button @click="twistOpen=false">关闭</button></div>
+        <p class="muted">随机生成一段可直接送入调试器的剧情变奏，不会自动保存或影响资料。</p>
+        <blockquote>{{twistText}}</blockquote>
+        <div class="actions"><button @click="rerollTwist">再次无意识转动</button><button class="primary" @click="useTwist">送入调试器</button></div>
+      </div>
+    </div>
     <div v-if="error" class="alert error">{{error}}</div>
     <div v-if="notice" class="alert ok">{{notice}}</div>
     <section v-if="tab==='home'" class="home">
-      <div class="hero">
-        <small>配置向导</small>
-        <h3>{{overview.ready?'工作台已具备基础配置':'从一个可验证的角色会话开始'}}</h3>
-        <p>资料只有进入绑定链路后才会参与模型请求。这里会告诉你当前缺什么，以及下一步应该去哪里处理。</p>
-        <div class="steps">
-          <button @click="createDoc('character')"><b>1</b>创建角色</button>
-          <button @click="tab='bindings'"><b>2</b>确认生效配置</button>
-          <button @click="tab='debug'"><b>3</b>模拟请求</button>
+      <div class="home-hero-grid">
+        <div class="hero">
+          <small>ASTRBOT v{{overview.version || 'LOCAL'}} ENGINE LOADED</small>
+          <h3>{{overview.ready?'欢迎来到星系潜意识酒馆':'从一个可验证的角色会话开始'}}</h3>
+          <p>这里是 AI 角色扮演与长期记忆编织的中枢。资料只有进入绑定链路后才会参与模型请求，调试器会展示最终 messages[]、检索命中与 Token 近似估算。</p>
+          <div class="steps">
+            <button class="primary" @click="tab='debug'"><b>测</b>进入神经调试器试玩</button>
+            <button @click="openTwist"><b>眼</b>唤醒第三只眼灵感</button>
+          </div>
         </div>
+        <div class="system-card">
+          <div class="result-head compact"><h3>当前引擎快照</h3><span>LIVE</span></div>
+          <div class="system-line"><span>资料总量</span><b>{{documents.length}}</b></div>
+          <div class="system-line"><span>有效主链</span><b>{{activeSingleCount}} / 4</b></div>
+          <div class="system-line"><span>叠加注入</span><b>{{additiveBindingCount}}</b></div>
+          <div class="system-line"><span>活跃记忆</span><b>{{enabledMemoryCount}}</b></div>
+        </div>
+      </div>
+      <div class="ops-grid">
+        <div class="ops-card pink"><span>资料总量</span><b>{{documents.length}}</b><small>角色、预设、世界书、素材与快捷回复</small></div>
+        <div class="ops-card cyan"><span>有效主链</span><b>{{activeSingleCount}} / 4</b><small>预设、角色、角色组、Persona</small></div>
+        <div class="ops-card gold"><span>叠加注入</span><b>{{additiveBindingCount}}</b><small>世界书、创作素材、快捷回复绑定</small></div>
+        <div class="ops-card purple"><span>活跃记忆</span><b>{{enabledMemoryCount}}</b><small>active 且启用的长期记忆</small></div>
       </div>
       <div class="guide-grid">
         <div v-for="item in homeGuide" :class="['guide-card', item.state]">
@@ -1019,6 +1128,14 @@ createApp({
             <small>标识：{{b.identifier}}</small>
           </div>
           <button @click="addBlock">添加自定义块</button>
+          <div class="assembly-preview" v-if="promptAssembly.length">
+            <div class="result-head compact"><h3>实时提示词装配骨架</h3><span>仅展示已启用块</span></div>
+            <div class="assembly-row" v-for="b in promptAssembly">
+              <b>[{{b.role}} / {{b.position}} / D:{{b.depth}}]</b>
+              <span>{{b.name}} · 优先级 {{b.priority}}</span>
+              <p>{{(b.content || '由插件运行时动态生成').slice(0,120)}}</p>
+            </div>
+          </div>
         </template>
         <template v-if="tab==='lorebook' || tab==='material'">
           <div class="entry-toolbar">

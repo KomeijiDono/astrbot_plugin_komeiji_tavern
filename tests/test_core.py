@@ -22,7 +22,7 @@ from astrbot_plugin_komeiji_tavern.qq_delivery import split_forward_text
 from astrbot_plugin_komeiji_tavern.storage import TavernStorage
 from astrbot_plugin_komeiji_tavern.service import TavernService
 from astrbot_plugin_komeiji_tavern.web import TavernWebApi
-from astrbot_plugin_komeiji_tavern.main import KomeijiTavernPlugin, _flatten_config
+from astrbot_plugin_komeiji_tavern.main import KomeijiTavernPlugin, _flatten_config, _remove_last_completed_turn
 from astrbot_plugin_komeiji_tavern.illustration import OmniDrawBridge
 from astrbot_plugin_komeiji_tavern.export_utils import (
     build_document_archive,
@@ -354,6 +354,73 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(payload["session_id"], "test-session")
         self.assertEqual(payload["messages"][0]["content"], "hello")
 
+    def test_remove_last_completed_turn_drops_user_assistant_and_tool_suffix(self):
+        history = [
+            {"role": "system", "content": "rules"},
+            {"role": "user", "content": "keep"},
+            {"role": "assistant", "content": "kept reply"},
+            {"role": "user", "content": "redo this"},
+            {"role": "tool", "content": "tool result"},
+            {"role": "assistant", "content": "bad reply"},
+            {"role": "checkpoint", "content": "internal"},
+        ]
+        updated, removed = _remove_last_completed_turn(history)
+        self.assertEqual(updated, history[:3])
+        self.assertEqual(removed, 4)
+
+    def test_tavern_undo_updates_astrbot_history_and_rolls_back_plugin_state(self):
+        class Conversation:
+            history = json.dumps([
+                {"role": "user", "content": "first"},
+                {"role": "assistant", "content": "first reply"},
+                {"role": "user", "content": "bad direction"},
+                {"role": "assistant", "content": "bad reply"},
+            ])
+
+        class Manager:
+            def __init__(self):
+                self.updated = None
+
+            async def get_curr_conversation_id(self, _origin):
+                return "cid-1"
+
+            async def get_conversation(self, _origin, _cid):
+                return Conversation()
+
+            async def update_conversation(self, origin, cid, history):
+                self.updated = (origin, cid, history)
+
+        class Service:
+            def __init__(self):
+                self.rolled_back = []
+
+            async def rollback_history_state(self, session_id):
+                self.rolled_back.append(session_id)
+
+        class Event:
+            unified_msg_origin = "platform:private:user"
+
+            @staticmethod
+            def plain_result(text):
+                return MessageEventResult().message(text)
+
+        async def collect(generator):
+            return [item async for item in generator]
+
+        manager = Manager()
+        plugin = KomeijiTavernPlugin.__new__(KomeijiTavernPlugin)
+        plugin.context = type("Context", (), {"conversation_manager": manager})()
+        plugin.service = Service()
+        plugin._session_id = lambda _event: "test-session"
+
+        results = run(collect(plugin.tavern(Event(), "undo", "")))
+        self.assertEqual(manager.updated[2], [
+            {"role": "user", "content": "first"},
+            {"role": "assistant", "content": "first reply"},
+        ])
+        self.assertEqual(plugin.service.rolled_back, ["test-session"])
+        self.assertIn("已撤回上一轮对话", results[0].chain[0].text)
+
     def test_mentioned_tavern_reset_handles_unstripped_slash(self):
         class Service:
             def __init__(self):
@@ -396,6 +463,45 @@ class CoreTests(unittest.TestCase):
         ignored = run(collect(plugin.tavern_mentioned(Event("123456"))))
         self.assertEqual(ignored, [])
         self.assertEqual(plugin.service.reset_ids, ["test-session"])
+
+    def test_tv_alias_and_mentioned_tv_use_same_tavern_handler(self):
+        class Event:
+            unified_msg_origin = "platform:private:user"
+
+            def __init__(self):
+                self.target = "bot-self-id"
+
+            @staticmethod
+            def get_self_id():
+                return "bot-self-id"
+
+            def get_messages(self):
+                return [At(qq=self.target), Plain("/tv status")]
+
+            @staticmethod
+            def get_message_str():
+                return "/tv status"
+
+            @staticmethod
+            def plain_result(text):
+                return MessageEventResult().message(text)
+
+        class Storage:
+            @staticmethod
+            def get_session(_session_id):
+                return {"turn": 2, "effects": {}}
+
+        async def collect(generator):
+            return [item async for item in generator]
+
+        plugin = KomeijiTavernPlugin.__new__(KomeijiTavernPlugin)
+        plugin.storage = Storage()
+        plugin._session_id = lambda _event: "test-session"
+
+        direct = run(collect(plugin.tv(Event(), "status", "")))
+        mentioned = run(collect(plugin.tavern_mentioned(Event())))
+        self.assertEqual(direct[0].chain[0].text, mentioned[0].chain[0].text)
+        self.assertIn("轮次：2", direct[0].chain[0].text)
 
     def test_forced_preview_result_uses_long_delivery_without_llm_result_type(self):
         class Result:
@@ -1217,6 +1323,39 @@ class SummaryCompressionTests(unittest.TestCase):
             self.assertEqual(len(provider.calls), 2)
             self.assertIn("summary-1", provider.calls[1]["prompt"])
 
+    def test_stale_summary_is_discarded_after_astrbot_reset(self):
+        provider = _FakeSummaryProvider()
+        with tempfile.TemporaryDirectory() as directory:
+            service = TavernService(TavernStorage(Path(directory) / "state.db"), _FakeSummaryContext(provider), {
+                "summary_enabled": True, "summary_trigger_messages": 18, "history_max_messages": 12,
+            })
+            old_messages = self.messages(18)
+            state = {
+                "history_summary": {
+                    "content": "summary from the previous conversation",
+                    "covered_until": TavernService._message_fingerprint(old_messages[5]),
+                    "covered_messages": 6,
+                    "updated_at": 100.0,
+                    "provider_id": "summary",
+                },
+            }
+
+            history, meta, warnings, apply_limit = run(service._prepare_history(
+                [{"role": "user", "content": "first message after reset"}],
+                state,
+                session_id="s1",
+                generate=True,
+            ))
+
+            self.assertEqual(history, [{"role": "user", "content": "first message after reset"}])
+            self.assertEqual(meta["source"], "none")
+            self.assertEqual(meta["content"], "")
+            self.assertEqual(meta["covered_messages"], 0)
+            self.assertNotIn("history_summary", state)
+            self.assertFalse(provider.calls)
+            self.assertFalse(warnings)
+            self.assertFalse(apply_limit)
+
     def test_summary_failure_preserves_progress_and_uses_legacy_limit(self):
         provider = _FakeSummaryProvider(error=RuntimeError("down"))
         with tempfile.TemporaryDirectory() as directory:
@@ -1362,6 +1501,22 @@ class VectorMatcherTests(unittest.TestCase):
 
 
 class LongTermMemoryTests(unittest.TestCase):
+    def test_delete_auto_memories_for_turn_preserves_manual_and_other_turns(self):
+        with tempfile.TemporaryDirectory() as d:
+            storage = TavernStorage(Path(d) / "state.db")
+            for content, source_type, turn in (
+                ("bad plot", "auto_extract", 3),
+                ("older plot", "auto_extract", 2),
+                ("manual note", "manual", 3),
+            ):
+                storage.put_memory(
+                    scope_type="session", scope_id="s1", category="plot", content=content,
+                    source_type=source_type, source_session_id="s1", source_turn=turn,
+                )
+            self.assertEqual(storage.delete_auto_memories_for_turn("s1", 3), 1)
+            contents = {item["content"] for item in storage.list_memories(scope_type="session", scope_id="s1")}
+            self.assertEqual(contents, {"older plot", "manual note"})
+
     def test_memory_crud_persists_embedding_and_toggle_delete(self):
         with tempfile.TemporaryDirectory() as d:
             storage = TavernStorage(Path(d) / "state.db")
