@@ -1,8 +1,13 @@
+import { createHash } from 'node:crypto'
 import { cp, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 
 const path = new URL('../dist/index.html', import.meta.url)
 const html = await readFile(path, 'utf8')
-const cacheVersion = Date.now()
+const appPath = new URL('../dist/assets/app.js', import.meta.url)
+const cacheVersion = createHash('sha256')
+  .update(await readFile(appPath))
+  .digest('hex')
+  .slice(0, 12)
 const fixed = html
   .replace(/\s+type="module"/g, '')
   .replace(/\s+crossorigin/g, '')
