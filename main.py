@@ -131,6 +131,15 @@ class KomeijiTavernPlugin(Star):
     async def on_llm_request(self, event: AstrMessageEvent, req: ProviderRequest):
         if not self.config.get("enabled", True):
             return
+        try:
+            conversation_id = await self.context.conversation_manager.get_curr_conversation_id(
+                event.unified_msg_origin
+            )
+            event.set_extra("_kt_astrbot_conversation_id", str(conversation_id or ""))
+        except Exception:
+            # History-boundary detection in the service remains available when
+            # a platform does not expose AstrBot's conversation manager.
+            pass
         result = await self.service.process(event, req)
         req.system_prompt = result.system_prompt
         req.contexts = result.contexts
@@ -398,10 +407,124 @@ class KomeijiTavernPlugin(Star):
             return
         if action == "status":
             state = await asyncio.to_thread(self.storage.get_session, session_id)
+            campaign_lookup = getattr(self.storage, "campaign_for_session", None)
+            campaign = await asyncio.to_thread(campaign_lookup, session_id) if campaign_lookup else None
+            campaign_line = f"\n战役：{campaign.get('name')}（{campaign.get('id')}）" if campaign else "\n战役：未绑定"
             yield event.plain_result(
                 f"{DISPLAY_NAME} {PLUGIN_VERSION}\n会话：{session_id}\n轮次：{state.get('turn', 0)}\n"
-                f"生命周期记录：{len(state.get('effects', {}))}\n可在插件管理页查看绑定和最终 messages[]。"
+                f"生命周期记录：{len(state.get('effects', {}))}{campaign_line}\n可在插件管理页查看绑定和最终 messages[]。"
             )
+            return
+        if action in {"campaign", "game", "战役"}:
+            parts = rest.strip().split(" ", 1)
+            sub = parts[0].lower() if parts and parts[0] else "status"
+            arg = parts[1].strip() if len(parts) > 1 else ""
+            if sub in {"status", "state", "状态"}:
+                campaign = await asyncio.to_thread(self.storage.campaign_for_session, session_id)
+                if not campaign:
+                    yield event.plain_result("当前会话尚未绑定战役。请在管理页“战役状态”中创建，或使用 /tavern campaign use <战役ID或名称>。")
+                    return
+                text = {
+                    "id": campaign.get("id"), "name": campaign.get("name"),
+                    "world_id": campaign.get("world_id"), "ruleset_id": campaign.get("ruleset_id"),
+                    "state": campaign.get("state_data", {}),
+                }
+                event.set_extra("_kt_force_long_delivery", True)
+                yield event.plain_result(json.dumps(text, ensure_ascii=False, indent=2))
+                return
+            if sub == "list":
+                campaigns = await asyncio.to_thread(self.storage.list_campaigns, False)
+                lines = ["可用战役："] + [f"- {item['id']}：{item['name']}（{len(item.get('session_ids', []))} 个会话）" for item in campaigns]
+                yield event.plain_result("\n".join(lines) if campaigns else "还没有可用战役，请先在管理页创建。")
+                return
+            if sub in {"packs", "pack", "整合包"}:
+                packs = await asyncio.to_thread(self.storage.list_rp_packs)
+                lines = ["可用 RP 整合包："] + [f"- {item['id']}：{item['name']}" for item in packs]
+                yield event.plain_result("\n".join(lines) if packs else "还没有 RP 整合包，可在“当前游戏”页从现有战役创建。")
+                return
+            if sub in {"new", "新游戏"}:
+                packs = await asyncio.to_thread(self.storage.list_rp_packs)
+                target = next((item for item in packs if str(item.get("id")) == arg), None)
+                if not target:
+                    matches = [item for item in packs if arg and arg.lower() in str(item.get("name", "")).lower()]
+                    target = matches[0] if len(matches) == 1 else None
+                if not target:
+                    yield event.plain_result("找不到唯一匹配的整合包。请使用 /tv game packs 查看。")
+                    return
+                result = await self.service.start_new_game(pack_id=str(target["id"]), session_id=session_id)
+                yield event.plain_result(f"新游戏“{result['campaign']['name']}”已建立并绑定；旧战役已归档，AstrBot 已切换到新的 conversation。")
+                return
+            if sub in {"restart", "重开"}:
+                campaign = await asyncio.to_thread(self.storage.campaign_for_session, session_id)
+                pack_id = str((campaign or {}).get("settings", {}).get("rp_pack_id", ""))
+                if not campaign or not pack_id:
+                    yield event.plain_result("当前战役没有关联 RP 整合包，请先在“当前游戏”页保存整合包。")
+                    return
+                if arg.lower() not in {"confirm", "确认"}:
+                    yield event.plain_result("这会归档当前战役并新建 AstrBot conversation。确认请发送：/tv game restart confirm")
+                    return
+                result = await self.service.start_new_game(pack_id=pack_id, session_id=session_id)
+                yield event.plain_result(f"已从整合包重开“{result['campaign']['name']}”；旧档仍可恢复。")
+                return
+            if sub in {"save", "保存"}:
+                campaign = await asyncio.to_thread(self.storage.campaign_for_session, session_id)
+                yield event.plain_result("当前战役状态已实时保存。" if campaign else "当前会话没有绑定战役。")
+                return
+            if sub in {"use", "switch", "切换"}:
+                campaigns = await asyncio.to_thread(self.storage.list_campaigns, False)
+                target = next((item for item in campaigns if str(item.get("id")) == arg), None)
+                if not target:
+                    matches = [item for item in campaigns if arg.lower() in str(item.get("name", "")).lower()]
+                    target = matches[0] if len(matches) == 1 else None
+                if not target:
+                    yield event.plain_result("找不到唯一匹配的战役。请使用 /tavern campaign list 查看 ID。")
+                    return
+                await asyncio.to_thread(self.storage.bind_campaign_session, str(target["id"]), session_id)
+                yield event.plain_result(f"当前会话已进入战役“{target['name']}”。后续将使用该战役的状态和长期记忆。")
+                return
+            if sub in {"leave", "unbind", "退出"}:
+                await asyncio.to_thread(self.storage.unbind_campaign_session, session_id)
+                yield event.plain_result("当前会话已退出战役；战役数据本身仍然保留。")
+                return
+            yield event.plain_result("用法：/tv game status|list|packs|new <整合包>|restart confirm|use <战役>|save|leave")
+            return
+        if action in {"state", "状态"}:
+            parts = rest.strip().split(" ", 1)
+            sub = parts[0].lower() if parts and parts[0] else "show"
+            arg = parts[1].strip() if len(parts) > 1 else ""
+            campaign = await asyncio.to_thread(self.storage.campaign_for_session, session_id)
+            if not campaign:
+                yield event.plain_result("当前会话没有绑定战役。")
+                return
+            changes = await asyncio.to_thread(self.storage.list_campaign_state_changes, str(campaign["id"]), None, 200)
+            if sub in {"show", "status", "查看"}:
+                event.set_extra("_kt_force_long_delivery", True)
+                yield event.plain_result(json.dumps(campaign.get("state_data", {}), ensure_ascii=False, indent=2))
+                return
+            if sub in {"approve", "apply", "确认"}:
+                pending = [item for item in changes if item.get("status") == "pending"]
+                targets = pending if arg in {"all", "全部"} else [item for item in pending if item.get("id") == arg]
+                if not targets:
+                    yield event.plain_result("找不到待确认变更。使用管理页查看完整补丁 ID。")
+                    return
+                for change in reversed(targets):
+                    before = campaign.get("state_data", {})
+                    campaign["state_data"] = self.service._apply_state_patch(before, change.get("patch", []))
+                    await asyncio.to_thread(self.storage.save_campaign, campaign)
+                    await asyncio.to_thread(self.storage.set_campaign_state_change_status, str(change["id"]), "applied", before_state=before, after_state=campaign["state_data"])
+                yield event.plain_result(f"已应用 {len(targets)} 条状态变更。")
+                return
+            if sub in {"undo", "撤销"}:
+                applied = next((item for item in changes if item.get("status") == "applied"), None)
+                if not applied:
+                    yield event.plain_result("没有可撤销的已应用状态变更。")
+                    return
+                campaign["state_data"] = applied.get("before_state", {})
+                await asyncio.to_thread(self.storage.save_campaign, campaign)
+                await asyncio.to_thread(self.storage.set_campaign_state_change_status, str(applied["id"]), "reverted")
+                yield event.plain_result("已撤销最近一次状态变更。")
+                return
+            yield event.plain_result("用法：/tv state show|approve <变更ID|all>|undo")
             return
         if action == "retrieval":
             parts = rest.strip().split(" ", 1)

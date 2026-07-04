@@ -42,6 +42,272 @@ def entry(uid, keys, content, **extra):
     return {"uid": uid, "key": keys, "content": content, **extra}
 
 
+class CampaignStateTests(unittest.TestCase):
+    def test_auxiliary_llm_uses_astrbot_fallback_order(self):
+        calls = []
+
+        class Provider:
+            def __init__(self, provider_id, error=None):
+                self.provider_config = {"id": provider_id}
+                self.error = error
+
+            async def text_chat(self, **kwargs):
+                calls.append((self.provider_config["id"], kwargs["prompt"]))
+                if self.error:
+                    raise RuntimeError(self.error)
+                return type("Response", (), {"role": "assistant", "completion_text": "ok"})()
+
+        providers = {
+            "primary": Provider("primary", "expired"),
+            "fallback-1": Provider("fallback-1", "busy"),
+            "fallback-2": Provider("fallback-2"),
+        }
+
+        class Context:
+            @staticmethod
+            def get_config(umo=None):
+                self.assertEqual(umo, "session-1")
+                return {"provider_settings": {
+                    "fallback_chat_models": ["primary", "fallback-1", "fallback-2"]
+                }}
+
+            @staticmethod
+            def get_provider_by_id(provider_id):
+                return providers.get(provider_id)
+
+        service = TavernService(object(), Context(), {})
+        response, provider_id = run(service._text_chat_with_fallback(
+            session_id="session-1", provider=providers["primary"], prompt="state",
+        ))
+        self.assertEqual(response.completion_text, "ok")
+        self.assertEqual(provider_id, "fallback-2")
+        self.assertEqual(calls, [
+            ("primary", "state"), ("fallback-1", "state"), ("fallback-2", "state"),
+        ])
+
+    def test_astrbot_reset_or_new_starts_a_new_story_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = TavernStorage(Path(tmp) / "tavern.db")
+            node_id = storage.create_story_node({
+                "session_id": "s1", "assistant_text": "The old scene ends here.",
+            })
+            service = TavernService(storage, object(), {})
+            state = {"current_story_node_id": node_id, "astrbot_conversation_id": "conv-old"}
+            self.assertFalse(run(service._conversation_boundary_changed(
+                state=state,
+                messages=[{"role": "assistant", "content": "The old scene ends here."}],
+                conversation_id="conv-old",
+            )))
+            self.assertTrue(run(service._conversation_boundary_changed(
+                state=state, messages=[], conversation_id="conv-old",
+            )))
+            self.assertTrue(run(service._conversation_boundary_changed(
+                state=state,
+                messages=[{"role": "assistant", "content": "The old scene ends here."}],
+                conversation_id="conv-new",
+            )))
+            fresh = service._fresh_conversation_state("conv-new")
+            self.assertEqual(fresh["turn"], 0)
+            self.assertTrue(fresh["archive_new_root"])
+            self.assertNotIn("current_story_node_id", fresh)
+
+    def test_story_summaries_expose_history_fingerprints_for_legacy_reset_detection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = TavernStorage(Path(tmp) / "tavern.db")
+            parent_id = storage.create_story_node({
+                "session_id": "s1", "assistant_text": "Previous reply",
+            })
+            storage.create_story_node({
+                "session_id": "s1", "parent_id": parent_id,
+                "request_messages": [{"role": "assistant", "content": "Previous reply"}],
+                "assistant_text": "Current reply",
+            })
+            nodes = storage.list_story_nodes("s1")
+            parent = next(item for item in nodes if item["id"] == parent_id)
+            child = next(item for item in nodes if item["parent_id"] == parent_id)
+            self.assertIn(parent["assistant_fingerprint"], child["history_assistant_fingerprints"])
+            self.assertTrue(child["parent_history_continuous"])
+
+            disconnected_id = storage.create_story_node({
+                "session_id": "s1", "parent_id": child["id"],
+                "request_messages": [{"role": "user", "content": "new topic"}],
+                "assistant_text": "A fresh conversation",
+            })
+            disconnected = next(item for item in storage.list_story_nodes("s1") if item["id"] == disconnected_id)
+            self.assertFalse(disconnected["parent_history_continuous"])
+
+    def test_campaign_state_is_injected_even_when_preset_has_no_memory_block(self):
+        builder = PromptBuilder()
+        result = builder.build(
+            original_system="", contexts=[], current_prompt="continue",
+            preset={"main_prompt": "base", "blocks": [{"identifier": "main", "name": "Main"}]},
+            character=None, persona="", lore=ScanResult(), values={},
+            campaign_context="[当前权威状态]\n{\"ammo\": 4}",
+        )
+        campaign_block = next(block for block in result.blocks if block.identifier == "campaign")
+        self.assertIn('"ammo": 4', campaign_block.content)
+        self.assertIn('"ammo": 4', result.messages[0]["content"])
+
+    def test_campaign_can_span_sessions_and_resolve_world_ruleset_scopes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = TavernStorage(Path(tmp) / "tavern.db")
+            campaign_id = storage.save_campaign({
+                "name": "Rain City", "world_id": "rain-world", "ruleset_id": "survival",
+                "state_data": {"inventory": [{"name": "water", "count": 2}]},
+            })
+            self.assertTrue(storage.bind_campaign_session(campaign_id, "session-a"))
+            self.assertTrue(storage.bind_campaign_session(campaign_id, "session-b"))
+            self.assertEqual(storage.campaign_for_session("session-b")["id"], campaign_id)
+
+            class Event:
+                unified_msg_origin = "session-b"
+                def get_sender_id(self): return "user-1"
+                def get_group_id(self): return "group-1"
+
+            scopes = TavernService(storage, object(), {}).scopes(Event(), None)
+            self.assertIn(("campaign", campaign_id), scopes)
+            self.assertIn(("world", "rain-world"), scopes)
+            self.assertIn(("ruleset", "survival"), scopes)
+
+    def test_campaign_state_patch_is_deterministic_and_auditable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = TavernStorage(Path(tmp) / "tavern.db")
+            campaign_id = storage.save_campaign({"name": "Test", "state_data": {"ammo": 5, "clues": []}})
+            before = storage.get_campaign(campaign_id)["state_data"]
+            patch_data = [
+                {"op": "increment", "path": "ammo", "value": -1},
+                {"op": "append", "path": "clues", "value": "red door"},
+            ]
+            after = TavernService._apply_state_patch(before, patch_data)
+            self.assertEqual(after, {"ammo": 4, "clues": ["red door"]})
+            change_id = storage.put_campaign_state_change({
+                "campaign_id": campaign_id, "story_node_id": "node-1",
+                "patch": patch_data, "before_state": before, "after_state": after,
+            })
+            self.assertEqual(storage.list_campaign_state_changes(campaign_id)[0]["status"], "pending")
+            storage.set_campaign_state_change_status(change_id, "applied", before_state=before, after_state=after)
+            self.assertEqual(storage.applied_campaign_state_for_story_node("node-1"), after)
+
+    def test_rp_pack_starts_new_game_and_cleans_session_overrides(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = TavernStorage(Path(tmp) / "tavern.db")
+            preset_id = storage.put_document("preset", "Preset", {"main_prompt": "base"})
+            lore_id = storage.put_document("lorebook", "World", {"entries": []})
+            old_campaign_id = storage.save_campaign({"name": "Old", "state_data": {"points": 12}})
+            storage.bind_campaign_session(old_campaign_id, "session-1")
+            storage.bind("campaign", old_campaign_id, "preset", preset_id, 0)
+            storage.bind("campaign", old_campaign_id, "lorebook", lore_id, 0)
+            storage.bind("session", "session-1", "preset", "stale-session-preset", 0)
+            pack = TavernService(storage, object(), {}).create_pack_from_campaign(old_campaign_id, "Survival Pack")
+
+            class ConversationManager:
+                def __init__(self):
+                    self.created = []
+                async def new_conversation(self, session_id, platform_id=None):
+                    self.created.append((session_id, platform_id))
+                    return "conv-new"
+
+            class Context:
+                conversation_manager = ConversationManager()
+
+            result = run(TavernService(storage, Context(), {}).start_new_game(
+                pack_id=pack["id"], session_id="session-1", name="Fresh Run",
+            ))
+            new_campaign = result["campaign"]
+            self.assertEqual(result["conversation_id"], "conv-new")
+            self.assertEqual(storage.get_campaign(old_campaign_id)["archived"], True)
+            self.assertEqual(storage.campaign_for_session("session-1")["id"], new_campaign["id"])
+            self.assertEqual(new_campaign["name"], "Fresh Run")
+            self.assertEqual(new_campaign["state_data"], {"points": 12})
+            self.assertEqual(storage.get_session("session-1")["turn"], 0)
+            self.assertFalse(storage.list_bindings(scope_type="session", scope_id="session-1"))
+            copied = storage.list_bindings(scope_type="campaign", scope_id=new_campaign["id"])
+            self.assertEqual({item["kind"]: item["target_id"] for item in copied}, {
+                "preset": preset_id,
+                "lorebook": lore_id,
+            })
+            self.assertEqual(Context.conversation_manager.created, [("session-1", None)])
+
+    def test_web_play_turn_generates_and_archives_story_node(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = TavernStorage(Path(tmp) / "tavern.db")
+            preset_id = storage.put_document("preset", "Preset", {"main_prompt": "{{original_system}}"})
+            storage.bind("global", "*", "preset", preset_id, 0)
+            campaign_id = storage.save_campaign({"name": "Web Run", "state_data": {"location": "门厅"}})
+            storage.bind_campaign_session(campaign_id, "session-web")
+
+            class Provider:
+                provider_config = {"id": "web-provider"}
+                def __init__(self):
+                    self.calls = []
+                async def text_chat(self, **kwargs):
+                    self.calls.append(kwargs)
+                    return type("Response", (), {"completion_text": "门轴轻响，房间里有人屏住了呼吸。"})()
+
+            class Context:
+                def __init__(self, provider):
+                    self.provider = provider
+                def get_using_provider(self, _session_id):
+                    return self.provider
+                def get_config(self, umo=None):
+                    return {}
+                def get_provider_by_id(self, _provider_id):
+                    return None
+
+            provider = Provider()
+            service = TavernService(storage, Context(provider), {"memory_enabled": False})
+            result = run(service.play_web_turn(session_id="session-web", prompt="我推开门。"))
+            self.assertEqual(result["provider_id"], "web-provider")
+            self.assertIn("门轴轻响", result["reply"])
+            self.assertTrue(result["node_id"])
+            node = storage.get_story_node(result["node_id"])
+            self.assertEqual(node["session_id"], "session-web")
+            self.assertIn("我推开门", json.dumps(node["request_messages"], ensure_ascii=False))
+            self.assertEqual(storage.get_session("session-web")["current_story_node_id"], result["node_id"])
+            self.assertTrue(provider.calls)
+            self.assertIn("messages", provider.calls[0])
+            self.assertNotIn("prompt", provider.calls[0])
+            self.assertTrue(any(item["role"] == "user" and "我推开门" in item["content"] for item in provider.calls[0]["messages"]))
+
+    def test_web_chat_completion_falls_back_for_legacy_prompt_providers(self):
+        calls = []
+
+        class Provider:
+            provider_config = {"id": "legacy-provider"}
+            async def text_chat(self, **kwargs):
+                calls.append(kwargs)
+                if "messages" in kwargs:
+                    raise TypeError("messages is not supported")
+                return type("Response", (), {"completion_text": "ok"})()
+
+        class Context:
+            @staticmethod
+            def get_using_provider(_session_id):
+                return Provider()
+            @staticmethod
+            def get_config(umo=None):
+                return {}
+            @staticmethod
+            def get_provider_by_id(_provider_id):
+                return None
+
+        service = TavernService(object(), Context(), {})
+        response, provider_id = run(service._chat_completion_with_fallback(
+            session_id="session-web",
+            messages=[
+                {"role": "system", "content": "rules"},
+                {"role": "assistant", "content": "previous"},
+                {"role": "user", "content": "continue"},
+            ],
+        ))
+        self.assertEqual(response.completion_text, "ok")
+        self.assertEqual(provider_id, "legacy-provider")
+        self.assertIn("messages", calls[0])
+        self.assertEqual(calls[1]["prompt"], "continue")
+        self.assertEqual(calls[1]["contexts"], [{"role": "assistant", "content": "previous"}])
+        self.assertEqual(calls[1]["system_prompt"], "rules")
+
+
 class ExportTests(unittest.TestCase):
     @staticmethod
     def read_zip(content):

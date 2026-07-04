@@ -8,6 +8,7 @@ import random
 import json
 import time
 from collections import OrderedDict
+from types import SimpleNamespace
 from typing import Any
 
 from astrbot.api import logger
@@ -37,6 +38,60 @@ DEFAULT_SUMMARY_PROMPT = """请把以下旧聊天记录压缩成可供后续角�
 新增旧聊天记录：
 {history}
 """
+
+DEFAULT_CAMPAIGN_STATE_PROMPT = """你是角色扮演战役的状态记录员。根据本轮玩家输入与叙事结果，提出对当前结构化状态的最小修改。
+只记录文本明确发生的变化；不要把计划、猜测、选项或修辞当成事实。不要自行补全数值。
+仅输出 JSON 对象：{"patch":[{"op":"set|delete|increment|append|remove","path":"点号分隔路径","value":任意JSON值}],"reason":"简短依据"}。
+若没有可靠变化，输出 {"patch":[],"reason":""}。
+
+状态字段说明：
+{schema}
+
+当前状态：
+{state}
+
+玩家输入：
+{user}
+
+叙事结果：
+{assistant}
+"""
+
+STATE_TEMPLATES: dict[str, dict[str, Any]] = {
+    "survival": {
+        "name": "生存探索",
+        "schema": {
+            "time": "日期、时间与天气", "location": "当前精确位置",
+            "condition": "体力、饥渴、伤势与感染", "system": "积分与等级",
+            "resources": "食物、水、燃料、弹药、药品与建材的准确数量",
+            "key_items": "钥匙、文件、图纸和任务道具", "equipment": "武器、护具与工具",
+            "quests": "active/completed/failed/warnings", "base": "据点设施与安全状态",
+            "clues": "已经确认的情报", "relationships": "NPC关系、信任与承诺",
+        },
+        "state": {
+            "time": {"day": "开局", "clock": "未知", "weather": "未知"}, "location": "开局地点",
+            "condition": {"stamina_percent": 100, "hunger": "正常", "thirst": "正常", "injuries": [], "infection": "无"},
+            "system": {"points": 0, "level": 1}, "resources": {}, "key_items": [], "equipment": [],
+            "quests": {"active": [], "completed": [], "failed": [], "warnings": []},
+            "base": None, "clues": [], "relationships": {},
+        },
+    },
+    "light": {
+        "name": "轻量叙事",
+        "schema": {"time": "当前时间", "location": "当前位置", "quests": "目标与未解决事项", "clues": "确认事实", "relationships": "人物关系"},
+        "state": {"time": "开局", "location": "开局地点", "quests": {"active": [], "completed": []}, "clues": [], "relationships": {}},
+    },
+    "trpg": {
+        "name": "TRPG",
+        "schema": {"scene": "当前场景", "attributes": "角色属性", "hp": "生命值", "mp": "资源值", "effects": "持续效果", "inventory": "物品", "quests": "任务", "clues": "线索"},
+        "state": {"scene": "开场", "attributes": {}, "hp": {"current": 100, "max": 100}, "mp": {"current": 0, "max": 0}, "effects": [], "inventory": [], "quests": [], "clues": []},
+    },
+    "relationship": {
+        "name": "关系叙事",
+        "schema": {"time": "时间", "location": "地点", "mood": "当前情绪", "relationships": "关系阶段、信任与承诺", "events": "关键事件", "open_threads": "未解决事项"},
+        "state": {"time": "开局", "location": "开局地点", "mood": {}, "relationships": {}, "events": [], "open_threads": []},
+    },
+}
 
 DEFAULT_QUICK_REPLIES = [
     {"id": "default-continue", "label": "继续剧情", "alias": "continue", "content": "继续上一条助手回复，从中断处自然衔接。推进当前场景，避免复述已有内容，也不要替用户决定行动或台词。", "mode": "continue", "enabled": True, "append_input": True, "order": 10},
@@ -128,10 +183,30 @@ class TavernService:
         payload["assistant_payload"] = assistant_payload or {}
         async with self._session_lock(session_id):
             state = await asyncio.to_thread(self.storage.get_session, session_id)
-            payload["state_snapshot"] = copy.deepcopy(state)
+            campaign = await asyncio.to_thread(self.storage.campaign_for_session, session_id)
+            payload["state_snapshot"] = dict(
+                copy.deepcopy(state),
+                **({"_campaign_state": copy.deepcopy(campaign.get("state_data", {}))} if campaign else {}),
+            )
             node_id = await asyncio.to_thread(self.storage.create_story_node, payload)
             state["current_story_node_id"] = node_id
+            state.pop("archive_new_root", None)
             await asyncio.to_thread(self.storage.save_session, session_id, state)
+            if campaign:
+                messages = payload.get("request_messages", [])
+                user_text = ""
+                for message in reversed(messages if isinstance(messages, list) else []):
+                    if isinstance(message, dict) and message.get("role") == "user":
+                        user_text = self._message_text(message)
+                        break
+                try:
+                    await self._extract_campaign_state_change(
+                        campaign=campaign, session_id=session_id,
+                        turn=int(state.get("turn", 0) or 0), user_text=user_text,
+                        assistant_text=assistant_text, story_node_id=node_id,
+                    )
+                except Exception as exc:
+                    logger.warning("%s 战役状态提取失败，已跳过本轮: %s", PLUGIN_TAG, exc)
         return node_id
 
     def ensure_defaults(self) -> None:
@@ -161,22 +236,153 @@ class TavernService:
             )
             self.storage.bind("global", "*", "quick_reply", document_id)
 
-    @staticmethod
-    def scopes(event: Any, req: Any) -> list[tuple[str, str]]:
+    def create_pack_from_campaign(self, campaign_id: str, name: str = "") -> dict[str, Any]:
+        campaign = self.storage.get_campaign(campaign_id)
+        if not campaign:
+            raise ValueError("找不到战役")
+        bindings = self.storage.list_bindings(scope_type="campaign", scope_id=campaign_id)
+        single: dict[str, str] = {}
+        additive: dict[str, list[str]] = {"lorebook": [], "material": [], "quick_reply": []}
+        for binding in bindings:
+            kind, target_id = str(binding.get("kind", "")), str(binding.get("target_id", ""))
+            if kind in additive:
+                additive[kind].append(target_id)
+            elif kind in {"character", "character_group", "preset", "persona"}:
+                single[kind] = target_id
+        settings = copy.deepcopy(campaign.get("settings", {}))
+        settings.setdefault("state_apply_mode", "tiered")
+        payload = {
+            "world_id": campaign.get("world_id", ""), "ruleset_id": campaign.get("ruleset_id", ""),
+            "campaign_description": campaign.get("description", ""), "rule_prompt": campaign.get("rule_prompt", ""),
+            "state_template": str(settings.get("state_template", "custom")),
+            "state_schema": copy.deepcopy(campaign.get("state_schema", {})),
+            "initial_state": copy.deepcopy(campaign.get("state_data", {})),
+            "campaign_settings": settings, "single_bindings": single, "additive_bindings": additive,
+            "recommended_config": {
+                "history_max_messages": 24, "summary_trigger_messages": 36,
+                "memory_extract_interval": 8, "memory_extract_mode": "pending",
+            },
+        }
+        pack_id = self.storage.save_rp_pack({
+            "name": name or str(campaign.get("name") or "RP 整合包"),
+            "description": str(campaign.get("description", "")), "payload": payload,
+        })
+        return self.storage.get_rp_pack(pack_id) or {}
+
+    async def start_new_game(
+        self, *, pack_id: str, session_id: str, name: str = "",
+        template_id: str = "", archive_current: bool = True,
+        conversation_mode: str = "new",
+    ) -> dict[str, Any]:
+        pack = await asyncio.to_thread(self.storage.get_rp_pack, pack_id)
+        if not pack:
+            raise ValueError("找不到 RP 整合包")
+        payload = pack.get("payload", {}) if isinstance(pack.get("payload"), dict) else {}
+        current = await asyncio.to_thread(self.storage.campaign_for_session, session_id)
+        if current and archive_current:
+            current["archived"] = True
+            await asyncio.to_thread(self.storage.save_campaign, current)
+        template = STATE_TEMPLATES.get(template_id or str(payload.get("state_template", "")))
+        state_schema = copy.deepcopy(payload.get("state_schema", {}))
+        initial_state = copy.deepcopy(payload.get("initial_state", {}))
+        if template_id and template:
+            state_schema, initial_state = copy.deepcopy(template["schema"]), copy.deepcopy(template["state"])
+        settings = copy.deepcopy(payload.get("campaign_settings", {}))
+        settings["rp_pack_id"] = pack_id
+        settings["state_template"] = template_id or str(payload.get("state_template", "custom"))
+        settings.setdefault("state_tracking_enabled", True)
+        settings.setdefault("state_extract_interval", 1)
+        settings.setdefault("state_apply_mode", "tiered")
+        campaign_id = await asyncio.to_thread(self.storage.save_campaign, {
+            "name": name or str(pack.get("name") or "新游戏"),
+            "world_id": str(payload.get("world_id", "")), "ruleset_id": str(payload.get("ruleset_id", "")),
+            "description": str(payload.get("campaign_description", pack.get("description", ""))),
+            "rule_prompt": str(payload.get("rule_prompt", "")),
+            "state_schema": state_schema, "state_data": initial_state, "settings": settings,
+        })
+        for kind, target_id in (payload.get("single_bindings", {}) or {}).items():
+            if target_id:
+                await asyncio.to_thread(self.storage.bind, "campaign", campaign_id, str(kind), str(target_id), 0)
+        for kind, target_ids in (payload.get("additive_bindings", {}) or {}).items():
+            for target_id in target_ids if isinstance(target_ids, list) else []:
+                await asyncio.to_thread(self.storage.bind, "campaign", campaign_id, str(kind), str(target_id), 0)
+        for binding in await asyncio.to_thread(self.storage.list_bindings, scope_type="session", scope_id=session_id):
+            if str(binding.get("kind")) in {"character", "character_group", "preset", "persona", "lorebook", "material", "quick_reply"}:
+                await asyncio.to_thread(
+                    self.storage.unbind, str(binding["scope_type"]), str(binding["scope_id"]), str(binding["kind"]), str(binding["target_id"])
+                )
+        await asyncio.to_thread(self.storage.bind_campaign_session, campaign_id, session_id)
+        await self.reset_session(session_id)
+        conversation_id = ""
+        manager = getattr(self.context, "conversation_manager", None)
+        if manager is not None:
+            if conversation_mode == "clear":
+                conversation_id = str(await manager.get_curr_conversation_id(session_id) or "")
+                if conversation_id:
+                    await manager.update_conversation(session_id, conversation_id, [])
+            else:
+                platform_id = session_id.split(":", 1)[0] if ":" in session_id else None
+                conversation_id = str(await manager.new_conversation(session_id, platform_id=platform_id))
+        return {
+            "campaign": await asyncio.to_thread(self.storage.get_campaign, campaign_id),
+            "pack": pack, "conversation_id": conversation_id,
+            "archived_campaign_id": str((current or {}).get("id", "")),
+        }
+
+    def analyze_worldbook(self, document_id: str) -> dict[str, Any]:
+        document = self.storage.get_document(document_id)
+        if not document or document.get("kind") != "lorebook":
+            raise ValueError("找不到世界书")
+        entries = normalize_entries(document.get("data", {}), kind="lorebook")
+        issues: list[dict[str, Any]] = []
+        seen: dict[str, str] = {}
+        broad = {"任务", "物资", "事件", "地点", "区域", "系统", "状态", "角色", "危险", "积分", "据点", "基地"}
+        for entry in entries:
+            label = entry.comment or entry.uid
+            keys = list(entry.keys)
+            joined = [key for key in keys if any(mark in key for mark in ("、", "，", ";", "；"))]
+            if joined:
+                issues.append({"level": "error", "entry": label, "code": "joined_keywords", "message": "关键词被中文标点连成一个词", "values": joined})
+            if not entry.constant and not keys and not entry.vectorized:
+                issues.append({"level": "error", "entry": label, "code": "unreachable", "message": "非常驻、无关键词且未向量化，条目不会命中"})
+            if entry.constant and len(entry.content) > 1200:
+                issues.append({"level": "warning", "entry": label, "code": "large_constant", "message": f"常驻内容较大（{len(entry.content)}字），建议按需触发"})
+            if not entry.constant and len(entry.content) > 800 and not entry.vectorized:
+                issues.append({"level": "info", "entry": label, "code": "vector_candidate", "message": "长条目建议开启向量化"})
+            for key in keys:
+                normalized = key.strip().lower()
+                if normalized in broad:
+                    issues.append({"level": "warning", "entry": label, "code": "broad_keyword", "message": f"关键词“{key}”可能频繁误触发"})
+                if normalized in seen and seen[normalized] != label:
+                    issues.append({"level": "warning", "entry": label, "code": "duplicate_keyword", "message": f"关键词“{key}”也用于“{seen[normalized]}”"})
+                seen[normalized] = label
+        return {"document_id": document_id, "name": document.get("name", ""), "entry_count": len(entries), "issues": issues}
+
+    def scopes(self, event: Any, req: Any) -> list[tuple[str, str]]:
         result = [("global", "*")]
+        get_extra = getattr(event, "get_extra", lambda _key: None)
         for scope_type, value in (
             ("session", getattr(event, "unified_msg_origin", "")),
+            ("conversation", str(get_extra("_kt_astrbot_conversation_id") or "")),
             ("user", str(event.get_sender_id() or "")),
             ("group", str(event.get_group_id() or "")),
             ("persona", str(getattr(getattr(req, "conversation", None), "persona_id", "") or "")),
         ):
             if value:
                 result.append((scope_type, value))
+        session_id = str(getattr(event, "unified_msg_origin", "") or getattr(req, "session_id", "") or "")
+        campaign = self.storage.campaign_for_session(session_id) if session_id else None
+        if campaign:
+            if campaign.get("world_id"):
+                result.append(("world", str(campaign["world_id"])))
+            if campaign.get("ruleset_id"):
+                result.append(("ruleset", str(campaign["ruleset_id"])))
+            result.append(("campaign", str(campaign["id"])))
         return result
 
     def _bound_one(self, kind: str, scopes: list[tuple[str, str]]) -> dict[str, Any] | None:
         by_type = {scope_type: (scope_type, scope_id) for scope_type, scope_id in scopes}
-        for scope_type in ("session", "persona", "user", "group", "global"):
+        for scope_type in ("session", "campaign", "ruleset", "world", "persona", "user", "group", "global"):
             scope = by_type.get(scope_type)
             if not scope:
                 continue
@@ -557,8 +763,9 @@ class TavernService:
             if not query:
                 return "", []
             candidates: list[dict[str, Any]] = []
+            has_conversation_scope = any(scope_type == "conversation" for scope_type, _ in scopes)
             for scope_type, scope_id in scopes:
-                candidates.extend(await asyncio.to_thread(
+                scoped = await asyncio.to_thread(
                     self.storage.list_memories,
                     scope_type=scope_type,
                     scope_id=scope_id,
@@ -566,7 +773,10 @@ class TavernService:
                     status="active",
                     include_expired=False,
                     limit=500,
-                ))
+                )
+                if scope_type == "session" and has_conversation_scope:
+                    scoped = [item for item in scoped if item.get("source_type") != "auto_extract"]
+                candidates.extend(scoped)
             seen: set[str] = set()
             scored: list[tuple[float, dict[str, Any]]] = []
             for item in candidates:
@@ -607,6 +817,154 @@ class TavernService:
         if provider is None:
             raise RuntimeError("当前会话没有可用的记忆 Provider")
         return provider, str(getattr(provider, "provider_config", {}).get("id", "current"))
+
+    async def _text_chat_with_fallback(
+        self, *, session_id: str, provider: Any, **kwargs: Any,
+    ) -> tuple[Any, str]:
+        """Call an auxiliary model using AstrBot's ordered fallback list."""
+        candidates: list[tuple[Any, str]] = []
+        seen: set[str] = set()
+
+        def build_call_variants() -> list[dict[str, Any]]:
+            variants: list[dict[str, Any]] = []
+            passthrough = {
+                key: value for key, value in kwargs.items()
+                if key not in {"messages", "prompt", "contexts", "system_prompt"}
+            }
+            if "messages" in kwargs:
+                normalized = [
+                    item for item in (
+                        self._normalize_message(item) for item in list(kwargs.get("messages") or [])
+                    )
+                    if item is not None
+                ]
+                if normalized:
+                    variants.append({**passthrough, "contexts": normalized})
+            else:
+                messages: list[dict[str, Any]] = []
+                system_prompt = str(kwargs.get("system_prompt", "") or "").strip()
+                if system_prompt:
+                    messages.append({"role": "system", "content": system_prompt})
+                messages.extend(self._normalize_messages(list(kwargs.get("contexts") or [])))
+                prompt = str(kwargs.get("prompt", "") or "")
+                if prompt:
+                    messages.append({"role": "user", "content": prompt})
+                if messages:
+                    variants.append({**passthrough, "contexts": messages})
+            original = dict(kwargs)
+            if not variants or all(variant != original for variant in variants):
+                variants.append(original)
+            return variants
+
+        def add_candidate(candidate: Any, candidate_id: str = "") -> None:
+            if candidate is None:
+                return
+            resolved_id = candidate_id or str(
+                getattr(candidate, "provider_config", {}).get("id", "")
+            )
+            identity = resolved_id or f"object:{id(candidate)}"
+            if identity in seen:
+                return
+            seen.add(identity)
+            candidates.append((candidate, resolved_id or "current"))
+
+        add_candidate(provider)
+        try:
+            astrbot_config = self.context.get_config(umo=session_id)
+            provider_settings = astrbot_config.get("provider_settings", {})
+            fallback_ids = provider_settings.get("fallback_chat_models", [])
+            if isinstance(fallback_ids, list):
+                for fallback_id in fallback_ids:
+                    if isinstance(fallback_id, str) and fallback_id:
+                        add_candidate(
+                            self.context.get_provider_by_id(fallback_id), fallback_id
+                        )
+        except Exception as exc:
+            logger.debug("%s 读取 AstrBot 备用 Provider 列表失败: %s", PLUGIN_TAG, exc)
+
+        call_variants = build_call_variants()
+        last_error: Exception | None = None
+        previous_id = candidates[0][1] if candidates else "current"
+        for index, (candidate, candidate_id) in enumerate(candidates):
+            if index:
+                logger.warning(
+                    "%s 辅助模型从 %s 切换到备用 Provider: %s",
+                    PLUGIN_TAG, previous_id, candidate_id,
+                )
+            candidate_error: Exception | None = None
+            for call_kwargs in call_variants:
+                try:
+                    response = await candidate.text_chat(**call_kwargs)
+                    if str(getattr(response, "role", "")) == "err":
+                        raise RuntimeError(
+                            str(getattr(response, "completion_text", "") or "Provider 返回错误响应")
+                        )
+                    return response, candidate_id
+                except Exception as exc:
+                    candidate_error = exc
+                    last_error = exc
+                    logger.debug(
+                        "%s 辅助模型 Provider %s 调用形式 %s 失败: %s",
+                        PLUGIN_TAG, candidate_id,
+                        "contexts" if "contexts" in call_kwargs else "prompt", exc,
+                    )
+            if candidate_error:
+                logger.warning(
+                    "%s 辅助模型 Provider %s 调用失败: %s",
+                    PLUGIN_TAG, candidate_id, candidate_error,
+                )
+            previous_id = candidate_id
+        if last_error:
+            raise last_error
+        raise RuntimeError("没有可用的辅助模型 Provider")
+
+    @staticmethod
+    def _messages_as_transcript(messages: list[dict[str, Any]]) -> str:
+        lines: list[str] = []
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            role = str(message.get("role", "unknown") or "unknown").upper()
+            content = TavernService._message_text(message).strip()
+            if content:
+                lines.append(f"{role}: {content}")
+        return "\n\n".join(lines)
+
+    async def _chat_completion_with_fallback(
+        self, *, session_id: str, messages: list[dict[str, Any]], provider: Any | None = None,
+    ) -> tuple[Any, str]:
+        provider = provider or self.context.get_using_provider(session_id)
+        if provider is None:
+            raise RuntimeError("当前会话没有可用的聊天 Provider")
+        normalized = [item for item in (self._normalize_message(item) for item in messages) if item is not None]
+        if not normalized:
+            raise ValueError("聊天请求 messages[] 为空。")
+        system_prompt = "\n\n".join(
+            self._message_text(item) for item in normalized if item.get("role") == "system"
+        ).strip()
+        chat_messages = [item for item in normalized if item.get("role") != "system"]
+        current_prompt = ""
+        contexts = list(chat_messages)
+        if contexts and contexts[-1].get("role") == "user":
+            current_prompt = self._message_text(contexts[-1])
+            contexts = contexts[:-1]
+        transcript = self._messages_as_transcript(normalized)
+        if not current_prompt:
+            current_prompt = transcript
+        try:
+            return await self._text_chat_with_fallback(
+                session_id=session_id, provider=provider, contexts=normalized,
+            )
+        except TypeError:
+            try:
+                return await self._text_chat_with_fallback(
+                    session_id=session_id, provider=provider,
+                    prompt=current_prompt, contexts=contexts, system_prompt=system_prompt,
+                )
+            except TypeError:
+                return await self._text_chat_with_fallback(
+                    session_id=session_id, provider=provider, prompt=transcript,
+                )
 
     @staticmethod
     def _parse_memory_items(text: str) -> list[dict[str, str]]:
@@ -655,7 +1013,9 @@ class TavernService:
             )
             template = str(self.config.get("memory_prompt", DEFAULT_MEMORY_PROMPT) or DEFAULT_MEMORY_PROMPT)
             prompt = template.replace("{history}", transcript)
-            response = await provider.text_chat(
+            response, provider_id = await self._text_chat_with_fallback(
+                session_id=session_id,
+                provider=provider,
                 prompt=prompt,
                 max_tokens=max(128, int(self.config.get("memory_max_tokens", 512) or 512)),
                 temperature=0.1,
@@ -664,14 +1024,18 @@ class TavernService:
             written: list[str] = []
             extract_mode = str(self.config.get("memory_extract_mode", "auto") or "auto")
             status = "pending" if extract_mode == "pending" else "active"
+            campaign = await asyncio.to_thread(self.storage.campaign_for_session, session_id)
+            conversation_id = str(state.get("astrbot_conversation_id", "") or "")
+            memory_scope_type = "campaign" if campaign else "conversation" if conversation_id else "session"
+            memory_scope_id = str(campaign["id"]) if campaign else conversation_id or session_id
             for item in items:
                 embedding = await self._embedding(item["content"])
                 if not embedding:
                     continue
                 memory_id = await asyncio.to_thread(
                     self.storage.put_memory,
-                    scope_type="session",
-                    scope_id=session_id,
+                    scope_type=memory_scope_type,
+                    scope_id=memory_scope_id,
                     category=item["category"],
                     content=item["content"],
                     embedding=embedding,
@@ -769,6 +1133,170 @@ class TavernService:
         return result
 
     @staticmethod
+    def _same_story_tail(left: str, right: str) -> bool:
+        left_norm = " ".join(str(left or "").split())
+        right_norm = " ".join(str(right or "").split())
+        if not left_norm or not right_norm:
+            return False
+        if left_norm == right_norm:
+            return True
+        left_tail, right_tail = left_norm[-800:], right_norm[-800:]
+        return len(left_tail) >= 120 and (left_tail in right_norm or right_tail in left_norm)
+
+    async def _conversation_boundary_changed(
+        self,
+        *,
+        state: dict[str, Any],
+        messages: list[dict[str, Any]],
+        conversation_id: str,
+    ) -> bool:
+        previous_id = str(state.get("astrbot_conversation_id", "") or "")
+        if previous_id and conversation_id and previous_id != conversation_id:
+            return True
+        node_id = str(state.get("current_story_node_id", "") or "")
+        if not node_id:
+            return False
+        node = await asyncio.to_thread(self.storage.get_story_node, node_id)
+        assistant_tail = str((node or {}).get("assistant_text", "") or "")
+        if not assistant_tail:
+            return False
+        assistants = [self._message_text(item) for item in messages if item.get("role") == "assistant"]
+        return not any(self._same_story_tail(assistant_tail, item) for item in assistants)
+
+    @staticmethod
+    def _fresh_conversation_state(conversation_id: str) -> dict[str, Any]:
+        return {
+            "turn": 0,
+            "effects": {},
+            "variables": {},
+            "group_index": 0,
+            "astrbot_conversation_id": conversation_id,
+            "conversation_epoch": time.time(),
+            "archive_new_root": True,
+        }
+
+    @staticmethod
+    def _campaign_context(campaign: dict[str, Any] | None) -> str:
+        if not campaign:
+            return ""
+        state = campaign.get("state_data", {}) if isinstance(campaign.get("state_data"), dict) else {}
+        parts = [f"[当前战役：{campaign.get('name') or '未命名'}]"]
+        if campaign.get("description"):
+            parts.append(str(campaign["description"]))
+        if campaign.get("rule_prompt"):
+            parts.append("[本战役规则]\n" + str(campaign["rule_prompt"]))
+        if state:
+            parts.append("[当前权威状态；物品、任务和数值以此为准]\n" + json.dumps(state, ensure_ascii=False, indent=2))
+        return "\n\n".join(parts)
+
+    @staticmethod
+    def _apply_state_patch(state: dict[str, Any], patch: list[dict[str, Any]]) -> dict[str, Any]:
+        result = copy.deepcopy(state)
+        for change in patch[:50]:
+            if not isinstance(change, dict):
+                continue
+            op = str(change.get("op", "")).lower()
+            path = [part for part in str(change.get("path", "")).split(".") if part]
+            if not path or any(part.startswith("_") for part in path):
+                continue
+            cursor: dict[str, Any] = result
+            for part in path[:-1]:
+                value = cursor.get(part)
+                if not isinstance(value, dict):
+                    value = {}
+                    cursor[part] = value
+                cursor = value
+            key = path[-1]
+            value = copy.deepcopy(change.get("value"))
+            if op == "set":
+                cursor[key] = value
+            elif op == "delete":
+                cursor.pop(key, None)
+            elif op == "increment" and isinstance(value, (int, float)):
+                current = cursor.get(key, 0)
+                if isinstance(current, (int, float)):
+                    cursor[key] = current + value
+            elif op == "append":
+                current = cursor.setdefault(key, [])
+                if isinstance(current, list) and value not in current:
+                    current.append(value)
+            elif op == "remove" and isinstance(cursor.get(key), list):
+                cursor[key] = [item for item in cursor[key] if item != value]
+        return result
+
+    @staticmethod
+    def _parse_state_change(text: str) -> tuple[list[dict[str, Any]], str]:
+        raw = str(text or "").strip()
+        start, end = raw.find("{"), raw.rfind("}")
+        if start >= 0 and end >= start:
+            raw = raw[start:end + 1]
+        try:
+            data = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            return [], ""
+        patch = data.get("patch", []) if isinstance(data, dict) else []
+        allowed = {"set", "delete", "increment", "append", "remove"}
+        clean = [
+            item for item in patch
+            if isinstance(item, dict) and str(item.get("op", "")).lower() in allowed
+            and str(item.get("path", "")).strip()
+        ][:50]
+        return clean, str(data.get("reason", "")) if isinstance(data, dict) else ""
+
+    @staticmethod
+    def _state_patch_risk(patch: list[dict[str, Any]]) -> str:
+        high_prefixes = ("system.points", "resources", "equipment", "key_items", "condition.injuries", "condition.infection", "quests.completed", "quests.failed")
+        medium_prefixes = ("condition", "quests", "base", "relationships", "inventory", "hp", "mp")
+        paths = [str(item.get("path", "")) for item in patch if isinstance(item, dict)]
+        if any(path == prefix or path.startswith(prefix + ".") for path in paths for prefix in high_prefixes):
+            return "high"
+        if any(path == prefix or path.startswith(prefix + ".") for path in paths for prefix in medium_prefixes):
+            return "medium"
+        return "low"
+
+    async def _extract_campaign_state_change(
+        self, *, campaign: dict[str, Any], session_id: str, turn: int,
+        user_text: str, assistant_text: str, story_node_id: str,
+    ) -> str:
+        settings = campaign.get("settings", {}) if isinstance(campaign.get("settings"), dict) else {}
+        if not settings.get("state_tracking_enabled", True):
+            return ""
+        interval = max(1, int(settings.get("state_extract_interval", 1) or 1))
+        if turn % interval:
+            return ""
+        provider, _ = self._memory_provider(session_id)
+        state = campaign.get("state_data", {}) if isinstance(campaign.get("state_data"), dict) else {}
+        prompt = str(settings.get("state_prompt") or DEFAULT_CAMPAIGN_STATE_PROMPT)
+        prompt = (prompt.replace("{schema}", json.dumps(campaign.get("state_schema", {}), ensure_ascii=False, indent=2))
+                  .replace("{state}", json.dumps(state, ensure_ascii=False, indent=2))
+                  .replace("{user}", user_text[-8000:]).replace("{assistant}", assistant_text[-12000:]))
+        response, _ = await self._text_chat_with_fallback(
+            session_id=session_id,
+            provider=provider,
+            prompt=prompt,
+            max_tokens=768,
+            temperature=0.0,
+        )
+        patch, reason = self._parse_state_change(str(getattr(response, "completion_text", "") or ""))
+        if not patch:
+            return ""
+        after = self._apply_state_patch(state, patch)
+        mode = str(settings.get("state_apply_mode", "pending") or "pending")
+        risk_level = self._state_patch_risk(patch)
+        status = "applied" if mode == "auto" or (mode == "tiered" and risk_level == "low") else "pending"
+        change_id = await asyncio.to_thread(self.storage.put_campaign_state_change, {
+            "campaign_id": campaign["id"], "session_id": session_id,
+            "story_node_id": story_node_id, "source_turn": turn, "patch": patch,
+            "reason": reason, "status": status, "risk_level": risk_level, "source_type": "llm",
+            "before_state": state, "after_state": after,
+        })
+        if status == "applied":
+            updated = dict(campaign)
+            updated["state_data"] = after
+            await asyncio.to_thread(self.storage.save_campaign, updated)
+        return change_id
+
+    @staticmethod
     def _story_context_from_node(node: dict[str, Any]) -> list[dict[str, Any]]:
         messages = node.get("request_messages") if isinstance(node.get("request_messages"), list) else []
         result: list[dict[str, Any]] = []
@@ -785,6 +1313,56 @@ class TavernService:
         if assistant_text:
             result.append({"role": "assistant", "content": assistant_text})
         return result
+
+    @staticmethod
+    def _conversation_history(conversation: Any) -> list[dict[str, Any]]:
+        if conversation is None:
+            return []
+        raw = getattr(conversation, "history", conversation)
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw or "[]")
+            except (json.JSONDecodeError, TypeError):
+                return []
+        if not isinstance(raw, list):
+            return []
+        return [item for item in (TavernService._normalize_message(item) for item in raw) if item is not None]
+
+    async def _web_contexts_for_session(self, session_id: str) -> tuple[list[dict[str, Any]], str, str]:
+        manager = getattr(self.context, "conversation_manager", None)
+        conversation_id = ""
+        if manager is not None:
+            try:
+                conversation_id = str(await manager.get_curr_conversation_id(session_id) or "")
+                if conversation_id:
+                    conversation = await manager.get_conversation(session_id, conversation_id)
+                    history = self._conversation_history(conversation)
+                    if history:
+                        return history, conversation_id, "conversation"
+            except Exception as exc:
+                logger.debug("%s 读取网页游玩 AstrBot conversation 失败: %s", PLUGIN_TAG, exc)
+        state = await asyncio.to_thread(self.storage.get_session, session_id)
+        node_id = str(state.get("current_story_node_id", "") or "")
+        node = await asyncio.to_thread(self.storage.get_story_node, node_id) if node_id else None
+        return (self._story_context_from_node(node) if node else []), conversation_id, "story" if node else "empty"
+
+    async def _append_web_conversation(
+        self, *, session_id: str, conversation_id: str, contexts: list[dict[str, Any]],
+        user_text: str, assistant_text: str,
+    ) -> bool:
+        manager = getattr(self.context, "conversation_manager", None)
+        if manager is None or not conversation_id:
+            return False
+        try:
+            updated = list(contexts) + [
+                {"role": "user", "content": user_text},
+                {"role": "assistant", "content": assistant_text},
+            ]
+            await manager.update_conversation(session_id, conversation_id, updated)
+            return True
+        except Exception as exc:
+            logger.debug("%s 写回网页游玩 AstrBot conversation 失败: %s", PLUGIN_TAG, exc)
+            return False
 
     @classmethod
     def _message_fingerprint(cls, message: dict[str, Any]) -> str:
@@ -833,8 +1411,10 @@ class TavernService:
         template = str(self.config.get("summary_prompt", DEFAULT_SUMMARY_PROMPT) or DEFAULT_SUMMARY_PROMPT)
         prompt = template.replace("{previous_summary}", previous_summary or "（无）").replace("{history}", transcript)
         timeout = max(1, int(self.config.get("summary_timeout_seconds", 60)))
-        response = await asyncio.wait_for(
-            provider.text_chat(
+        (response, provider_id) = await asyncio.wait_for(
+            self._text_chat_with_fallback(
+                session_id=session_id,
+                provider=provider,
                 prompt=prompt,
                 max_tokens=max(128, int(self.config.get("summary_max_tokens", 1024))),
                 temperature=0.2,
@@ -981,8 +1561,18 @@ class TavernService:
         session_id = str(getattr(event, "unified_msg_origin", "") or req.session_id or "default")
         async with self._session_lock(session_id):
             state = await asyncio.to_thread(self.storage.get_session, session_id)
+            campaign = await asyncio.to_thread(self.storage.campaign_for_session, session_id)
             pending = state.pop("pending_generation", {})
             pending_branch = state.pop("pending_branch", {}) if isinstance(state.get("pending_branch"), dict) else {}
+            source_contexts = self._normalize_messages(list(req.contexts or []))
+            conversation_id = str(event.get_extra("_kt_astrbot_conversation_id") or "")
+            skip_boundary = bool(event.get_extra("_kt_skip_boundary_check"))
+            if not skip_boundary and not pending_branch and await self._conversation_boundary_changed(
+                state=state, messages=source_contexts, conversation_id=conversation_id,
+            ):
+                state = self._fresh_conversation_state(conversation_id)
+            elif conversation_id:
+                state["astrbot_conversation_id"] = conversation_id
             generation_mode = str(event.get_extra("_kt_mode") or pending.get("mode") or mode)
             quiet_prompt = str(event.get_extra("_kt_quiet_prompt") or pending.get("prompt") or quiet_prompt)
             branch_parent_id = ""
@@ -993,12 +1583,22 @@ class TavernService:
                 branch_name = str(pending_branch.get("branch_name", "") or "")
                 node = await asyncio.to_thread(self.storage.get_story_node, branch_parent_id)
                 if node:
-                    state.update(copy.deepcopy(node.get("state_snapshot", {})) if isinstance(node.get("state_snapshot"), dict) else {})
+                    node_state = copy.deepcopy(node.get("state_snapshot", {})) if isinstance(node.get("state_snapshot"), dict) else {}
+                    campaign_state = node_state.pop("_campaign_state", None)
+                    state.update(node_state)
+                    applied_state = await asyncio.to_thread(
+                        self.storage.applied_campaign_state_for_story_node, branch_parent_id,
+                    )
+                    if isinstance(applied_state, dict):
+                        campaign_state = applied_state
+                    if campaign and isinstance(campaign_state, dict):
+                        campaign["state_data"] = campaign_state
+                        await asyncio.to_thread(self.storage.save_campaign, campaign)
                     state["current_story_node_id"] = branch_parent_id
                     branch_contexts = self._story_context_from_node(node)
             await asyncio.to_thread(self.storage.save_session, session_id, state)
             entries = await self._collect_entries(scopes)
-            source_contexts = branch_contexts if branch_contexts is not None else self._normalize_messages(list(req.contexts or []))
+            source_contexts = branch_contexts if branch_contexts is not None else source_contexts
             scan_messages = list(source_contexts)
             if req.prompt:
                 scan_messages.append({"role": "user", "content": req.prompt})
@@ -1028,6 +1628,7 @@ class TavernService:
             if req.prompt:
                 memory_text = f"{memory_text}\n{req.prompt}".strip()
             memory_context, memory_matches = await self._retrieve_memories(scopes=scopes, text=memory_text)
+            campaign_context = self._campaign_context(campaign)
             character = character_doc["data"] if character_doc else {}
             char_data = character.get("data", character)
             values = {
@@ -1046,6 +1647,7 @@ class TavernService:
                 lore=scan, values=values, mode=generation_mode, quiet_prompt=quiet_prompt,
                 session_summary=str(summary_meta.get("content", "")),
                 memory_context=memory_context,
+                campaign_context=campaign_context,
                 apply_history_limit=apply_history_limit,
             )
             result.warnings.extend(summary_warnings)
@@ -1075,6 +1677,11 @@ class TavernService:
                     for item in memory_matches
                 ],
             }
+            preview["campaign"] = {
+                "id": str((campaign or {}).get("id", "")),
+                "name": str((campaign or {}).get("name", "")),
+                "state_data": copy.deepcopy((campaign or {}).get("state_data", {})),
+            } if campaign else None
             preview["retrieval"] = {
                 "enabled": bool(self.config.get("vector_enabled", False)) or retrieval_mode == "keyword",
                 "mode": retrieval_mode,
@@ -1103,7 +1710,7 @@ class TavernService:
                 event.set_extra("_kt_story_snapshot", {
                     "session_id": session_id,
                     "parent_id": branch_parent_id or str(state.get("current_story_node_id", "") or ""),
-                    "branch_name": branch_name,
+                    "branch_name": branch_name or ("新会话" if state.get("archive_new_root") else ""),
                     "title": title,
                     "turn_index": int(state.get("turn", 0) or 0),
                     "request_messages": result.messages,
@@ -1111,7 +1718,7 @@ class TavernService:
                     "bindings_snapshot": effective,
                     "retrieval_snapshot": preview.get("retrieval", {}),
                     "memory_snapshot": preview.get("memory", {}),
-                    "state_snapshot": copy.deepcopy(state),
+                    "state_snapshot": dict(copy.deepcopy(state), **({"_campaign_state": copy.deepcopy(campaign.get("state_data", {}))} if campaign else {})),
                 })
 
             retrieval_matches = [
@@ -1161,6 +1768,88 @@ class TavernService:
             })
         return result
 
+    async def play_web_turn(
+        self, *, session_id: str, prompt: str, mode: str = "normal", quiet_prompt: str = "",
+        branch_node_id: str = "", branch_name: str = "",
+    ) -> dict[str, Any]:
+        session_id = str(session_id or "").strip()
+        prompt = str(prompt or "").strip()
+        mode = str(mode or "normal")
+        if not session_id or not prompt:
+            raise ValueError("请选择会话并输入玩家行动。")
+        if mode not in {"normal", "continue", "impersonate", "quiet"}:
+            raise ValueError("生成模式无效。")
+        contexts, conversation_id, context_source = await self._web_contexts_for_session(session_id)
+        if branch_node_id:
+            node = await asyncio.to_thread(self.storage.get_story_node, branch_node_id)
+            if not node:
+                raise ValueError("找不到要继续的剧情节点。")
+            contexts = self._story_context_from_node(node)
+            context_source = "branch"
+            await self.set_pending_branch(session_id, branch_node_id, branch_name)
+        extras = {
+            "_kt_astrbot_conversation_id": conversation_id,
+            "_kt_mode": mode,
+            "_kt_quiet_prompt": str(quiet_prompt or ""),
+            "_kt_skip_boundary_check": context_source in {"story", "branch"},
+        }
+        event = SimpleNamespace(
+            unified_msg_origin=session_id,
+            get_sender_name=lambda: "WebUI 玩家",
+            get_sender_id=lambda: "webui",
+            get_group_id=lambda: "",
+        )
+        event.get_extra = lambda key: extras.get(key)
+        event.set_extra = lambda key, value: extras.__setitem__(key, value)
+        provider = self.context.get_using_provider(session_id)
+        req = SimpleNamespace(
+            session_id=session_id,
+            contexts=contexts,
+            prompt=prompt,
+            system_prompt="",
+            provider=provider,
+            llm_provider=provider,
+            conversation=SimpleNamespace(persona_id=""),
+        )
+        result = await self.process(event, req, mode=mode, quiet_prompt=str(quiet_prompt or ""))
+        response, provider_id = await self._chat_completion_with_fallback(
+            session_id=session_id, provider=provider, messages=result.messages,
+        )
+        assistant_text = str(getattr(response, "completion_text", "") or "").strip()
+        if not assistant_text:
+            raise RuntimeError("Provider 返回空回复。")
+        snapshot = event.get_extra("_kt_story_snapshot")
+        node_id = ""
+        if isinstance(snapshot, dict):
+            node_id = await self.finalize_story_snapshot(
+                snapshot,
+                assistant_text,
+                {"completion_text": assistant_text, "provider_id": provider_id, "source": "webui"},
+            )
+        wrote_conversation = await self._append_web_conversation(
+            session_id=session_id,
+            conversation_id=conversation_id,
+            contexts=contexts,
+            user_text=prompt,
+            assistant_text=assistant_text,
+        )
+        preview = await asyncio.to_thread(self.storage.get_preview, session_id)
+        campaign = await asyncio.to_thread(self.storage.campaign_for_session, session_id)
+        changes = await asyncio.to_thread(
+            self.storage.list_campaign_state_changes, str(campaign["id"]), None, 100
+        ) if campaign else []
+        return {
+            "session_id": session_id,
+            "conversation_id": conversation_id,
+            "provider_id": provider_id,
+            "node_id": node_id,
+            "reply": assistant_text,
+            "conversation_synced": wrote_conversation,
+            "preview": preview,
+            "campaign": campaign,
+            "changes": changes,
+        }
+
     async def simulate(self, payload: dict[str, Any]) -> dict[str, Any]:
         session_id = str(payload.get("session_id", "preview") or "preview")
         scopes = [("global", "*")]
@@ -1169,6 +1858,13 @@ class TavernService:
             value = str(payload.get(key, "") or "")
             if value:
                 scopes.append((scope_type, value))
+        campaign = await asyncio.to_thread(self.storage.campaign_for_session, session_id)
+        if campaign:
+            if campaign.get("world_id"):
+                scopes.append(("world", str(campaign["world_id"])))
+            if campaign.get("ruleset_id"):
+                scopes.append(("ruleset", str(campaign["ruleset_id"])))
+            scopes.append(("campaign", str(campaign["id"])))
         state = copy.deepcopy(await asyncio.to_thread(self.storage.get_session, session_id))
         messages = self._normalize_messages(list(payload.get("contexts", [])))
         history, summary_meta, summary_warnings, apply_history_limit = await self._prepare_history(
@@ -1220,6 +1916,7 @@ class TavernService:
             quiet_prompt=str(payload.get("quiet_prompt", "")),
             session_summary=str(summary_meta.get("content", "")),
             memory_context=memory_context,
+            campaign_context=self._campaign_context(campaign),
             apply_history_limit=apply_history_limit,
         )
         warnings = list(result.warnings) + summary_warnings

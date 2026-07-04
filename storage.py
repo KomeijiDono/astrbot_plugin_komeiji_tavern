@@ -13,7 +13,7 @@ from typing import Any, Iterable
 
 
 class TavernStorage:
-    SCHEMA_VERSION = 8
+    SCHEMA_VERSION = 10
 
     def __init__(self, path: str | Path):
         self.path = Path(path)
@@ -83,6 +83,55 @@ class TavernStorage:
             updated_at REAL NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_memories_scope ON memories(scope_type, scope_id, enabled, updated_at);
+        CREATE TABLE IF NOT EXISTS campaigns (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            world_id TEXT NOT NULL DEFAULT '',
+            ruleset_id TEXT NOT NULL DEFAULT '',
+            description TEXT NOT NULL DEFAULT '',
+            rule_prompt TEXT NOT NULL DEFAULT '',
+            state_schema TEXT NOT NULL DEFAULT '{}',
+            state_data TEXT NOT NULL DEFAULT '{}',
+            settings TEXT NOT NULL DEFAULT '{}',
+            archived INTEGER NOT NULL DEFAULT 0,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS campaign_sessions (
+            session_id TEXT PRIMARY KEY,
+            campaign_id TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            FOREIGN KEY(campaign_id) REFERENCES campaigns(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_campaign_sessions_campaign ON campaign_sessions(campaign_id, updated_at);
+        CREATE TABLE IF NOT EXISTS campaign_state_changes (
+            id TEXT PRIMARY KEY,
+            campaign_id TEXT NOT NULL,
+            session_id TEXT NOT NULL DEFAULT '',
+            story_node_id TEXT NOT NULL DEFAULT '',
+            source_turn INTEGER NOT NULL DEFAULT 0,
+            patch TEXT NOT NULL DEFAULT '[]',
+            reason TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'pending',
+            risk_level TEXT NOT NULL DEFAULT 'high',
+            source_type TEXT NOT NULL DEFAULT 'llm',
+            before_state TEXT NOT NULL DEFAULT '{}',
+            after_state TEXT NOT NULL DEFAULT '{}',
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            FOREIGN KEY(campaign_id) REFERENCES campaigns(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_campaign_changes ON campaign_state_changes(campaign_id,status,created_at);
+        CREATE TABLE IF NOT EXISTS rp_packs (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            description TEXT NOT NULL DEFAULT '',
+            payload TEXT NOT NULL DEFAULT '{}',
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_rp_packs_name ON rp_packs(name, updated_at);
         CREATE TABLE IF NOT EXISTS runtime_metrics (
             id TEXT PRIMARY KEY,
             session_id TEXT NOT NULL,
@@ -182,6 +231,7 @@ class TavernStorage:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
     def _migrate_schema(self, conn: sqlite3.Connection) -> None:
+        self._ensure_column(conn, "campaign_state_changes", "risk_level", "TEXT NOT NULL DEFAULT 'high'")
         self._ensure_column(conn, "memories", "embedding_model", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column(conn, "memories", "status", "TEXT NOT NULL DEFAULT 'active'")
         self._ensure_column(conn, "memories", "importance", "REAL NOT NULL DEFAULT 1.0")
@@ -666,6 +716,211 @@ class TavernStorage:
             conn.execute("DELETE FROM sessions WHERE session_id=?", (session_id,))
             conn.execute("DELETE FROM previews WHERE session_id=?", (session_id,))
 
+    def save_rp_pack(self, payload: dict[str, Any]) -> str:
+        pack_id = str(payload.get("id") or uuid.uuid4())
+        now = time.time()
+        existing = self.get_rp_pack(pack_id)
+        created_at = float((existing or {}).get("created_at", now))
+        data = payload.get("payload", {}) if isinstance(payload.get("payload", {}), dict) else {}
+        with self._lock, self._connection() as conn:
+            conn.execute(
+                """INSERT INTO rp_packs(id,name,description,payload,created_at,updated_at)
+                VALUES(?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET
+                name=excluded.name,description=excluded.description,payload=excluded.payload,
+                updated_at=excluded.updated_at""",
+                (pack_id, str(payload.get("name") or "新 RP 整合包"),
+                 str(payload.get("description", "")), json.dumps(data, ensure_ascii=False),
+                 created_at, now),
+            )
+        return pack_id
+
+    def get_rp_pack(self, pack_id: str) -> dict[str, Any] | None:
+        with self._connection() as conn:
+            row = conn.execute("SELECT * FROM rp_packs WHERE id=?", (pack_id,)).fetchone()
+        if not row:
+            return None
+        item = dict(row)
+        item["payload"] = self._load_json(item.get("payload"), {})
+        return item
+
+    def list_rp_packs(self) -> list[dict[str, Any]]:
+        with self._connection() as conn:
+            rows = conn.execute("SELECT * FROM rp_packs ORDER BY name,updated_at DESC").fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["payload"] = self._load_json(item.get("payload"), {})
+            result.append(item)
+        return result
+
+    def delete_rp_pack(self, pack_id: str) -> bool:
+        with self._lock, self._connection() as conn:
+            result = conn.execute("DELETE FROM rp_packs WHERE id=?", (pack_id,))
+        return bool(result.rowcount)
+
+    @staticmethod
+    def _decode_campaign(row: sqlite3.Row) -> dict[str, Any]:
+        item = dict(row)
+        for key in ("state_schema", "state_data", "settings"):
+            item[key] = TavernStorage._load_json(item.get(key), {})
+        item["archived"] = bool(item.get("archived"))
+        return item
+
+    def save_campaign(self, payload: dict[str, Any]) -> str:
+        campaign_id = str(payload.get("id") or uuid.uuid4())
+        now = time.time()
+        existing = self.get_campaign(campaign_id)
+        created_at = float((existing or {}).get("created_at", now))
+        state_schema = payload.get("state_schema", (existing or {}).get("state_schema", {}))
+        state_data = payload.get("state_data", (existing or {}).get("state_data", {}))
+        settings = payload.get("settings", (existing or {}).get("settings", {}))
+        with self._lock, self._connection() as conn:
+            conn.execute(
+                """INSERT INTO campaigns(
+                    id,name,world_id,ruleset_id,description,rule_prompt,state_schema,state_data,
+                    settings,archived,created_at,updated_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET
+                    name=excluded.name,world_id=excluded.world_id,ruleset_id=excluded.ruleset_id,
+                    description=excluded.description,rule_prompt=excluded.rule_prompt,
+                    state_schema=excluded.state_schema,state_data=excluded.state_data,
+                    settings=excluded.settings,archived=excluded.archived,updated_at=excluded.updated_at""",
+                (
+                    campaign_id, str(payload.get("name", (existing or {}).get("name", "新战役"))),
+                    str(payload.get("world_id", (existing or {}).get("world_id", ""))),
+                    str(payload.get("ruleset_id", (existing or {}).get("ruleset_id", ""))),
+                    str(payload.get("description", (existing or {}).get("description", ""))),
+                    str(payload.get("rule_prompt", (existing or {}).get("rule_prompt", ""))),
+                    json.dumps(state_schema if isinstance(state_schema, dict) else {}, ensure_ascii=False),
+                    json.dumps(state_data if isinstance(state_data, dict) else {}, ensure_ascii=False),
+                    json.dumps(settings if isinstance(settings, dict) else {}, ensure_ascii=False),
+                    int(bool(payload.get("archived", (existing or {}).get("archived", False)))),
+                    created_at, now,
+                ),
+            )
+        return campaign_id
+
+    def get_campaign(self, campaign_id: str) -> dict[str, Any] | None:
+        with self._connection() as conn:
+            row = conn.execute("SELECT * FROM campaigns WHERE id=?", (campaign_id,)).fetchone()
+        return self._decode_campaign(row) if row else None
+
+    def list_campaigns(self, include_archived: bool = True) -> list[dict[str, Any]]:
+        sql = "SELECT * FROM campaigns"
+        if not include_archived:
+            sql += " WHERE archived=0"
+        sql += " ORDER BY archived,name,updated_at DESC"
+        with self._connection() as conn:
+            rows = conn.execute(sql).fetchall()
+            links = conn.execute("SELECT session_id,campaign_id FROM campaign_sessions ORDER BY updated_at DESC").fetchall()
+        sessions: dict[str, list[str]] = {}
+        for row in links:
+            sessions.setdefault(str(row["campaign_id"]), []).append(str(row["session_id"]))
+        result = [self._decode_campaign(row) for row in rows]
+        for item in result:
+            item["session_ids"] = sessions.get(str(item["id"]), [])
+        return result
+
+    def delete_campaign(self, campaign_id: str) -> bool:
+        with self._lock, self._connection() as conn:
+            conn.execute("DELETE FROM campaign_sessions WHERE campaign_id=?", (campaign_id,))
+            conn.execute("DELETE FROM campaign_state_changes WHERE campaign_id=?", (campaign_id,))
+            result = conn.execute("DELETE FROM campaigns WHERE id=?", (campaign_id,))
+        return bool(result.rowcount)
+
+    def bind_campaign_session(self, campaign_id: str, session_id: str) -> bool:
+        if not self.get_campaign(campaign_id):
+            return False
+        now = time.time()
+        with self._lock, self._connection() as conn:
+            conn.execute(
+                """INSERT INTO campaign_sessions(session_id,campaign_id,created_at,updated_at)
+                VALUES(?,?,?,?) ON CONFLICT(session_id) DO UPDATE SET
+                campaign_id=excluded.campaign_id,updated_at=excluded.updated_at""",
+                (session_id, campaign_id, now, now),
+            )
+        return True
+
+    def unbind_campaign_session(self, session_id: str) -> bool:
+        with self._lock, self._connection() as conn:
+            result = conn.execute("DELETE FROM campaign_sessions WHERE session_id=?", (session_id,))
+        return bool(result.rowcount)
+
+    def campaign_for_session(self, session_id: str) -> dict[str, Any] | None:
+        with self._connection() as conn:
+            row = conn.execute(
+                """SELECT c.* FROM campaigns c JOIN campaign_sessions s ON s.campaign_id=c.id
+                WHERE s.session_id=? AND c.archived=0""", (session_id,),
+            ).fetchone()
+        return self._decode_campaign(row) if row else None
+
+    def put_campaign_state_change(self, payload: dict[str, Any]) -> str:
+        change_id = str(payload.get("id") or uuid.uuid4())
+        now = time.time()
+        with self._lock, self._connection() as conn:
+            conn.execute(
+                """INSERT OR REPLACE INTO campaign_state_changes(
+                    id,campaign_id,session_id,story_node_id,source_turn,patch,reason,status,
+                    risk_level,source_type,before_state,after_state,created_at,updated_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    change_id, str(payload.get("campaign_id", "")), str(payload.get("session_id", "")),
+                    str(payload.get("story_node_id", "")), int(payload.get("source_turn", 0) or 0),
+                    json.dumps(payload.get("patch", []), ensure_ascii=False), str(payload.get("reason", "")),
+                    str(payload.get("status", "pending")), str(payload.get("risk_level", "high")),
+                    str(payload.get("source_type", "llm")),
+                    json.dumps(payload.get("before_state", {}), ensure_ascii=False),
+                    json.dumps(payload.get("after_state", {}), ensure_ascii=False),
+                    float(payload.get("created_at", now)), now,
+                ),
+            )
+        return change_id
+
+    def list_campaign_state_changes(self, campaign_id: str, status: str | None = None, limit: int = 200) -> list[dict[str, Any]]:
+        sql, params = "SELECT * FROM campaign_state_changes WHERE campaign_id=?", [campaign_id]
+        if status:
+            sql += " AND status=?"
+            params.append(status)
+        sql += " ORDER BY created_at DESC LIMIT ?"
+        params.append(max(1, int(limit)))
+        with self._connection() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            for key, fallback in (("patch", []), ("before_state", {}), ("after_state", {})):
+                item[key] = self._load_json(item.get(key), fallback)
+            result.append(item)
+        return result
+
+    def set_campaign_state_change_status(
+        self, change_id: str, status: str, *,
+        before_state: dict[str, Any] | None = None,
+        after_state: dict[str, Any] | None = None,
+    ) -> bool:
+        assignments, params = ["status=?", "updated_at=?"], [status, time.time()]
+        if before_state is not None:
+            assignments.append("before_state=?")
+            params.append(json.dumps(before_state, ensure_ascii=False))
+        if after_state is not None:
+            assignments.append("after_state=?")
+            params.append(json.dumps(after_state, ensure_ascii=False))
+        params.append(change_id)
+        with self._lock, self._connection() as conn:
+            result = conn.execute(
+                f"UPDATE campaign_state_changes SET {','.join(assignments)} WHERE id=?",
+                params,
+            )
+        return bool(result.rowcount)
+
+    def applied_campaign_state_for_story_node(self, story_node_id: str) -> dict[str, Any] | None:
+        with self._connection() as conn:
+            row = conn.execute(
+                """SELECT after_state FROM campaign_state_changes
+                WHERE story_node_id=? AND status='applied' ORDER BY updated_at DESC LIMIT 1""",
+                (story_node_id,),
+            ).fetchone()
+        return self._load_json(row["after_state"], {}) if row else None
+
     def create_story_node(self, payload: dict[str, Any]) -> str:
         node_id = str(payload.get("id") or uuid.uuid4())
         now = time.time()
@@ -710,7 +965,38 @@ class TavernStorage:
         params.append(max(1, int(limit)))
         with self._connection() as conn:
             rows = conn.execute(sql, params).fetchall()
-        return [self._decode_story_node(row, summary=True) for row in rows]
+        result = [self._decode_story_node(row, summary=True) for row in rows]
+        row_by_id = {str(row["id"]): row for row in rows}
+        for item, row in zip(result, rows):
+            parent = row_by_id.get(str(row["parent_id"] or ""))
+            if not parent:
+                continue
+            history = self._load_json(row["request_messages"], [])
+            assistants = [
+                str(message.get("content", "") or "")
+                for message in history if isinstance(message, dict) and message.get("role") == "assistant"
+            ] if isinstance(history, list) else []
+            item["parent_history_continuous"] = any(
+                self._story_text_continues(str(parent["assistant_text"] or ""), text)
+                for text in assistants
+            )
+        return result
+
+    @staticmethod
+    def _story_text_continues(previous: str, historical: str) -> bool:
+        previous = " ".join(str(previous or "").split())
+        historical = " ".join(str(historical or "").split())
+        if not previous or not historical:
+            return False
+        if previous == historical:
+            return True
+        if len(previous) < 80:
+            return previous in historical or historical in previous
+        chunk_size = 80
+        last_start = max(0, len(previous) - chunk_size)
+        starts = {0, last_start}
+        starts.update(int(last_start * ratio) for ratio in (0.2, 0.4, 0.6, 0.8))
+        return any(previous[start:start + chunk_size] in historical for start in starts)
 
     def get_story_node(self, node_id: str) -> dict[str, Any] | None:
         with self._connection() as conn:
@@ -754,6 +1040,19 @@ class TavernStorage:
         state = cls._load_json(result.pop("state_snapshot"), {})
         result["message_count"] = len(messages) if isinstance(messages, list) else 0
         result["assistant_preview"] = str(result.get("assistant_text", ""))[:240]
+        assistant_normalized = " ".join(str(result.get("assistant_text", "") or "").split())
+        result["assistant_fingerprint"] = hashlib.sha1(assistant_normalized.encode("utf-8")).hexdigest() if assistant_normalized else ""
+        history_fingerprints: list[str] = []
+        for message in messages if isinstance(messages, list) else []:
+            if not isinstance(message, dict) or str(message.get("role", "")) != "assistant":
+                continue
+            content = message.get("content", "")
+            if not isinstance(content, str):
+                content = json.dumps(content, ensure_ascii=False, sort_keys=True)
+            normalized = " ".join(content.split())
+            if normalized:
+                history_fingerprints.append(hashlib.sha1(normalized.encode("utf-8")).hexdigest())
+        result["history_assistant_fingerprints"] = history_fingerprints
         if not summary:
             result.update({
                 "request_messages": messages,

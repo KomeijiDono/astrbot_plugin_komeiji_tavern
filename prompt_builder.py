@@ -34,7 +34,7 @@ def estimate_tokens(text: str) -> int:
 class PromptBuilder:
     CORE_BLOCKS = {
         "main", "astrbot_system", "character", "personality", "scenario",
-        "persona", "summary", "memory", "post_history", "continue",
+        "persona", "summary", "memory", "campaign", "post_history", "continue",
         "impersonate", "quiet",
     }
 
@@ -99,6 +99,7 @@ class PromptBuilder:
         quiet_prompt: str = "",
         session_summary: str = "",
         memory_context: str = "",
+        campaign_context: str = "",
         apply_history_limit: bool = True,
     ) -> BuildResult:
         preset = preset or {}
@@ -174,6 +175,12 @@ class PromptBuilder:
         if quiet_prompt:
             blocks.append(PromptBlock("quiet", "Quiet Prompt", quiet_prompt, role="user", position="depth", depth=0, priority=0))
 
+        if campaign_context.strip() and not any(block.identifier == "campaign" for block in blocks):
+            blocks.append(PromptBlock(
+                "campaign", "Campaign State", "",
+                role="system", position="system", priority=35, source="campaign",
+            ))
+
         for block in blocks:
             block.content = self.macros.render(block.content, values).strip()
             if block.identifier == "summary" and session_summary.strip():
@@ -182,6 +189,8 @@ class PromptBuilder:
             if block.identifier == "memory" and memory_context.strip():
                 generated = f"[长期记忆]\n{memory_context.strip()}"
                 block.content = f"{block.content}\n\n{generated}".strip()
+            if block.identifier == "campaign" and campaign_context.strip():
+                block.content = f"{block.content}\n\n{campaign_context.strip()}".strip()
             block.token_estimate = estimate_tokens(block.content)
 
         active = [block for block in blocks if block.enabled and block.content]

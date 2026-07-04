@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import mimetypes
 import time
@@ -26,7 +27,7 @@ from .export_utils import (
     download_payload,
     safe_filename,
 )
-from .service import TavernService
+from .service import STATE_TEMPLATES, TavernService
 from .storage import TavernStorage
 
 
@@ -69,6 +70,22 @@ class TavernWebApi:
             (f"{self.PREFIX}/memories/status", ["POST"], self.set_memory_status, "Batch update long-term memory status"),
             (f"{self.PREFIX}/memories/<memory_id>/toggle", ["POST"], self.toggle_memory, "Toggle long-term memory"),
             (f"{self.PREFIX}/memories/<memory_id>/delete", ["POST"], self.delete_memory, "Delete long-term memory"),
+            (f"{self.PREFIX}/campaigns", ["GET"], self.campaigns, "List campaigns"),
+            (f"{self.PREFIX}/campaigns", ["POST"], self.save_campaign, "Create or update campaign"),
+            (f"{self.PREFIX}/campaigns/<campaign_id>/delete", ["POST"], self.delete_campaign, "Delete campaign"),
+            (f"{self.PREFIX}/campaigns/<campaign_id>/sessions", ["POST"], self.bind_campaign_session, "Bind campaign session"),
+            (f"{self.PREFIX}/campaigns/sessions/unbind", ["POST"], self.unbind_campaign_session, "Unbind campaign session"),
+            (f"{self.PREFIX}/campaigns/<campaign_id>/changes", ["GET"], self.campaign_changes, "List campaign state changes"),
+            (f"{self.PREFIX}/campaigns/<campaign_id>/changes/<change_id>", ["POST"], self.resolve_campaign_change, "Apply or reject campaign state change"),
+            (f"{self.PREFIX}/rp-packs", ["GET"], self.rp_packs, "List RP packs"),
+            (f"{self.PREFIX}/rp-packs", ["POST"], self.save_rp_pack, "Save RP pack"),
+            (f"{self.PREFIX}/rp-packs/from-campaign", ["POST"], self.rp_pack_from_campaign, "Create RP pack from campaign"),
+            (f"{self.PREFIX}/rp-packs/<pack_id>/delete", ["POST"], self.delete_rp_pack, "Delete RP pack"),
+            (f"{self.PREFIX}/state-templates", ["GET"], self.state_templates, "List state templates"),
+            (f"{self.PREFIX}/game/current", ["GET"], self.current_game, "Current game overview"),
+            (f"{self.PREFIX}/game/new", ["POST"], self.new_game, "Start a new game"),
+            (f"{self.PREFIX}/game/play", ["POST"], self.play_game, "Play a web roleplay turn"),
+            (f"{self.PREFIX}/worldbooks/<document_id>/analyze", ["GET"], self.analyze_worldbook, "Analyze worldbook"),
             (f"{self.PREFIX}/metrics", ["GET"], self.metrics, "Runtime metrics"),
             (f"{self.PREFIX}/retrieval/test", ["POST"], self.retrieval_test, "Test retrieval"),
             (f"{self.PREFIX}/retrieval/stats", ["GET"], self.retrieval_stats, "Retrieval stats"),
@@ -181,6 +198,14 @@ class TavernWebApi:
             value = str(payload.get(key, "") or "")
             if value:
                 scopes.append((scope_type, value))
+        session_id = str(payload.get("session_id", "") or "")
+        campaign = self.storage.campaign_for_session(session_id) if session_id else None
+        if campaign:
+            if campaign.get("world_id"):
+                scopes.append(("world", str(campaign["world_id"])))
+            if campaign.get("ruleset_id"):
+                scopes.append(("ruleset", str(campaign["ruleset_id"])))
+            scopes.append(("campaign", str(campaign["id"])))
         return self.ok(self.service.effective_bindings(scopes))
 
     async def unbind(self):
@@ -296,6 +321,150 @@ class TavernWebApi:
             include_expired=request.args.get("include_expired", "1") not in {"0", "false", "False"},
             limit=int(request.args.get("limit", 300)),
         ))
+
+    async def campaigns(self):
+        include_archived = request.args.get("include_archived", "1") not in {"0", "false", "False"}
+        return self.ok(self.storage.list_campaigns(include_archived=include_archived))
+
+    async def rp_packs(self):
+        return self.ok(self.storage.list_rp_packs())
+
+    async def save_rp_pack(self):
+        payload = await request.get_json(force=True)
+        if not isinstance(payload, dict) or not str(payload.get("name", "")).strip():
+            return self.error("name is required")
+        pack_id = self.storage.save_rp_pack(payload)
+        return self.ok(self.storage.get_rp_pack(pack_id))
+
+    async def rp_pack_from_campaign(self):
+        payload = await request.get_json(force=True)
+        try:
+            result = await asyncio.to_thread(
+                self.service.create_pack_from_campaign,
+                str((payload or {}).get("campaign_id", "")),
+                str((payload or {}).get("name", "")),
+            )
+            return self.ok(result)
+        except ValueError as exc:
+            return self.error(str(exc), 404)
+
+    async def delete_rp_pack(self, pack_id: str):
+        return self.ok({"deleted": self.storage.delete_rp_pack(pack_id)})
+
+    async def state_templates(self):
+        return self.ok(STATE_TEMPLATES)
+
+    async def current_game(self):
+        session_id = str(request.args.get("session_id", "") or "")
+        campaign = self.storage.campaign_for_session(session_id) if session_id else None
+        changes = self.storage.list_campaign_state_changes(str(campaign["id"]), limit=100) if campaign else []
+        pack = self.storage.get_rp_pack(str((campaign or {}).get("settings", {}).get("rp_pack_id", ""))) if campaign else None
+        return self.ok({"session_id": session_id, "campaign": campaign, "pack": pack, "changes": changes})
+
+    async def new_game(self):
+        payload = await request.get_json(force=True)
+        try:
+            result = await self.service.start_new_game(
+                pack_id=str((payload or {}).get("pack_id", "")),
+                session_id=str((payload or {}).get("session_id", "")),
+                name=str((payload or {}).get("name", "")),
+                template_id=str((payload or {}).get("template_id", "")),
+                archive_current=bool((payload or {}).get("archive_current", True)),
+                conversation_mode=str((payload or {}).get("conversation_mode", "new")),
+            )
+            return self.ok(result)
+        except ValueError as exc:
+            return self.error(str(exc))
+
+    async def play_game(self):
+        payload = await request.get_json(force=True)
+        try:
+            result = await self.service.play_web_turn(
+                session_id=str((payload or {}).get("session_id", "")),
+                prompt=str((payload or {}).get("prompt", "")),
+                mode=str((payload or {}).get("mode", "normal")),
+                quiet_prompt=str((payload or {}).get("quiet_prompt", "")),
+                branch_node_id=str((payload or {}).get("branch_node_id", "")),
+                branch_name=str((payload or {}).get("branch_name", "")),
+            )
+            return self.ok(result)
+        except ValueError as exc:
+            return self.error(str(exc))
+        except Exception as exc:
+            return self.error(str(exc), 500)
+
+    async def analyze_worldbook(self, document_id: str):
+        try:
+            return self.ok(await asyncio.to_thread(self.service.analyze_worldbook, document_id))
+        except ValueError as exc:
+            return self.error(str(exc), 404)
+
+    async def save_campaign(self):
+        payload = await request.get_json(force=True)
+        if not isinstance(payload, dict) or not str(payload.get("name", "")).strip():
+            return self.error("name is required")
+        campaign_id = self.storage.save_campaign(payload)
+        return self.ok(self.storage.get_campaign(campaign_id))
+
+    async def delete_campaign(self, campaign_id: str):
+        return self.ok({"deleted": self.storage.delete_campaign(campaign_id)})
+
+    async def bind_campaign_session(self, campaign_id: str):
+        payload = await request.get_json(force=True)
+        session_id = str((payload or {}).get("session_id", "")).strip()
+        if not session_id:
+            return self.error("session_id is required")
+        if not self.storage.bind_campaign_session(campaign_id, session_id):
+            return self.error("campaign not found", 404)
+        return self.ok({"campaign_id": campaign_id, "session_id": session_id})
+
+    async def unbind_campaign_session(self):
+        payload = await request.get_json(force=True)
+        session_id = str((payload or {}).get("session_id", "")).strip()
+        if not session_id:
+            return self.error("session_id is required")
+        return self.ok({"deleted": self.storage.unbind_campaign_session(session_id)})
+
+    async def campaign_changes(self, campaign_id: str):
+        return self.ok(self.storage.list_campaign_state_changes(
+            campaign_id, status=request.args.get("status") or None,
+            limit=int(request.args.get("limit", 200)),
+        ))
+
+    async def resolve_campaign_change(self, campaign_id: str, change_id: str):
+        payload = await request.get_json(force=True)
+        action = str((payload or {}).get("action", "")).lower()
+        if action not in {"apply", "reject", "undo"}:
+            return self.error("action must be apply, reject or undo")
+        changes = self.storage.list_campaign_state_changes(campaign_id, limit=1000)
+        change = next((item for item in changes if item.get("id") == change_id), None)
+        campaign = self.storage.get_campaign(campaign_id)
+        if not change or not campaign:
+            return self.error("campaign or change not found", 404)
+        if action != "undo" and str(change.get("status")) != "pending":
+            return self.error("change is already resolved", 409)
+        if action == "undo":
+            if str(change.get("status")) != "applied":
+                return self.error("only applied changes can be undone", 409)
+            campaign["state_data"] = change.get("before_state", {})
+            self.storage.save_campaign(campaign)
+            self.storage.set_campaign_state_change_status(change_id, "reverted")
+            return self.ok({"status": "reverted", "campaign": self.storage.get_campaign(campaign_id)})
+        if action == "apply":
+            before_state = campaign.get("state_data", {})
+            campaign["state_data"] = self.service._apply_state_patch(
+                before_state, change.get("patch", []),
+            )
+            self.storage.save_campaign(campaign)
+            status = "applied"
+            self.storage.set_campaign_state_change_status(
+                change_id, status, before_state=before_state,
+                after_state=campaign["state_data"],
+            )
+        else:
+            status = "rejected"
+            self.storage.set_campaign_state_change_status(change_id, status)
+        return self.ok({"status": status, "campaign": self.storage.get_campaign(campaign_id)})
 
     async def save_memory(self):
         payload = await request.get_json(force=True)
@@ -535,8 +704,13 @@ class TavernWebApi:
 
     def _merge_bound_conversations(self, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
         by_id = {str(item.get("id", "")): item for item in items if item.get("id")}
-        for binding in self.storage.list_bindings(scope_type="session"):
-            session_id = str(binding.get("scope_id", ""))
+        linked_ids = [str(binding.get("scope_id", "")) for binding in self.storage.list_bindings(scope_type="session")]
+        linked_ids.extend(
+            str(session_id)
+            for campaign in self.storage.list_campaigns()
+            for session_id in campaign.get("session_ids", [])
+        )
+        for session_id in linked_ids:
             if not session_id or session_id in by_id:
                 continue
             parts = session_id.split(":", 2)

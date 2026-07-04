@@ -1,4 +1,4 @@
-import { createApp, ref, computed, onMounted } from 'vue/dist/vue.esm-bundler.js'
+import { createApp, ref, computed, onMounted, watch } from 'vue/dist/vue.esm-bundler.js'
 import './style.css'
 
 const API = '/api/plug/astrbot_plugin_komeiji_tavern/v1'
@@ -62,6 +62,7 @@ const labels = {
 
 const tabs = [
   ['home', '开始'],
+  ['game', '当前游戏'],
   ['character', '角色卡'],
   ['character_group', '角色组'],
   ['preset', '提示词预设'],
@@ -70,6 +71,7 @@ const tabs = [
   ['persona', '用户设定'],
   ['quick_reply', '快捷回复'],
   ['bindings', '绑定管理'],
+  ['campaigns', '战役状态'],
   ['memories', '长期记忆'],
   ['metrics', '运行仪表盘'],
   ['archive', '分支树'],
@@ -78,9 +80,10 @@ const tabs = [
 ]
 
 const navGroups = [
+  ['开始游戏', ['game']],
   ['创作资料', ['home', 'character', 'character_group', 'preset', 'lorebook', 'material', 'persona', 'quick_reply']],
   ['生效与调试', ['bindings', 'debug', 'metrics']],
-  ['长期系统', ['memories', 'archive']],
+  ['长期系统', ['campaigns', 'memories', 'archive']],
   ['帮助', ['help']],
 ].map(group => ({
   name: group[0],
@@ -89,6 +92,7 @@ const navGroups = [
 
 const tabMeta = {
   home: { icon: '🌌', subtitle: '向导与就绪总览' },
+  game: { icon: '🎮', subtitle: '开局、存档与状态中枢' },
   character: { icon: '🎴', subtitle: '角色档案编构' },
   character_group: { icon: '👥', subtitle: '多角色协奏' },
   preset: { icon: '⚡', subtitle: '提示词积木装配' },
@@ -97,6 +101,7 @@ const tabMeta = {
   persona: { icon: '🧙', subtitle: '观测者档案' },
   quick_reply: { icon: '💬', subtitle: '快捷回复宏' },
   bindings: { icon: '🔗', subtitle: '会话与资料映射' },
+  campaigns: { icon: '🧭', subtitle: '多世界战役与权威状态' },
   memories: { icon: '🧠', subtitle: '长期神经记忆' },
   metrics: { icon: '📊', subtitle: 'Token 与运行指标' },
   archive: { icon: '🌳', subtitle: '多元分支快照' },
@@ -211,6 +216,12 @@ createApp({
     const documents = ref([])
     const bindings = ref([])
     const memories = ref([])
+    const campaigns = ref([])
+    const campaignChanges = ref([])
+    const rpPacks = ref([])
+    const stateTemplates = ref({})
+    const currentGame = ref({ campaign: null, pack: null, changes: [] })
+    const worldbookReports = ref([])
     const metrics = ref({ items: [], totals: {}, providers: {} })
     const personas = ref([])
     const conversations = ref([])
@@ -218,6 +229,7 @@ createApp({
     const pendingDeleteId = ref('')
     const error = ref('')
     const notice = ref('')
+    let noticeTimer = null
     const busy = ref(false)
     const file = ref(null)
     const fileLabel = computed(() => file.value?.name || '未选择文件')
@@ -241,6 +253,9 @@ createApp({
     const retrievalStats = ref(null)
     const retrievalResult = ref(null)
     const archive = ref({ session_id: '', nodes: [], selected: null, branch_name: '' })
+    const playDraft = ref({ prompt: '', mode: 'normal', quiet_prompt: '', branch_name: '' })
+    const playResult = ref(null)
+    const continueVisibleCount = ref(1)
     const selectedQuickReplyId = ref('')
     const twistOpen = ref(false)
     const twistText = ref(twistSeeds[0])
@@ -248,6 +263,17 @@ createApp({
     const binding = ref({ scope_type: 'session', scope_id: '', kind: 'character', target_id: '', priority: 0 })
     const newMemoryDraft = () => ({ id: '', scope_type: 'session', scope_id: '', category: 'status', content: '', enabled: true, status: 'active', importance: 1, source_type: 'manual', source_ref: '', expires_at: 0 })
     const memoryDraft = ref(newMemoryDraft())
+    const newCampaignDraft = () => ({
+      id: '', name: '新战役', world_id: '', ruleset_id: '', description: '', rule_prompt: '',
+      state_schema: { location: '当前位置', time: '当前时间', condition: '角色状态', inventory: '物品清单', quests: '任务', clues: '线索', relationships: '人物关系' },
+      state_data: { location: '', time: '', condition: {}, inventory: [], quests: [], clues: [], relationships: {} },
+      settings: { state_tracking_enabled: true, state_extract_interval: 1, state_apply_mode: 'pending' }, archived: false,
+    })
+    const campaignDraft = ref(newCampaignDraft())
+    const campaignSessionId = ref('')
+    const campaignSchemaJson = ref(JSON.stringify(campaignDraft.value.state_schema, null, 2))
+    const campaignStateJson = ref(JSON.stringify(campaignDraft.value.state_data, null, 2))
+    const newGameDraft = ref({ pack_id: '', session_id: '', name: '', template_id: '', archive_current: true, conversation_mode: 'new' })
     const debug = ref({ session_id: '', persona_id: '', prompt: '', system_prompt: '', mode: 'normal', quiet_prompt: '', seed: 1 })
     const debugResult = ref(null)
     const toggleTheme = () => {
@@ -279,7 +305,6 @@ createApp({
     const groupMembers = computed(() => (selected.value?.data?.members || []).map(id => characterDocs.value.find(x => x.id === id)).filter(Boolean))
     const availableGroupMembers = computed(() => characterDocs.value.filter(x => !(selected.value?.data?.members || []).includes(x.id)))
     const quickReplies = computed(() => Array.isArray(selected.value?.data?.items) ? selected.value.data.items.slice().sort((a, b) => Number(a.order || 0) - Number(b.order || 0)) : [])
-    const effectiveQuickReplies = computed(() => debugResult.value?.effective?.additive?.quick_reply || bindingSummary.value.additive.quick_reply || [])
 
     const sFiltered = computed(() => {
       const q = sQuery.value.toLowerCase()
@@ -314,10 +339,10 @@ createApp({
     const visibleMemoryIds = computed(() => filteredMemories.value.map(x => x.id))
     const allVisibleMemoriesSelected = computed(() => visibleMemoryIds.value.length > 0 && visibleMemoryIds.value.every(id => selectedMemoryIds.value.includes(id)))
     const memoryGroups = computed(() => {
-      const order = ['session', 'user', 'group', 'persona', 'global']
+      const order = ['campaign', 'conversation', 'world', 'ruleset', 'session', 'user', 'group', 'persona', 'global']
       return order.map(scope => ({
         scope,
-        title: scope === 'session' ? '会话记忆' : scope === 'user' ? '用户记忆' : scope === 'group' ? '群组记忆' : scope === 'persona' ? 'Persona 记忆' : '全局记忆',
+        title: scope === 'campaign' ? '战役记忆' : scope === 'conversation' ? 'AstrBot 对话记忆' : scope === 'world' ? '世界记忆' : scope === 'ruleset' ? '规则集记忆' : scope === 'session' ? '会话记忆' : scope === 'user' ? '用户记忆' : scope === 'group' ? '群组记忆' : scope === 'persona' ? 'Persona 记忆' : '全局记忆',
         items: filteredMemories.value.filter(item => item.scope_type === scope),
       })).filter(group => group.items.length)
     })
@@ -330,6 +355,7 @@ createApp({
     const tabCount = key => {
       if (labels[key]) return documentCount(key)
       if (key === 'bindings') return bindings.value.length
+      if (key === 'campaigns') return campaigns.value.length
       if (key === 'memories') return memories.value.length
       if (key === 'metrics') return metricTotals.value.requests || 0
       if (key === 'archive') return archive.value.nodes.length
@@ -352,24 +378,81 @@ createApp({
     })
     const archiveTree = computed(() => {
       const byParent = new Map()
-      for (const node of archive.value.nodes.slice().reverse()) {
-        const parent = node.parent_id || ''
+      const ordered = archive.value.nodes.slice().reverse()
+      const knownIds = new Set(ordered.map(node => node.id))
+      for (const node of ordered) {
+        let parent = node.parent_id || ''
+        if (node.parent_history_continuous === false) {
+          parent = ''
+        }
+        node._effective_parent_id = parent
         if (!byParent.has(parent)) byParent.set(parent, [])
         byParent.get(parent).push(node)
       }
       const out = []
-      const visit = (parent, depth) => {
-        for (const node of byParent.get(parent) || []) {
-          out.push({ ...node, depth })
-          visit(node.id, depth + 1)
-        }
+      const visited = new Set()
+      const visit = (parent, lane, segment) => {
+        const children = byParent.get(parent) || []
+        children.forEach((node, index) => {
+          if (visited.has(node.id)) return
+          visited.add(node.id)
+          // A normal continuation stays in the same lane. Only additional
+          // children of one parent represent a real branch and move right.
+          const nodeLane = lane + (index === 0 ? 0 : 1)
+          out.push({ ...node, depth: nodeLane, segment, is_root: false })
+          visit(node.id, nodeLane, segment)
+        })
       }
-      visit('', 0)
-      for (const node of archive.value.nodes) {
-        if (!out.some(x => x.id === node.id)) out.push({ ...node, depth: 0 })
-      }
+      const roots = ordered.filter(node => !node._effective_parent_id || !knownIds.has(node._effective_parent_id))
+      roots.forEach((node, index) => {
+        if (visited.has(node.id)) return
+        visited.add(node.id)
+        const segment = index + 1
+        out.push({ ...node, depth: 0, segment, is_root: true })
+        visit(node.id, 0, segment)
+      })
       return out
     })
+    const archiveSegments = computed(() => {
+      const groups = new Map()
+      for (const node of archiveTree.value) {
+        if (!groups.has(node.segment)) groups.set(node.segment, [])
+        groups.get(node.segment).push(node)
+      }
+      return Array.from(groups.entries())
+        .map(([segment, nodes]) => ({
+          segment,
+          nodes,
+          root: nodes.find(node => node.is_root) || nodes[0],
+          latest_at: Math.max(...nodes.map(node => Number(node.created_at || 0))),
+        }))
+        .sort((left, right) => right.latest_at - left.latest_at)
+        .map((item, index) => ({ ...item, current: index === 0 }))
+    })
+    const activeContinueSegment = computed(() => archiveSegments.value.find(item => item.current) || null)
+    const sortedContinueNodes = computed(() => (activeContinueSegment.value?.nodes || archiveTree.value).slice().sort((left, right) => {
+      const turnDelta = Number(right.turn_index || 0) - Number(left.turn_index || 0)
+      if (turnDelta) return turnDelta
+      return Number(right.created_at || 0) - Number(left.created_at || 0)
+    }))
+    const continueTimeline = computed(() => sortedContinueNodes.value.slice(0, continueVisibleCount.value))
+    const hiddenContinueCount = computed(() => Math.max(0, sortedContinueNodes.value.length - continueTimeline.value.length))
+    const expandContinueNodes = () => {
+      continueVisibleCount.value = Math.min(sortedContinueNodes.value.length, continueVisibleCount.value + 10)
+    }
+    const collapseContinueNodes = () => {
+      continueVisibleCount.value = 1
+    }
+    const latestContinueNode = computed(() => sortedContinueNodes.value[0] || null)
+    const selectedContinueNode = computed(() => archive.value.selected || latestContinueNode.value)
+    const pendingCurrentChanges = computed(() => (currentGame.value.changes || []).filter(item => item.status === 'pending'))
+    const continueHits = computed(() => {
+      const preview = playResult.value?.preview || {}
+      const retrieval = preview.retrieval?.matches || []
+      const memory = preview.memory?.matches || []
+      return { retrieval, memory }
+    })
+    const compactStateRows = computed(() => currentStateRows.value.slice(0, 10))
     const homeGuide = computed(() => {
       const counts = overview.value.counts || {}
       const hasPresetBinding = bindings.value.some(x => x.kind === 'preset')
@@ -394,17 +477,21 @@ createApp({
     const bindingsForTarget = computed(() => {
       const sessionId = debug.value.session_id || ''
       const personaId = debug.value.persona_id || ''
+      const campaign = campaigns.value.find(value => value.session_ids?.includes(sessionId))
       return bindings.value.filter(item => {
         if (item.scope_type === 'global') return true
         if (item.scope_type === 'session') return sessionId && item.scope_id === sessionId
         if (item.scope_type === 'persona') return personaId && item.scope_id === personaId
+        if (item.scope_type === 'campaign') return campaign && item.scope_id === campaign.id
+        if (item.scope_type === 'world') return campaign?.world_id && item.scope_id === campaign.world_id
+        if (item.scope_type === 'ruleset') return campaign?.ruleset_id && item.scope_id === campaign.ruleset_id
         return false
       })
     })
     const bindingSummary = computed(() => {
       const singleKinds = ['preset', 'character', 'character_group', 'persona']
       const additiveKinds = ['lorebook', 'material', 'quick_reply']
-      const rank = { global: 1, persona: 2, session: 3 }
+      const rank = { global: 1, persona: 2, world: 3, ruleset: 4, campaign: 5, session: 6 }
       const out = { single: {}, additive: {} }
       for (const kind of singleKinds) {
         out.single[kind] = bindingsForTarget.value
@@ -453,6 +540,15 @@ createApp({
     })
 
     const clear = () => { error.value = ''; notice.value = '' }
+    const dismissNotice = () => { notice.value = '' }
+
+    watch(notice, value => {
+      if (noticeTimer) clearTimeout(noticeTimer)
+      if (!value) return
+      noticeTimer = setTimeout(() => {
+        if (notice.value === value) notice.value = ''
+      }, 4200)
+    })
 
     const load = async () => {
       try {
@@ -464,6 +560,9 @@ createApp({
           request('/catalog/conversations?page_size=100'),
           request('/memories?limit=300'),
           request('/metrics?days=' + encodeURIComponent(metricDays.value) + '&limit=1000'),
+          request('/campaigns'),
+          request('/rp-packs'),
+          request('/state-templates'),
         ])
         overview.value = x[0].data
         documents.value = x[1].data
@@ -473,13 +572,20 @@ createApp({
         memories.value = x[5].data
         selectedMemoryIds.value = selectedMemoryIds.value.filter(id => memories.value.some(item => item.id === id))
         metrics.value = x[6].data
+        campaigns.value = x[7].data
+        rpPacks.value = x[8].data
+        stateTemplates.value = x[9].data
         if (!debug.value.session_id) {
           const bound = bindings.value.find(b => b.scope_type === 'session')
           if (bound) { debug.value.session_id = bound.scope_id; selectConversation() }
         }
         if (!archive.value.session_id) archive.value.session_id = debug.value.session_id
+        if (!newGameDraft.value.session_id) newGameDraft.value.session_id = debug.value.session_id
+        if (!newGameDraft.value.pack_id && rpPacks.value.length) newGameDraft.value.pack_id = rpPacks.value[0].id
         const warnings = x[4].data.warnings || []
         if (warnings.length) notice.value = warnings.join('；')
+        await refreshCurrentGame()
+        await refreshArchive()
       } catch (e) {
         error.value = e.message
       }
@@ -598,6 +704,7 @@ createApp({
       clear()
       const query = archive.value.session_id ? '?session_id=' + encodeURIComponent(archive.value.session_id) : ''
       archive.value.nodes = (await request('/archive' + query)).data
+      continueVisibleCount.value = 1
       if (archive.value.selected && !archive.value.nodes.some(x => x.id === archive.value.selected.id)) {
         archive.value.selected = null
       }
@@ -766,6 +873,199 @@ createApp({
       notice.value = '长期记忆已删除。'
     }
 
+    const editCampaign = async item => {
+      campaignDraft.value = JSON.parse(JSON.stringify(item))
+      campaignSchemaJson.value = JSON.stringify(campaignDraft.value.state_schema || {}, null, 2)
+      campaignStateJson.value = JSON.stringify(campaignDraft.value.state_data || {}, null, 2)
+      campaignSessionId.value = item.session_ids?.[0] || debug.value.session_id || ''
+      campaignChanges.value = (await request('/campaigns/' + encodeURIComponent(item.id) + '/changes?limit=200')).data
+    }
+
+    const resetCampaignDraft = () => {
+      campaignDraft.value = newCampaignDraft()
+      campaignSchemaJson.value = JSON.stringify(campaignDraft.value.state_schema, null, 2)
+      campaignStateJson.value = JSON.stringify(campaignDraft.value.state_data, null, 2)
+      campaignSessionId.value = debug.value.session_id || ''
+      campaignChanges.value = []
+    }
+
+    const saveCampaign = async () => {
+      clear()
+      if (!campaignDraft.value.name.trim()) { error.value = '请填写战役名称。'; return }
+      try {
+        campaignDraft.value.state_schema = JSON.parse(campaignSchemaJson.value || '{}')
+        campaignDraft.value.state_data = JSON.parse(campaignStateJson.value || '{}')
+      } catch (e) { error.value = '状态字段说明或当前状态不是合法 JSON：' + e.message; return }
+      const out = await post('/campaigns', campaignDraft.value)
+      campaignDraft.value = JSON.parse(JSON.stringify(out.data))
+      if (campaignSessionId.value.trim()) {
+        await post('/campaigns/' + encodeURIComponent(out.data.id) + '/sessions', { session_id: campaignSessionId.value.trim() })
+      }
+      await load()
+      await editCampaign(campaigns.value.find(item => item.id === out.data.id) || out.data)
+      notice.value = '战役与状态已保存。'
+    }
+
+    const deleteCampaign = async item => {
+      if (pendingDeleteId.value !== item.id) {
+        pendingDeleteId.value = item.id
+        notice.value = '再次点击删除以确认；战役状态与候选变更将一并删除。'
+        return
+      }
+      await post('/campaigns/' + encodeURIComponent(item.id) + '/delete', {})
+      pendingDeleteId.value = ''
+      resetCampaignDraft()
+      await load()
+    }
+
+    const bindCampaignSession = async () => {
+      if (!campaignDraft.value.id || !campaignSessionId.value.trim()) { error.value = '请先保存战役并填写会话 ID。'; return }
+      await post('/campaigns/' + encodeURIComponent(campaignDraft.value.id) + '/sessions', { session_id: campaignSessionId.value.trim() })
+      await load()
+      await editCampaign(campaigns.value.find(item => item.id === campaignDraft.value.id))
+      notice.value = '会话已绑定到该战役。'
+    }
+
+    const unbindCampaignSession = async sessionId => {
+      await post('/campaigns/sessions/unbind', { session_id: sessionId })
+      await load()
+      await editCampaign(campaigns.value.find(item => item.id === campaignDraft.value.id))
+    }
+
+    const resolveCampaignChange = async (change, action) => {
+      await post('/campaigns/' + encodeURIComponent(campaignDraft.value.id) + '/changes/' + encodeURIComponent(change.id), { action })
+      await load()
+      await editCampaign(campaigns.value.find(item => item.id === campaignDraft.value.id))
+      notice.value = action === 'apply' ? '候选状态变更已应用。' : '候选状态变更已拒绝。'
+    }
+
+    const refreshCurrentGame = async () => {
+      const sessionId = debug.value.session_id || newGameDraft.value.session_id || ''
+      if (!sessionId) { currentGame.value = { campaign: null, pack: null, changes: [] }; return }
+      currentGame.value = (await request('/game/current?session_id=' + encodeURIComponent(sessionId))).data
+    }
+
+    const refreshPlayableSession = async () => {
+      const sessionId = debug.value.session_id || newGameDraft.value.session_id || ''
+      newGameDraft.value.session_id = sessionId
+      archive.value.session_id = sessionId
+      await refreshCurrentGame()
+      await refreshArchive()
+    }
+
+    const clearSelectedContinueNode = () => {
+      archive.value.selected = null
+      archive.value.branch_name = ''
+      playDraft.value.branch_name = ''
+    }
+
+    const previewPlayPrompt = async () => {
+      clear()
+      const sessionId = debug.value.session_id || newGameDraft.value.session_id || ''
+      if (!sessionId) { error.value = '请先选择当前会话。'; return }
+      debug.value.session_id = sessionId
+      debug.value.prompt = playDraft.value.prompt || 'Continue.'
+      debug.value.mode = playDraft.value.mode
+      debug.value.quiet_prompt = playDraft.value.quiet_prompt
+      await simulate()
+      tab.value = 'debug'
+    }
+
+    const playTurn = async () => {
+      clear()
+      const sessionId = debug.value.session_id || newGameDraft.value.session_id || ''
+      if (!sessionId) { error.value = '请先选择当前会话。'; return }
+      if (!String(playDraft.value.prompt || '').trim()) { error.value = '请输入玩家行动或续写要求。'; return }
+      busy.value = true
+      try {
+        const out = await post('/game/play', {
+          session_id: sessionId,
+          prompt: playDraft.value.prompt,
+          mode: playDraft.value.mode,
+          quiet_prompt: playDraft.value.quiet_prompt,
+          branch_node_id: archive.value.selected?.id || '',
+          branch_name: playDraft.value.branch_name || archive.value.branch_name || '',
+        })
+        playResult.value = out.data
+        currentGame.value = { campaign: out.data.campaign, pack: currentGame.value.pack, changes: out.data.changes || [] }
+        if (out.data.reply) playDraft.value.prompt = ''
+        await refreshArchive()
+        if (out.data.node_id) archive.value.selected = (await request('/archive/' + encodeURIComponent(out.data.node_id))).data
+        notice.value = out.data.conversation_synced ? '已在网页完成一轮并同步到 AstrBot conversation。' : '已在网页完成一轮并保存到插件分支树。'
+      } catch (e) {
+        error.value = e.message
+      } finally {
+        busy.value = false
+      }
+    }
+
+    const createPackFromCurrent = async () => {
+      const campaign = currentGame.value.campaign
+      if (!campaign) { error.value = '当前会话没有战役。'; return }
+      const out = await post('/rp-packs/from-campaign', { campaign_id: campaign.id, name: campaign.name + '整合包' })
+      await load()
+      newGameDraft.value.pack_id = out.data.id
+      notice.value = '已从当前战役创建 RP 整合包。以后可一键重开。'
+    }
+
+    const deleteRpPack = async item => {
+      await post('/rp-packs/' + encodeURIComponent(item.id) + '/delete', {})
+      await load()
+    }
+
+    const startNewGame = async () => {
+      clear()
+      if (!newGameDraft.value.pack_id || !newGameDraft.value.session_id) { error.value = '请选择整合包和会话。'; return }
+      busy.value = true
+      try {
+        const out = await post('/game/new', newGameDraft.value)
+        debug.value.session_id = newGameDraft.value.session_id
+        await load()
+        notice.value = '新游戏“' + out.data.campaign.name + '”已创建；旧战役已归档。'
+      } catch (e) { error.value = e.message } finally { busy.value = false }
+    }
+
+    const flattenState = (value, prefix = '') => {
+      const rows = []
+      if (Array.isArray(value)) return [{ path: prefix, type: 'array', value: value.join(', ') }]
+      if (value !== null && typeof value === 'object') {
+        for (const [key, child] of Object.entries(value)) rows.push(...flattenState(child, prefix ? prefix + '.' + key : key))
+        return rows
+      }
+      return prefix ? [{ path: prefix, type: value === null ? 'null' : typeof value, value: value ?? '' }] : rows
+    }
+    const currentStateRows = computed(() => flattenState(currentGame.value.campaign?.state_data || {}))
+    const setCurrentStateValue = (row, raw) => {
+      const campaign = currentGame.value.campaign
+      if (!campaign) return
+      const state = JSON.parse(JSON.stringify(campaign.state_data || {}))
+      const parts = row.path.split('.')
+      let cursor = state
+      for (const part of parts.slice(0, -1)) cursor = cursor[part]
+      let value = raw
+      if (row.type === 'number') value = Number(raw)
+      else if (row.type === 'boolean') value = raw === true || raw === 'true'
+      else if (row.type === 'array') value = String(raw).split(',').map(item => item.trim()).filter(Boolean)
+      else if (row.type === 'null') value = raw || null
+      cursor[parts.at(-1)] = value
+      campaign.state_data = state
+    }
+    const saveCurrentState = async () => {
+      if (!currentGame.value.campaign) return
+      await post('/campaigns', currentGame.value.campaign)
+      await refreshCurrentGame()
+      notice.value = '权威状态已保存。'
+    }
+
+    const analyzeCurrentWorldbooks = async () => {
+      worldbookReports.value = []
+      const campaign = currentGame.value.campaign
+      if (!campaign) return
+      const ids = bindings.value.filter(item => item.scope_type === 'campaign' && item.scope_id === campaign.id && item.kind === 'lorebook').map(item => item.target_id)
+      for (const id of ids) worldbookReports.value.push((await request('/worldbooks/' + encodeURIComponent(id) + '/analyze')).data)
+    }
+    const riskLabel = value => value === 'low' ? '低风险' : value === 'medium' ? '中风险' : '高风险'
+
     const refreshMetrics = async () => {
       clear()
       metrics.value = (await request('/metrics?days=' + encodeURIComponent(metricDays.value) + '&limit=1000')).data
@@ -807,6 +1107,9 @@ createApp({
     const scopeName = i =>
       i.scope_type === 'global' ? '全局'
       : i.scope_type === 'persona' ? 'Persona：' + i.scope_id
+      : i.scope_type === 'campaign' ? '战役：' + i.scope_id
+      : i.scope_type === 'world' ? '世界：' + i.scope_id
+      : i.scope_type === 'ruleset' ? '规则集：' + i.scope_id
       : i.scope_type === 'session' ? '会话：' + i.scope_id
       : i.scope_type + '：' + i.scope_id
 
@@ -928,15 +1231,19 @@ createApp({
     return {
       tabs, navGroups, labels, tab, tabMeta, currentTabMeta, tabCount, activeSingleCount, additiveBindingCount, enabledMemoryCount,
       overview, documents, bindings, personas, selected, pendingDeleteId, pendingImport, pendingMemoryDeleteId, error, notice, busy,
+      dismissNotice,
       theme, toggleTheme,
       fileLabel,
       downloadLocationHint, saveJson,
       advanced, binding, memoryDraft, memoryQuery, memoryStatusFilter, selectedMemoryIds,
       memories, filteredMemories, memoryGroups, allVisibleMemoriesSelected,
+      campaigns, campaignDraft, campaignChanges, campaignSessionId, campaignSchemaJson, campaignStateJson,
+      rpPacks, stateTemplates, currentGame, worldbookReports, newGameDraft, currentStateRows,
       metricDays, metrics, metricItems, metricTotals, metricProviders, maxMetricTokens,
       retrievalTest, retrievalStats, retrievalResult,
-      archive, archiveTree, homeGuide, selectedQuickReplyId, promptAssembly, twistOpen, twistText,
-      debug, debugResult, debugSummary, docsForTab, bindDocs, characterDocs, card, entries, filteredEntries, quickReplies, effectiveQuickReplies,
+      archive, archiveTree, archiveSegments, homeGuide, selectedQuickReplyId, promptAssembly, twistOpen, twistText,
+      playDraft, playResult, continueVisibleCount, hiddenContinueCount, sortedContinueNodes, continueTimeline, latestContinueNode, selectedContinueNode, pendingCurrentChanges, activeContinueSegment, continueHits, compactStateRows,
+      debug, debugResult, debugSummary, docsForTab, bindDocs, characterDocs, card, entries, filteredEntries, quickReplies,
       groupMembers, availableGroupMembers,
       sessionOptions, sFiltered, dFiltered, sessionDisplay, debugDisplay, bindingTargetTitle, bindingsForTarget, bindingSummary,
       entryQuery, entryFilter, openEntryUid,
@@ -948,6 +1255,10 @@ createApp({
       updateScope, addBinding, unbind, scopeName, updateMemoryScope, resetMemoryDraft,
       saveMemory, editMemory, toggleMemory, toggleAllVisibleMemories,
       updateSelectedMemoryStatus, deleteMemory, refreshMetrics,
+      editCampaign, resetCampaignDraft, saveCampaign, deleteCampaign,
+      bindCampaignSession, unbindCampaignSession, resolveCampaignChange,
+      refreshCurrentGame, refreshPlayableSession, expandContinueNodes, collapseContinueNodes, clearSelectedContinueNode, previewPlayPrompt, playTurn, createPackFromCurrent, deleteRpPack, startNewGame,
+      setCurrentStateValue, saveCurrentState, analyzeCurrentWorldbooks, riskLabel,
       refreshRetrievalStats, runRetrievalTest,
       move, moveMember, addMember, addBlock, addEntry, addQuickReply, removeQuickReply, applyQuickReply,
       openTwist, rerollTwist, useTwist, keyText, setKeys,
@@ -980,6 +1291,12 @@ createApp({
     </div>
   </aside>
   <main>
+    <Transition name="toast-slide">
+      <div v-if="notice" class="toast notice-toast" @click="dismissNotice">
+        <span>✓</span>
+        <p>{{notice}}</p>
+      </div>
+    </Transition>
     <header>
       <div class="page-title">
         <span class="page-glyph">{{currentTabMeta.icon}}</span>
@@ -1020,7 +1337,6 @@ createApp({
       </div>
     </div>
     <div v-if="error" class="alert error">{{error}}</div>
-    <div v-if="notice" class="alert ok">{{notice}}</div>
     <section v-if="tab==='home'" class="home">
       <div class="home-hero-grid">
         <div class="hero">
@@ -1062,6 +1378,105 @@ createApp({
         <div class="metric" v-for="(v,k) in labels"><strong>{{overview.counts?.[k]||0}}</strong><span>{{v}}</span></div>
       </div>
       <div class="panel"><h3>待完成</h3><p v-if="!overview.tasks?.length">没有必须处理的事项。</p><ul><li v-for="x in overview.tasks">{{x}}</li></ul></div>
+    </section>
+    <section v-else-if="tab==='game'" class="stack game-hub">
+      <div class="panel game-toolbar">
+        <label>当前会话<select v-model="debug.session_id" @change="refreshPlayableSession"><option value="">请选择</option><option v-for="session in sessionOptions" :value="session.id">{{session.title}} · {{session.platform}}</option></select></label>
+        <button @click="refreshPlayableSession">刷新</button>
+        <button v-if="currentGame.campaign && !currentGame.pack" @click="createPackFromCurrent">将当前战役保存为整合包</button>
+      </div>
+
+      <div v-if="currentGame.campaign" class="hero game-hero">
+        <small>{{currentGame.pack ? 'RP PACK · '+currentGame.pack.name : 'CUSTOM CAMPAIGN'}}</small>
+        <h3>{{currentGame.campaign.name}}</h3>
+        <p>{{currentGame.campaign.description}}</p>
+        <div class="steps"><button @click="tab='archive'">查看存档树</button><button @click="tab='campaigns';editCampaign(currentGame.campaign)">高级战役设置</button></div>
+      </div>
+      <div v-else class="panel empty"><h3>这个会话还没有游戏</h3><p>从下方选择一个 RP 整合包即可一键开局。</p></div>
+
+      <div v-if="currentGame.campaign" class="panel continue-board">
+        <div class="result-head">
+          <div><h3>网页接着玩</h3><p class="muted">像酒馆一样在这里直接输入玩家行动；系统会使用当前绑定、世界书、长期记忆、战役状态和选中的剧情分支。</p></div>
+          <div class="actions"><button @click="tab='archive'">完整存档树</button><button @click="clearSelectedContinueNode" :disabled="!archive.selected">回到当前最新</button><button @click="previewPlayPrompt" :disabled="busy">预览本轮 Prompt</button></div>
+        </div>
+        <div class="summary-grid continue-stats">
+          <div class="summary-card ready"><span>当前战役</span><b>{{currentGame.campaign.name}}</b></div>
+          <div class="summary-card"><span>当前会话段</span><b>{{activeContinueSegment ? activeContinueSegment.nodes.length + ' 个节点' : '暂无节点'}}</b></div>
+          <div class="summary-card"><span>最新轮次</span><b>{{latestContinueNode ? latestContinueNode.turn_index : '—'}}</b></div>
+          <div class="summary-card" :class="{warn:pendingCurrentChanges.length}"><span>待确认状态</span><b>{{pendingCurrentChanges.length}}</b></div>
+        </div>
+        <div class="continue-layout">
+          <div class="continue-map">
+            <button v-for="node in continueTimeline" :key="node.id" :class="['continue-node',{active:archive.selected?.id===node.id,latest:latestContinueNode?.id===node.id}]" @click="selectArchiveNode(node)" :style="{paddingLeft: (18 + Math.min(node.depth || 0, 5) * 14) + 'px'}">
+              <span>{{node.branch_name || '主线'}}</span>
+              <b>{{node.title || '未命名节点'}}</b>
+              <small>第 {{node.turn_index}} 轮 · {{formatTimestamp(node.created_at)}}</small>
+            </button>
+            <button v-if="hiddenContinueCount" class="ghost compact" @click="expandContinueNodes">继续展开旧节点（还剩 {{hiddenContinueCount}}）</button>
+            <button v-if="continueVisibleCount > 1" class="ghost compact" @click="collapseContinueNodes">折叠旧节点</button>
+            <p v-if="!continueTimeline.length" class="muted">还没有自动归档节点。完成一次真实 RP 后，这里会出现可继续的剧情路线。</p>
+          </div>
+          <div class="play-console">
+            <div class="play-transcript">
+              <article v-if="archive.selected?.assistant_text" class="chat-bubble assistant"><small>选中存档 · {{archive.selected.branch_name || '主线'}} · 第 {{archive.selected.turn_index}} 轮</small><pre>{{archive.selected.assistant_text}}</pre></article>
+              <article v-else-if="selectedContinueNode" class="chat-bubble assistant"><small>最新节点 · {{selectedContinueNode.branch_name || '主线'}} · 第 {{selectedContinueNode.turn_index}} 轮</small><p>选择左侧节点可查看回复；不选节点时将从当前会话继续。</p></article>
+              <article v-if="playResult?.reply" class="chat-bubble assistant live"><small>刚生成 · {{playResult.provider_id || 'current provider'}} · {{playResult.conversation_synced ? '已同步 AstrBot' : '插件分支树'}}</small><pre>{{playResult.reply}}</pre></article>
+              <p v-if="!archive.selected?.assistant_text && !playResult?.reply" class="muted">这里会显示选中存档或刚生成的回复。输入玩家行动后，网页会直接完成一轮 RP 并自动保存新节点。</p>
+            </div>
+
+            <label>玩家行动 / 续写要求<textarea v-model="playDraft.prompt" placeholder="例如：我推开门，压低声音问她刚才听见了什么。"></textarea></label><p class="muted play-note">{{archive.selected ? '将从选中节点另起/续写分支。' : '未选节点时会接当前最新剧情。'}}</p>
+            <div class="play-controls">
+              <label>模式<select v-model="playDraft.mode"><option value="normal">普通生成</option><option value="continue">继续上一段</option><option value="impersonate">代写玩家</option><option value="quiet">静默提示</option></select></label>
+              <label>分支名<input v-model="playDraft.branch_name" placeholder="可选：if线 / 重开 / 主线"></label>
+              <button class="primary" @click="playTurn" :disabled="busy">{{busy ? '生成中…' : '在网页里继续'}}</button>
+            </div>
+            <label v-if="playDraft.mode==='quiet'">静默提示<textarea v-model="playDraft.quiet_prompt" placeholder="仅作为本轮约束，不直接作为玩家台词。"></textarea></label>
+          </div>
+          <aside class="play-hud">
+            <div><h4>状态 HUD</h4><div class="state-pills"><span v-for="row in compactStateRows"><b>{{row.path}}</b>{{row.value || '—'}}</span></div></div>
+            <div><h4>命中可视化</h4><p class="muted" v-if="!continueHits.retrieval.length && !continueHits.memory.length">生成后显示本轮世界书/素材检索与长期记忆命中。</p><div class="hit-chip" v-for="hit in continueHits.retrieval.slice(0,6)">世界书 · {{hit.name || hit.uid}}</div><div class="hit-chip memory" v-for="hit in continueHits.memory.slice(0,6)">记忆 · {{hit.category}} · {{hit.content}}</div></div>
+            <div><h4>待确认状态</h4><div v-for="change in pendingCurrentChanges.slice(0,4)" class="mini-change"><b>{{riskLabel(change.risk_level)}} · 第 {{change.source_turn}} 轮</b><small>{{change.reason}}</small><div class="actions"><button @click="resolveCampaignChange(change,'apply');refreshCurrentGame()">应用</button><button @click="resolveCampaignChange(change,'reject');refreshCurrentGame()">拒绝</button></div></div><p v-if="!pendingCurrentChanges.length" class="muted">暂无待确认补丁。</p></div>
+          </aside>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="result-head"><div><h3>新游戏向导</h3><p class="muted">自动归档旧战役、初始化状态、绑定全部资料并新建 AstrBot conversation。</p></div><button class="primary" @click="startNewGame" :disabled="busy">开始新游戏</button></div>
+        <div class="grid">
+          <label>RP整合包<select v-model="newGameDraft.pack_id"><option value="">请选择</option><option v-for="pack in rpPacks" :value="pack.id">{{pack.name}}</option></select></label>
+          <label>游戏名称<input v-model="newGameDraft.name" placeholder="留空使用整合包名称"></label>
+          <label>状态模板<select v-model="newGameDraft.template_id"><option value="">使用整合包初始状态</option><option v-for="(template,id) in stateTemplates" :value="id">{{template.name}}</option></select></label>
+          <label>目标会话<select v-model="newGameDraft.session_id"><option value="">请选择</option><option v-for="session in sessionOptions" :value="session.id">{{session.title}} · {{session.platform}}</option></select></label>
+          <label>AstrBot处理<select v-model="newGameDraft.conversation_mode"><option value="new">新建 conversation（推荐）</option><option value="clear">清空当前 conversation</option></select></label>
+          <label class="check-field"><input type="checkbox" v-model="newGameDraft.archive_current">归档当前战役</label>
+        </div>
+        <p v-if="!rpPacks.length" class="muted">还没有整合包。如果当前会话已有战役，点击页面顶部“将当前战役保存为整合包”。</p>
+        <div class="activation" v-for="pack in rpPacks"><div><b>{{pack.name}}</b><small>{{pack.description}}</small></div><button class="danger" @click="deleteRpPack(pack)">删除整合包</button></div>
+      </div>
+
+      <div v-if="currentGame.campaign" class="panel">
+        <div class="result-head"><div><h3>当前权威状态</h3><p class="muted">普通字段直接编辑；复杂结构仍可在高级战役设置中维护。</p></div><button class="primary" @click="saveCurrentState">保存状态</button></div>
+        <div class="state-form">
+          <label v-for="row in currentStateRows"><span>{{row.path}}</span>
+            <select v-if="row.type==='boolean'" :value="String(row.value)" @change="setCurrentStateValue(row,$event.target.value)"><option value="true">是</option><option value="false">否</option></select>
+            <input v-else :type="row.type==='number'?'number':'text'" :value="row.value" @input="setCurrentStateValue(row,$event.target.value)">
+          </label>
+        </div>
+      </div>
+
+      <div v-if="currentGame.campaign" class="panel">
+        <div class="result-head"><div><h3>状态变更</h3><p class="muted">低风险可自动应用；资源、伤势、积分与关键任务仍需确认。</p></div><span>{{currentGame.changes.filter(item=>item.status==='pending').length}} 待确认</span></div>
+        <div class="memory-card" v-for="change in currentGame.changes.slice(0,20)">
+          <div class="result-head"><b>{{riskLabel(change.risk_level)}} · {{change.status}}</b><small>第 {{change.source_turn}} 轮</small></div>
+          <p>{{change.reason}}</p><pre>{{JSON.stringify(change.patch,null,2)}}</pre>
+          <div class="actions"><button v-if="change.status==='pending'" class="primary" @click="resolveCampaignChange(change,'apply');refreshCurrentGame()">应用</button><button v-if="change.status==='pending'" @click="resolveCampaignChange(change,'reject');refreshCurrentGame()">拒绝</button><button v-if="change.status==='applied'" @click="resolveCampaignChange(change,'undo');refreshCurrentGame()">撤销</button></div>
+        </div>
+      </div>
+
+      <div v-if="currentGame.campaign" class="panel">
+        <div class="result-head"><div><h3>世界书体检</h3><p class="muted">检查错误分隔符、无法命中、过大常驻和宽泛关键词。</p></div><button @click="analyzeCurrentWorldbooks">开始体检</button></div>
+        <div v-for="report in worldbookReports" class="binding-stack"><h4>{{report.name}} · {{report.entry_count}} 条</h4><div v-for="issue in report.issues" :class="['activation',issue.level]"><b>{{issue.entry}}</b><span>{{issue.message}}</span></div><p v-if="!report.issues.length" class="muted">没有发现明显问题。</p></div>
+      </div>
     </section>
     <section v-else-if="['character','character_group','preset','lorebook','material','persona','quick_reply'].includes(tab)" class="workspace">
       <div class="library">
@@ -1272,11 +1687,11 @@ createApp({
       </div>
       <div class="panel">
         <h3>新增绑定</h3>
-        <p>角色、角色组、预设、用户设定按“会话 → Persona → 全局”覆盖；世界书和创作素材会按作用域叠加。</p>
+        <p>角色、角色组、预设、用户设定按“会话 → 战役 → 规则集 → 世界 → Persona → 全局”覆盖；世界书和创作素材会按作用域叠加。</p>
         <div class="binding-form">
           <label>资料类型<select v-model="binding.kind"><option v-for="(v,k) in labels" :value="k">{{v}}</option></select></label>
           <label>资料<select v-model="binding.target_id"><option value="">请选择</option><option v-for="d in bindDocs" :value="d.id">{{d.name}}</option></select></label>
-          <label>范围<select v-model="binding.scope_type" @change="updateScope"><option value="session">具体会话</option><option value="persona">AstrBot Persona</option><option value="global">全局</option></select></label>
+          <label>范围<select v-model="binding.scope_type" @change="updateScope"><option value="session">具体会话</option><option value="campaign">战役</option><option value="world">世界</option><option value="ruleset">规则集</option><option value="persona">AstrBot Persona</option><option value="global">全局</option></select></label>
           <label v-if="binding.scope_type==='session'" class="combo">会话
             <input v-model="sessionDisplay" @focus="onSFocus" @blur="onSBlur" placeholder="搜索或输入会话 ID">
             <div class="combo-panel" v-if="sOpen">
@@ -1285,6 +1700,9 @@ createApp({
             </div>
           </label>
           <label v-if="binding.scope_type==='persona'">Persona<select v-model="binding.scope_id"><option value="">请选择</option><option v-for="p in personas" :value="p.id">{{p.name}}</option></select></label>
+          <label v-if="binding.scope_type==='campaign'">战役<select v-model="binding.scope_id"><option value="">请选择</option><option v-for="c in campaigns" :value="c.id">{{c.name}}</option></select></label>
+          <label v-if="binding.scope_type==='world'">世界标识<input v-model="binding.scope_id" placeholder="与战役 world_id 一致"></label>
+          <label v-if="binding.scope_type==='ruleset'">规则集标识<input v-model="binding.scope_id" placeholder="与战役 ruleset_id 一致"></label>
           <button class="primary" @click="addBinding">确认绑定</button>
         </div>
       </div>
@@ -1295,12 +1713,56 @@ createApp({
         </table>
       </div>
     </section>
+    <section v-else-if="tab==='campaigns'" class="split">
+      <aside class="list panel">
+        <div class="result-head"><h3>战役</h3><button @click="resetCampaignDraft">新建</button></div>
+        <button v-for="item in campaigns" class="list-item" :class="{active:campaignDraft.id===item.id}" @click="editCampaign(item)">
+          <b>{{item.name}}</b><small>{{item.world_id || '独立世界'}} · {{item.session_ids?.length || 0}} 个会话</small>
+        </button>
+        <p v-if="!campaigns.length" class="muted">创建第一局战役后，长期记忆和状态便不再依赖某个聊天窗口。</p>
+      </aside>
+      <article class="stack">
+        <div class="panel">
+          <div class="result-head"><div><h3>{{campaignDraft.id ? '编辑战役' : '新建战役'}}</h3><p class="muted">世界、规则、存档状态和聊天会话彼此独立组合。</p></div><div class="actions"><button class="primary" @click="saveCampaign">保存</button><button v-if="campaignDraft.id" class="danger" @click="deleteCampaign(campaignDraft)">{{pendingDeleteId===campaignDraft.id?'确认删除':'删除'}}</button></div></div>
+          <div class="grid">
+            <label>战役名称<input v-model="campaignDraft.name"></label>
+            <label>世界标识<input v-model="campaignDraft.world_id" placeholder="例如 zombie-city"></label>
+            <label>规则集标识<input v-model="campaignDraft.ruleset_id" placeholder="例如 survival-lite"></label>
+          </div>
+          <label>战役简介<textarea v-model="campaignDraft.description" placeholder="只写本局稳定前提，不写流水剧情"></textarea></label>
+          <label>规则提示<textarea v-model="campaignDraft.rule_prompt" placeholder="例如资源守恒、不可替玩家决定行动、伤势恢复规则"></textarea></label>
+          <div class="grid">
+            <label>状态提取间隔（轮）<input type="number" min="1" v-model.number="campaignDraft.settings.state_extract_interval"></label>
+            <label>状态应用方式<select v-model="campaignDraft.settings.state_apply_mode"><option value="pending">待确认（推荐）</option><option value="auto">自动应用</option></select></label>
+            <label class="check-field"><input type="checkbox" v-model="campaignDraft.settings.state_tracking_enabled">启用 LLM 状态提议</label>
+          </div>
+          <div class="grid">
+            <label>状态字段说明 JSON<textarea class="json" v-model="campaignSchemaJson"></textarea></label>
+            <label>当前权威状态 JSON<textarea class="json" v-model="campaignStateJson"></textarea></label>
+          </div>
+        </div>
+        <div class="panel" v-if="campaignDraft.id">
+          <h3>绑定聊天会话</h3>
+          <div class="inline"><label>会话 ID<input v-model="campaignSessionId" placeholder="default:GroupMessage:..."></label><button @click="bindCampaignSession">绑定 / 移动到本战役</button></div>
+          <div class="activation" v-for="sid in campaignDraft.session_ids"><b>{{sid}}</b><button class="danger" @click="unbindCampaignSession(sid)">解绑</button></div>
+        </div>
+        <div class="panel" v-if="campaignDraft.id">
+          <div class="result-head"><div><h3>状态变更审核</h3><p class="muted">LLM 只提出补丁；确认后才改变权威状态。</p></div><span>{{campaignChanges.filter(x=>x.status==='pending').length}} 条待处理</span></div>
+          <div class="memory-card" v-for="change in campaignChanges">
+            <div class="result-head"><b>第 {{change.source_turn}} 轮 · {{change.status}}</b><small>{{formatTimestamp(change.created_at)}}</small></div>
+            <p>{{change.reason || '无说明'}}</p><pre>{{JSON.stringify(change.patch,null,2)}}</pre>
+            <div class="actions" v-if="change.status==='pending'"><button class="primary" @click="resolveCampaignChange(change,'apply')">应用</button><button @click="resolveCampaignChange(change,'reject')">拒绝</button></div>
+          </div>
+          <p v-if="!campaignChanges.length" class="muted">尚无状态候选。绑定会话并完成一轮 RP 后会在这里出现。</p>
+        </div>
+      </article>
+    </section>
     <section v-else-if="tab==='memories'" class="stack">
       <div class="panel">
         <h3>{{memoryDraft.id?'编辑长期记忆':'新增长期记忆'}}</h3>
         <p>自动提取的记忆会出现在这里。只有 active 且启用的记忆会注入 Prompt；pending 记忆需要确认后才会参与检索。</p>
         <div class="binding-form">
-          <label>作用域<select v-model="memoryDraft.scope_type" @change="updateMemoryScope"><option value="session">会话</option><option value="user">用户</option><option value="group">群组</option><option value="persona">Persona</option><option value="global">全局</option></select></label>
+          <label>作用域<select v-model="memoryDraft.scope_type" @change="updateMemoryScope"><option value="campaign">战役</option><option value="conversation">AstrBot 对话</option><option value="world">世界</option><option value="ruleset">规则集</option><option value="session">会话</option><option value="user">用户</option><option value="group">群组</option><option value="persona">Persona</option><option value="global">全局</option></select></label>
           <label>作用域 ID<input v-model="memoryDraft.scope_id" placeholder="会话 ID / 用户 ID / *"></label>
           <label>分类<select v-model="memoryDraft.category"><option value="preference">用户偏好</option><option value="relationship">角色关系</option><option value="plot">剧情节点</option><option value="status">长期状态</option></select></label>
           <label>状态<select v-model="memoryDraft.status"><option value="active">active</option><option value="pending">pending</option><option value="archived">archived</option><option value="rejected">rejected</option></select></label>
@@ -1383,14 +1845,23 @@ createApp({
         <div class="library-actions">
           <button class="primary" @click="refreshArchive">刷新分支树</button>
         </div>
-        <label class="combo">会话 ID
-          <input v-model="archive.session_id" placeholder="留空显示全部节点">
+        <label>会话
+          <select v-model="archive.session_id" @change="refreshArchive">
+            <option value="">全部会话</option>
+            <option v-for="session in sessionOptions" :value="session.id">{{session.title}} · {{session.platform}}</option>
+          </select>
         </label>
-        <button v-for="n in archiveTree" :class="['doc',{active:archive.selected?.id===n.id}]" @click="selectArchiveNode(n)" :style="{paddingLeft: (16 + n.depth * 18) + 'px'}">
-          <b>{{n.title||'（无标题）'}}</b>
-          <small>轮次 {{n.turn_index}} · {{n.branch_name||'主线'}} · {{formatTimestamp(n.created_at)}}</small>
-          <small>{{n.id}}</small>
-        </button>
+        <details v-for="segment in archiveSegments" :key="segment.segment" class="archive-segment" :open="segment.current">
+          <summary>
+            <span>{{segment.current ? '当前会话' : '已归档'}}</span>
+            <small>{{segment.root?.title || '未命名会话段'}} · {{segment.nodes.length}} 个节点</small>
+          </summary>
+          <button v-for="n in segment.nodes" :key="n.id" :class="['doc','archive-node',{active:archive.selected?.id===n.id}]" @click="selectArchiveNode(n)" :style="{paddingLeft: (16 + Math.min(n.depth, 5) * 18) + 'px'}">
+            <b>{{n.title||'（无标题）'}}</b>
+            <small>轮次 {{n.turn_index}} · {{n.branch_name||'主线'}} · {{formatTimestamp(n.created_at)}}</small>
+            <small>{{n.id}}</small>
+          </button>
+        </details>
         <p v-if="!archive.nodes.length" class="muted">还没有归档节点。真实请求完成后会自动保存。</p>
       </div>
       <article v-if="archive.selected" class="editor">
