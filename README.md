@@ -36,7 +36,7 @@
 ### 0.8.2
 
 - “当前游戏”页提升到导航顶部，支持在网页内完成一轮 RP、分批展开历史节点，并用顶部 toast 展示成功反馈。
-- 网页生成、自动摘要、长期记忆和战役状态等辅助模型调用统一使用 AstrBot Provider 的 contexts 参数，兼容 OpenAI-compatible 接口对 messages 字段的要求。
+- 网页生成、自动摘要、长期记忆和战役状态等辅助模型调用统一走 AstrBot Provider 的 prompt + contexts/system_prompt 形态，避免把 messages 作为未知参数传入后被下游兼容接口判定为空请求。
 - 版本号、插件元数据和 Web 面板包信息同步提升至 0.8.2。
 
 ### 0.8.1

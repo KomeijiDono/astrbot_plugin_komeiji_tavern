@@ -61,8 +61,8 @@ const labels = {
 }
 
 const tabs = [
-  ['home', '开始'],
   ['game', '当前游戏'],
+  ['home', '开始'],
   ['character', '角色卡'],
   ['character_group', '角色组'],
   ['preset', '提示词预设'],
@@ -80,8 +80,8 @@ const tabs = [
 ]
 
 const navGroups = [
-  ['开始游戏', ['game']],
-  ['创作资料', ['home', 'character', 'character_group', 'preset', 'lorebook', 'material', 'persona', 'quick_reply']],
+  ['游玩中枢', ['game', 'home']],
+  ['创作资料', ['character', 'character_group', 'preset', 'lorebook', 'material', 'persona']],
   ['生效与调试', ['bindings', 'debug', 'metrics']],
   ['长期系统', ['campaigns', 'memories', 'archive']],
   ['帮助', ['help']],
@@ -92,7 +92,7 @@ const navGroups = [
 
 const tabMeta = {
   home: { icon: '🌌', subtitle: '向导与就绪总览' },
-  game: { icon: '🎮', subtitle: '开局、存档与状态中枢' },
+  game: { icon: '🎮', subtitle: '实时对话、续写、HUD 与存档树' },
   character: { icon: '🎴', subtitle: '角色档案编构' },
   character_group: { icon: '👥', subtitle: '多角色协奏' },
   preset: { icon: '⚡', subtitle: '提示词积木装配' },
@@ -211,7 +211,7 @@ createApp({
   setup() {
     const storedTheme = readThemePreference()
     const theme = ref(storedTheme === 'light' ? 'light' : 'dark')
-    const tab = ref('home')
+    const tab = ref('game')
     const overview = ref({ counts: {}, tasks: [] })
     const documents = ref([])
     const bindings = ref([])
@@ -440,6 +440,9 @@ createApp({
     const expandContinueNodes = () => {
       continueVisibleCount.value = Math.min(sortedContinueNodes.value.length, continueVisibleCount.value + 10)
     }
+    const expandAllContinueNodes = () => {
+      continueVisibleCount.value = sortedContinueNodes.value.length || 1
+    }
     const collapseContinueNodes = () => {
       continueVisibleCount.value = 1
     }
@@ -452,7 +455,7 @@ createApp({
       const memory = preview.memory?.matches || []
       return { retrieval, memory }
     })
-    const compactStateRows = computed(() => currentStateRows.value.slice(0, 10))
+    const compactStateRows = computed(() => currentStateRows.value.slice(0, 8))
     const homeGuide = computed(() => {
       const counts = overview.value.counts || {}
       const hasPresetBinding = bindings.value.some(x => x.kind === 'preset')
@@ -949,6 +952,9 @@ createApp({
       const sessionId = debug.value.session_id || newGameDraft.value.session_id || ''
       newGameDraft.value.session_id = sessionId
       archive.value.session_id = sessionId
+      archive.value.selected = null
+      archive.value.branch_name = ''
+      playDraft.value.branch_name = ''
       await refreshCurrentGame()
       await refreshArchive()
     }
@@ -991,7 +997,7 @@ createApp({
         if (out.data.reply) playDraft.value.prompt = ''
         await refreshArchive()
         if (out.data.node_id) archive.value.selected = (await request('/archive/' + encodeURIComponent(out.data.node_id))).data
-        notice.value = out.data.conversation_synced ? '已在网页完成一轮并同步到 AstrBot conversation。' : '已在网页完成一轮并保存到插件分支树。'
+        notice.value = out.data.conversation_synced ? '一轮完成，已同步到 AstrBot conversation。' : '一轮完成，已保存到插件分支树。'
       } catch (e) {
         error.value = e.message
       } finally {
@@ -1257,7 +1263,7 @@ createApp({
       updateSelectedMemoryStatus, deleteMemory, refreshMetrics,
       editCampaign, resetCampaignDraft, saveCampaign, deleteCampaign,
       bindCampaignSession, unbindCampaignSession, resolveCampaignChange,
-      refreshCurrentGame, refreshPlayableSession, expandContinueNodes, collapseContinueNodes, clearSelectedContinueNode, previewPlayPrompt, playTurn, createPackFromCurrent, deleteRpPack, startNewGame,
+      refreshCurrentGame, refreshPlayableSession, expandContinueNodes, expandAllContinueNodes, collapseContinueNodes, clearSelectedContinueNode, previewPlayPrompt, playTurn, createPackFromCurrent, deleteRpPack, startNewGame,
       setCurrentStateValue, saveCurrentState, analyzeCurrentWorldbooks, riskLabel,
       refreshRetrievalStats, runRetrievalTest,
       move, moveMember, addMember, addBlock, addEntry, addQuickReply, removeQuickReply, applyQuickReply,
@@ -1381,23 +1387,27 @@ createApp({
     </section>
     <section v-else-if="tab==='game'" class="stack game-hub">
       <div class="panel game-toolbar">
-        <label>当前会话<select v-model="debug.session_id" @change="refreshPlayableSession"><option value="">请选择</option><option v-for="session in sessionOptions" :value="session.id">{{session.title}} · {{session.platform}}</option></select></label>
+        <div class="game-session-copy">
+          <span class="live-dot"></span>
+          <div><b>当前游戏</b><small>选择一个 AstrBot 会话后，网页会按当前绑定直接完成一轮实时 RP。</small></div>
+        </div>
+        <label>会话<select v-model="debug.session_id" @change="refreshPlayableSession"><option value="">请选择</option><option v-for="session in sessionOptions" :value="session.id">{{session.title}} · {{session.platform}}</option></select></label>
         <button @click="refreshPlayableSession">刷新</button>
-        <button v-if="currentGame.campaign && !currentGame.pack" @click="createPackFromCurrent">将当前战役保存为整合包</button>
+        <button v-if="currentGame.campaign && !currentGame.pack" @click="createPackFromCurrent">保存为整合包</button>
       </div>
 
       <div v-if="currentGame.campaign" class="hero game-hero">
         <small>{{currentGame.pack ? 'RP PACK · '+currentGame.pack.name : 'CUSTOM CAMPAIGN'}}</small>
         <h3>{{currentGame.campaign.name}}</h3>
-        <p>{{currentGame.campaign.description}}</p>
+        <p>{{currentGame.campaign.description || '这局游戏还没有简介，但状态、记忆和分支树已经接入。'}}</p>
         <div class="steps"><button @click="tab='archive'">查看存档树</button><button @click="tab='campaigns';editCampaign(currentGame.campaign)">高级战役设置</button></div>
       </div>
-      <div v-else class="panel empty"><h3>这个会话还没有游戏</h3><p>从下方选择一个 RP 整合包即可一键开局。</p></div>
+      <div v-else class="panel empty game-empty"><h3>这个会话还没有游戏</h3><p>先从下方选择一个 RP 整合包开局；如果你刚 reset 过，请点一次刷新，页面会回到最新 conversation。</p></div>
 
-      <div v-if="currentGame.campaign" class="panel continue-board">
-        <div class="result-head">
-          <div><h3>网页接着玩</h3><p class="muted">像酒馆一样在这里直接输入玩家行动；系统会使用当前绑定、世界书、长期记忆、战役状态和选中的剧情分支。</p></div>
-          <div class="actions"><button @click="tab='archive'">完整存档树</button><button @click="clearSelectedContinueNode" :disabled="!archive.selected">回到当前最新</button><button @click="previewPlayPrompt" :disabled="busy">预览本轮 Prompt</button></div>
+      <div v-if="currentGame.campaign" class="panel continue-board play-cockpit">
+        <div class="result-head cockpit-head">
+          <div><h3>实时对话驾驶台</h3><p class="muted">左侧是主线/分支存档，新的轮次永远在最上方；中间输入玩家行动；右侧 HUD 只保留本轮最需要看的状态。</p></div>
+          <div class="actions"><button @click="tab='archive'">完整存档树</button><button @click="clearSelectedContinueNode" :disabled="!archive.selected">回到当前最新</button><button @click="previewPlayPrompt" :disabled="busy">预览 Prompt</button></div>
         </div>
         <div class="summary-grid continue-stats">
           <div class="summary-card ready"><span>当前战役</span><b>{{currentGame.campaign.name}}</b></div>
@@ -1406,42 +1416,54 @@ createApp({
           <div class="summary-card" :class="{warn:pendingCurrentChanges.length}"><span>待确认状态</span><b>{{pendingCurrentChanges.length}}</b></div>
         </div>
         <div class="continue-layout">
-          <div class="continue-map">
-            <button v-for="node in continueTimeline" :key="node.id" :class="['continue-node',{active:archive.selected?.id===node.id,latest:latestContinueNode?.id===node.id}]" @click="selectArchiveNode(node)" :style="{paddingLeft: (18 + Math.min(node.depth || 0, 5) * 14) + 'px'}">
+          <aside class="continue-map">
+            <div class="continue-map-head">
+              <div><b>主线时间线</b><small>最新在上 · 默认只露出当前轮</small></div>
+              <span>{{continueTimeline.length}} / {{sortedContinueNodes.length}}</span>
+            </div>
+            <div class="continue-map-actions" v-if="hiddenContinueCount || continueVisibleCount > 1">
+              <button v-if="hiddenContinueCount" class="ghost compact" @click="expandContinueNodes">再展开 10 轮</button>
+              <button v-if="hiddenContinueCount" class="ghost compact" @click="expandAllContinueNodes">展开全部</button>
+              <button v-if="continueVisibleCount > 1" class="ghost compact" @click="collapseContinueNodes">折叠</button>
+            </div>
+            <button v-for="node in continueTimeline" :key="node.id" :class="['continue-node',{active:archive.selected?.id===node.id,latest:latestContinueNode?.id===node.id}]" @click="selectArchiveNode(node)" :style="{paddingLeft: (18 + Math.min(node.depth || 0, 5) * 12) + 'px'}">
               <span>{{node.branch_name || '主线'}}</span>
               <b>{{node.title || '未命名节点'}}</b>
               <small>第 {{node.turn_index}} 轮 · {{formatTimestamp(node.created_at)}}</small>
             </button>
-            <button v-if="hiddenContinueCount" class="ghost compact" @click="expandContinueNodes">继续展开旧节点（还剩 {{hiddenContinueCount}}）</button>
-            <button v-if="continueVisibleCount > 1" class="ghost compact" @click="collapseContinueNodes">折叠旧节点</button>
+            <button v-if="hiddenContinueCount" class="ghost compact continue-more" @click="expandContinueNodes">继续展开旧节点（还剩 {{hiddenContinueCount}}）</button>
             <p v-if="!continueTimeline.length" class="muted">还没有自动归档节点。完成一次真实 RP 后，这里会出现可继续的剧情路线。</p>
-          </div>
+          </aside>
+
           <div class="play-console">
             <div class="play-transcript">
               <article v-if="archive.selected?.assistant_text" class="chat-bubble assistant"><small>选中存档 · {{archive.selected.branch_name || '主线'}} · 第 {{archive.selected.turn_index}} 轮</small><pre>{{archive.selected.assistant_text}}</pre></article>
-              <article v-else-if="selectedContinueNode" class="chat-bubble assistant"><small>最新节点 · {{selectedContinueNode.branch_name || '主线'}} · 第 {{selectedContinueNode.turn_index}} 轮</small><p>选择左侧节点可查看回复；不选节点时将从当前会话继续。</p></article>
+              <article v-else-if="selectedContinueNode" class="chat-bubble assistant pending"><small>{{latestContinueNode?.id===selectedContinueNode.id ? '最新节点' : '存档节点'}} · {{selectedContinueNode.branch_name || '主线'}} · 第 {{selectedContinueNode.turn_index}} 轮</small><p>点左侧节点可读取完整回复；不选择节点时，下一轮会接当前会话最新剧情继续。</p></article>
               <article v-if="playResult?.reply" class="chat-bubble assistant live"><small>刚生成 · {{playResult.provider_id || 'current provider'}} · {{playResult.conversation_synced ? '已同步 AstrBot' : '插件分支树'}}</small><pre>{{playResult.reply}}</pre></article>
-              <p v-if="!archive.selected?.assistant_text && !playResult?.reply" class="muted">这里会显示选中存档或刚生成的回复。输入玩家行动后，网页会直接完成一轮 RP 并自动保存新节点。</p>
+              <p v-if="!archive.selected?.assistant_text && !playResult?.reply && !selectedContinueNode" class="muted">这里会显示选中存档或刚生成的回复。输入玩家行动后，网页会直接完成一轮 RP 并自动保存新节点。</p>
             </div>
 
-            <label>玩家行动 / 续写要求<textarea v-model="playDraft.prompt" placeholder="例如：我推开门，压低声音问她刚才听见了什么。"></textarea></label><p class="muted play-note">{{archive.selected ? '将从选中节点另起/续写分支。' : '未选节点时会接当前最新剧情。'}}</p>
+            <label class="composer-field"><span>玩家行动 / 续写要求</span><textarea v-model="playDraft.prompt" placeholder="例如：我推开门，压低声音问她刚才听见了什么。"></textarea></label>
+            <p class="muted play-note">{{archive.selected ? '将从选中节点另起/续写分支。' : '未选节点时会接当前最新剧情。'}}</p>
             <div class="play-controls">
               <label>模式<select v-model="playDraft.mode"><option value="normal">普通生成</option><option value="continue">继续上一段</option><option value="impersonate">代写玩家</option><option value="quiet">静默提示</option></select></label>
               <label>分支名<input v-model="playDraft.branch_name" placeholder="可选：if线 / 重开 / 主线"></label>
-              <button class="primary" @click="playTurn" :disabled="busy">{{busy ? '生成中…' : '在网页里继续'}}</button>
+              <button class="primary" @click="playTurn" :disabled="busy">{{busy ? '生成中…' : '发送这一轮'}}</button>
             </div>
             <label v-if="playDraft.mode==='quiet'">静默提示<textarea v-model="playDraft.quiet_prompt" placeholder="仅作为本轮约束，不直接作为玩家台词。"></textarea></label>
           </div>
+
           <aside class="play-hud">
-            <div><h4>状态 HUD</h4><div class="state-pills"><span v-for="row in compactStateRows"><b>{{row.path}}</b>{{row.value || '—'}}</span></div></div>
-            <div><h4>命中可视化</h4><p class="muted" v-if="!continueHits.retrieval.length && !continueHits.memory.length">生成后显示本轮世界书/素材检索与长期记忆命中。</p><div class="hit-chip" v-for="hit in continueHits.retrieval.slice(0,6)">世界书 · {{hit.name || hit.uid}}</div><div class="hit-chip memory" v-for="hit in continueHits.memory.slice(0,6)">记忆 · {{hit.category}} · {{hit.content}}</div></div>
-            <div><h4>待确认状态</h4><div v-for="change in pendingCurrentChanges.slice(0,4)" class="mini-change"><b>{{riskLabel(change.risk_level)}} · 第 {{change.source_turn}} 轮</b><small>{{change.reason}}</small><div class="actions"><button @click="resolveCampaignChange(change,'apply');refreshCurrentGame()">应用</button><button @click="resolveCampaignChange(change,'reject');refreshCurrentGame()">拒绝</button></div></div><p v-if="!pendingCurrentChanges.length" class="muted">暂无待确认补丁。</p></div>
+            <div class="hud-card"><h4>状态 HUD</h4><div class="state-pills"><span v-for="row in compactStateRows"><b>{{row.path}}</b>{{row.value || '—'}}</span></div><p v-if="currentStateRows.length > compactStateRows.length" class="muted hud-more">还有 {{currentStateRows.length - compactStateRows.length}} 项，去“当前权威状态”查看。</p></div>
+            <div class="hud-card"><h4>命中</h4><p class="muted" v-if="!continueHits.retrieval.length && !continueHits.memory.length">生成后显示本轮世界书/素材检索与长期记忆命中。</p><div class="hit-chip" v-for="hit in continueHits.retrieval.slice(0,5)">世界书 · {{hit.name || hit.uid}}</div><div class="hit-chip memory" v-for="hit in continueHits.memory.slice(0,5)">记忆 · {{hit.category}} · {{hit.content}}</div></div>
+            <div class="hud-card"><h4>状态候选</h4><div v-for="change in pendingCurrentChanges.slice(0,3)" class="mini-change"><b>{{riskLabel(change.risk_level)}} · 第 {{change.source_turn}} 轮</b><small>{{change.reason}}</small><div class="actions"><button @click="resolveCampaignChange(change,'apply');refreshCurrentGame()">应用</button><button @click="resolveCampaignChange(change,'reject');refreshCurrentGame()">拒绝</button></div></div><p v-if="!pendingCurrentChanges.length" class="muted">暂无待确认补丁。</p></div>
           </aside>
         </div>
       </div>
 
-      <div class="panel">
-        <div class="result-head"><div><h3>新游戏向导</h3><p class="muted">自动归档旧战役、初始化状态、绑定全部资料并新建 AstrBot conversation。</p></div><button class="primary" @click="startNewGame" :disabled="busy">开始新游戏</button></div>
+      <details class="panel new-game-dock" :open="!currentGame.campaign">
+        <summary><span>新游戏向导</span><small>整合包开局、初始化状态、绑定资料并处理 AstrBot conversation</small></summary>
+        <div class="result-head"><div><h3>开始新游戏</h3><p class="muted">自动归档旧战役、初始化状态、绑定全部资料并新建 AstrBot conversation。</p></div><button class="primary" @click="startNewGame" :disabled="busy">开始新游戏</button></div>
         <div class="grid">
           <label>RP整合包<select v-model="newGameDraft.pack_id"><option value="">请选择</option><option v-for="pack in rpPacks" :value="pack.id">{{pack.name}}</option></select></label>
           <label>游戏名称<input v-model="newGameDraft.name" placeholder="留空使用整合包名称"></label>
@@ -1450,9 +1472,9 @@ createApp({
           <label>AstrBot处理<select v-model="newGameDraft.conversation_mode"><option value="new">新建 conversation（推荐）</option><option value="clear">清空当前 conversation</option></select></label>
           <label class="check-field"><input type="checkbox" v-model="newGameDraft.archive_current">归档当前战役</label>
         </div>
-        <p v-if="!rpPacks.length" class="muted">还没有整合包。如果当前会话已有战役，点击页面顶部“将当前战役保存为整合包”。</p>
+        <p v-if="!rpPacks.length" class="muted">还没有整合包。如果当前会话已有战役，点击页面顶部“保存为整合包”。</p>
         <div class="activation" v-for="pack in rpPacks"><div><b>{{pack.name}}</b><small>{{pack.description}}</small></div><button class="danger" @click="deleteRpPack(pack)">删除整合包</button></div>
-      </div>
+      </details>
 
       <div v-if="currentGame.campaign" class="panel">
         <div class="result-head"><div><h3>当前权威状态</h3><p class="muted">普通字段直接编辑；复杂结构仍可在高级战役设置中维护。</p></div><button class="primary" @click="saveCurrentState">保存状态</button></div>

@@ -3,7 +3,7 @@
 ## 0.8.2：实时游戏驾驶台与 Provider 调用修复
 
 - “当前游戏”页移到导航顶部，接着玩驾驶台支持最新战役置顶、历史节点分批继续展开、成功提示改为自动收起的顶部 toast。
-- 修复网页生成、自动摘要、长期记忆和战役状态等辅助模型调用 AstrBot Provider 时参数名不匹配的问题，统一使用 contexts 传递 OpenAI 格式消息，避免 OpenAI-compatible 接口报 field messages is required。
+- 修复网页生成、自动摘要、长期记忆和战役状态等辅助模型调用 AstrBot Provider 时参数形态不匹配的问题，统一走 prompt + contexts/system_prompt，并阻止 messages 原样透传到 Provider，避免 OpenAI-compatible 接口报 field messages is required。
 - 插件、元数据和 Web 面板版本同步提升至 0.8.2。
 
 ## 0.8.1：分支树窄屏修复

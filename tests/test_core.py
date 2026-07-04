@@ -265,11 +265,11 @@ class CampaignStateTests(unittest.TestCase):
             self.assertIn("我推开门", json.dumps(node["request_messages"], ensure_ascii=False))
             self.assertEqual(storage.get_session("session-web")["current_story_node_id"], result["node_id"])
             self.assertTrue(provider.calls)
-            self.assertIn("messages", provider.calls[0])
-            self.assertNotIn("prompt", provider.calls[0])
-            self.assertTrue(any(item["role"] == "user" and "我推开门" in item["content"] for item in provider.calls[0]["messages"]))
+            self.assertNotIn("messages", provider.calls[0])
+            self.assertIn("prompt", provider.calls[0])
+            self.assertIn("我推开门", provider.calls[0]["prompt"])
 
-    def test_web_chat_completion_falls_back_for_legacy_prompt_providers(self):
+    def test_web_chat_completion_uses_astrbot_prompt_contexts_shape(self):
         calls = []
 
         class Provider:
@@ -302,10 +302,11 @@ class CampaignStateTests(unittest.TestCase):
         ))
         self.assertEqual(response.completion_text, "ok")
         self.assertEqual(provider_id, "legacy-provider")
-        self.assertIn("messages", calls[0])
-        self.assertEqual(calls[1]["prompt"], "continue")
-        self.assertEqual(calls[1]["contexts"], [{"role": "assistant", "content": "previous"}])
-        self.assertEqual(calls[1]["system_prompt"], "rules")
+        self.assertEqual(len(calls), 1)
+        self.assertNotIn("messages", calls[0])
+        self.assertEqual(calls[0]["prompt"], "continue")
+        self.assertEqual(calls[0]["contexts"], [{"role": "assistant", "content": "previous"}])
+        self.assertEqual(calls[0]["system_prompt"], "rules")
 
 
 class ExportTests(unittest.TestCase):

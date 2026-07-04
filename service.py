@@ -831,6 +831,30 @@ class TavernService:
                 key: value for key, value in kwargs.items()
                 if key not in {"messages", "prompt", "contexts", "system_prompt"}
             }
+
+            def add_variant(payload: dict[str, Any]) -> None:
+                cleaned: dict[str, Any] = {}
+                for key, value in payload.items():
+                    if key in {"prompt", "system_prompt"} and not str(value or ""):
+                        continue
+                    if key == "contexts" and not value:
+                        continue
+                    cleaned[key] = value
+                if cleaned and all(cleaned != item for item in variants):
+                    variants.append(cleaned)
+
+            def split_messages(messages: list[dict[str, Any]]) -> tuple[str, list[dict[str, Any]], str]:
+                system_prompt = "\n\n".join(
+                    self._message_text(item) for item in messages if item.get("role") == "system"
+                ).strip()
+                chat_messages = [item for item in messages if item.get("role") != "system"]
+                prompt = ""
+                contexts = list(chat_messages)
+                if contexts and contexts[-1].get("role") == "user":
+                    prompt = self._message_text(contexts[-1])
+                    contexts = contexts[:-1]
+                return system_prompt, contexts, prompt
+
             if "messages" in kwargs:
                 normalized = [
                     item for item in (
@@ -839,21 +863,24 @@ class TavernService:
                     if item is not None
                 ]
                 if normalized:
-                    variants.append({**passthrough, "contexts": normalized})
+                    system_prompt, contexts, prompt = split_messages(normalized)
+                    add_variant({**passthrough, "contexts": contexts, "prompt": prompt, "system_prompt": system_prompt})
+                    add_variant({**passthrough, "contexts": normalized})
+                    add_variant({**passthrough, "prompt": self._messages_as_transcript(normalized)})
             else:
-                messages: list[dict[str, Any]] = []
-                system_prompt = str(kwargs.get("system_prompt", "") or "").strip()
-                if system_prompt:
-                    messages.append({"role": "system", "content": system_prompt})
-                messages.extend(self._normalize_messages(list(kwargs.get("contexts") or [])))
+                contexts = self._normalize_messages(list(kwargs.get("contexts") or []))
                 prompt = str(kwargs.get("prompt", "") or "")
-                if prompt:
-                    messages.append({"role": "user", "content": prompt})
-                if messages:
-                    variants.append({**passthrough, "contexts": messages})
-            original = dict(kwargs)
-            if not variants or all(variant != original for variant in variants):
-                variants.append(original)
+                system_prompt = str(kwargs.get("system_prompt", "") or "").strip()
+                add_variant({**passthrough, "contexts": contexts, "prompt": prompt, "system_prompt": system_prompt})
+                if contexts or system_prompt:
+                    normalized = (
+                        ([{"role": "system", "content": system_prompt}] if system_prompt else [])
+                        + contexts
+                        + ([{"role": "user", "content": prompt}] if prompt else [])
+                    )
+                    add_variant({**passthrough, "contexts": normalized})
+                    if prompt and contexts:
+                        add_variant({**passthrough, "prompt": self._messages_as_transcript(normalized)})
             return variants
 
         def add_candidate(candidate: Any, candidate_id: str = "") -> None:
@@ -951,20 +978,13 @@ class TavernService:
         transcript = self._messages_as_transcript(normalized)
         if not current_prompt:
             current_prompt = transcript
-        try:
-            return await self._text_chat_with_fallback(
-                session_id=session_id, provider=provider, contexts=normalized,
-            )
-        except TypeError:
-            try:
-                return await self._text_chat_with_fallback(
-                    session_id=session_id, provider=provider,
-                    prompt=current_prompt, contexts=contexts, system_prompt=system_prompt,
-                )
-            except TypeError:
-                return await self._text_chat_with_fallback(
-                    session_id=session_id, provider=provider, prompt=transcript,
-                )
+        return await self._text_chat_with_fallback(
+            session_id=session_id,
+            provider=provider,
+            prompt=current_prompt,
+            contexts=contexts,
+            system_prompt=system_prompt,
+        )
 
     @staticmethod
     def _parse_memory_items(text: str) -> list[dict[str, str]]:
