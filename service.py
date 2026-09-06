@@ -12,11 +12,26 @@ from types import SimpleNamespace
 from typing import Any
 
 from astrbot.api import logger
+from astrbot.core.agent.tool import ToolSet
 
+from .cipher import CipherCodec
+from .constants import PLUGIN_VERSION
 from .lore import LoreScanner, normalize_entries
 from .models import BuildResult, LoreEntry, ScanResult
 from .prompt_builder import PromptBuilder, estimate_tokens
 from .storage import TavernStorage
+from .url_request import (
+    FETCH_TOOL_NAME,
+    SUBMIT_REPLY_TOOL_NAME,
+    URLRequestBroker,
+    URLRequestHandle,
+    URLRequestProtocolError,
+    build_fetch_tool,
+    build_submit_reply_tool,
+    request_url_user_prompt,
+    strip_reasoning_tags,
+    url_request_overhead_text,
+)
 
 PLUGIN_TAG = "[Komeiji's Tavern]"
 DEFAULT_MEMORY_PROMPT = """从以下角色扮演聊天中提取需要长期保留的记忆。
@@ -108,6 +123,45 @@ class TavernService:
         self.storage = storage
         self.context = context
         self.config = config
+        self.cipher = CipherCodec(str(config.get("cipher_method", "base64_utf8")))
+        url_request_enabled = bool(config.get("url_request_enabled", False))
+        cipher_enabled = (
+            bool(config.get("cipher_enabled", False))
+            and not url_request_enabled
+        )
+        self.url_requests = URLRequestBroker(
+            enabled=url_request_enabled,
+            backend=str(config.get("url_request_backend", "local") or "local"),
+            public_base_url=str(
+                config.get("url_request_public_base_url", "") or ""
+            ),
+            listen_host=str(
+                config.get("url_request_listen_host", "0.0.0.0") or "0.0.0.0"
+            ),
+            listen_port=int(config.get("url_request_listen_port", 6190) or 6190),
+            ttl_seconds=int(
+                config.get("url_request_ttl_seconds", 600) or 600
+            ),
+            fetch_tool_enabled=bool(
+                config.get("url_request_fetch_tool_enabled", True)
+            ),
+            reply_tool_enabled=bool(
+                config.get("url_request_reply_tool_enabled", True)
+            ),
+            plugin_version=PLUGIN_VERSION,
+            hosted_api_base_url=str(
+                config.get("url_request_hosted_api_base_url", "") or ""
+            ),
+            hosted_api_key=str(
+                config.get("url_request_hosted_api_key", "") or ""
+            ),
+            hosted_timeout_seconds=int(
+                config.get("url_request_hosted_timeout_seconds", 10) or 10
+            ),
+            hosted_proxy_url=str(
+                config.get("url_request_hosted_proxy_url", "") or ""
+            ),
+        )
         self.scanner = LoreScanner(
             default_scan_depth=int(config.get("scan_depth", 4)),
             max_recursion_steps=int(config.get("max_recursion_steps", 3)),
@@ -118,10 +172,127 @@ class TavernService:
             history_first_trimming=bool(config.get("history_first_trimming", True)),
             history_keep_recent_messages=int(config.get("history_keep_recent_messages", 6)),
             history_max_messages=int(config.get("history_max_messages", 12)),
+            content_token_estimator=(
+                lambda text: estimate_tokens(self.cipher.encode_payload(text))
+                if cipher_enabled else estimate_tokens(text)
+            ),
+            request_overhead_tokens=(
+                estimate_tokens(
+                    url_request_overhead_text(
+                        fetch_tool_enabled=self.url_requests.fetch_tool_enabled,
+                        reply_tool_enabled=self.url_requests.reply_tool_enabled,
+                    )
+                )
+                if url_request_enabled
+                else estimate_tokens(self.cipher.protocol_prompt)
+                if cipher_enabled
+                else 0
+            ),
+            message_overhead_tokens=(
+                estimate_tokens(self.cipher.encode_content("")) if cipher_enabled else 0
+            ),
         )
         self._embedding_cache: OrderedDict[str, list[float]] = OrderedDict()
         self._embedding_cache_limit = 512
         self._session_locks: dict[str, asyncio.Lock] = {}
+
+    @property
+    def cipher_enabled(self) -> bool:
+        return bool(self.config.get("cipher_enabled", False)) and not self.url_request_enabled
+
+    @property
+    def cipher_configured(self) -> bool:
+        return bool(self.config.get("cipher_enabled", False))
+
+    @property
+    def url_request_enabled(self) -> bool:
+        return bool(self.config.get("url_request_enabled", False))
+
+    def provider_messages(self, result: BuildResult) -> list[dict[str, Any]]:
+        messages = copy.deepcopy(result.messages)
+        return self.cipher.encode_messages(messages) if self.cipher_enabled else messages
+
+    def provider_request_parts(
+        self, result: BuildResult,
+    ) -> tuple[str, list[dict[str, Any]], str]:
+        if not self.cipher_enabled:
+            return (
+                result.system_prompt,
+                copy.deepcopy(result.contexts),
+                result.current_prompt,
+            )
+        encoded_system = self.cipher.encode_content(result.system_prompt) if result.system_prompt else ""
+        system_prompt = (
+            f"{self.cipher.protocol_prompt}\n\n{encoded_system}".strip()
+        )
+        contexts = []
+        for message in result.contexts:
+            item = copy.deepcopy(message)
+            item["content"] = self.cipher.encode_content(
+                self._message_text(message)
+            )
+            contexts.append(item)
+        prompt = (
+            self.cipher.encode_content(result.current_prompt)
+            if result.current_prompt else ""
+        )
+        return system_prompt, contexts, prompt
+
+    def cipher_metadata(self, *, provider_encoded: bool) -> dict[str, Any]:
+        if not self.cipher_enabled:
+            return {
+                "enabled": self.cipher_configured,
+                "method": self.cipher.method,
+                "provider_request_encoded": False,
+                "stored_messages": "plaintext",
+                "suppressed_by_url_request": (
+                    self.cipher_configured and self.url_request_enabled
+                ),
+            }
+        return self.cipher.metadata(provider_encoded=provider_encoded)
+
+    def url_request_metadata(
+        self,
+        *,
+        provider_externalized: bool,
+    ) -> dict[str, Any]:
+        return {
+            "enabled": self.url_request_enabled,
+            "provider_request_externalized": bool(
+                provider_externalized and self.url_request_enabled
+            ),
+            "page_format": "html_with_json_content_negotiation",
+            "backend": self.url_requests.backend,
+            "hosted_proxy_configured": bool(
+                self.url_requests.hosted_proxy_url
+            ),
+            "fetch_tool_enabled": self.url_requests.fetch_tool_enabled,
+            "reply_tool_enabled": self.url_requests.reply_tool_enabled,
+            "stored_messages": "plaintext",
+            "temporary_storage": (
+                "remote_d1_with_local_runtime_copy"
+                if self.url_requests.backend == "hosted"
+                else "memory_only"
+            ),
+            "cleanup": "delete_on_completion_with_ttl_fallback",
+            "ttl_seconds": self.url_requests.ttl_seconds,
+            "cipher_suppressed": (
+                self.url_request_enabled and self.cipher_configured
+            ),
+        }
+
+    def decode_model_response(self, text: str) -> tuple[str, bool, str]:
+        raw = str(text or "")
+        if not self.cipher_enabled:
+            return raw, True, ""
+        decoded = self.cipher.decode_response(raw)
+        if decoded.ok:
+            return decoded.text, True, decoded.error
+        failure = (
+            f"【密文回复自动解码失败：{decoded.error}】\n"
+            f"模型原始输出：\n{raw}"
+        )
+        return failure, False, decoded.error
 
     def _session_lock(self, session_id: str) -> asyncio.Lock:
         return self._session_locks.setdefault(session_id, asyncio.Lock())
@@ -135,6 +306,7 @@ class TavernService:
     async def reset_session(self, session_id: str) -> None:
         async with self._session_lock(session_id):
             await asyncio.to_thread(self.storage.reset_session, session_id)
+            await asyncio.to_thread(self.storage.close_candidate_groups, session_id)
 
     async def rollback_history_state(self, session_id: str) -> None:
         """Discard derived state from the removed turn while keeping its archive node recoverable."""
@@ -156,10 +328,172 @@ class TavernService:
                 state["turn"] = max(0, int(state.get("turn", 0) or 0) - 1)
             await asyncio.to_thread(self.storage.save_session, session_id, state)
             await asyncio.to_thread(self.storage.delete_preview, session_id)
+            await asyncio.to_thread(self.storage.close_candidate_groups, session_id)
             if removed_turn > 0:
                 await asyncio.to_thread(
                     self.storage.delete_auto_memories_for_turn, session_id, removed_turn
                 )
+
+    async def prepare_swipe(
+        self,
+        *,
+        session_id: str,
+        conversation_id: str,
+        base_history: list[dict[str, Any]],
+        user_message: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Create/load the latest candidate group and restore its pre-turn state."""
+        async with self._session_lock(session_id):
+            state = await asyncio.to_thread(self.storage.get_session, session_id)
+            current_node_id = str(state.get("current_story_node_id", "") or "")
+            current_node = (
+                await asyncio.to_thread(self.storage.get_story_node, current_node_id)
+                if current_node_id else None
+            )
+            if not current_node:
+                raise ValueError("当前回复没有分支快照，无法创建候选。请确认已启用分支树归档。")
+
+            group = await asyncio.to_thread(
+                self.storage.active_candidate_group, session_id
+            )
+            if group:
+                if str(group.get("conversation_id", "")) != str(conversation_id):
+                    await asyncio.to_thread(self.storage.close_candidate_groups, session_id)
+                    group = None
+                elif str(group.get("selected_node_id", "")) != current_node_id:
+                    raise ValueError("当前剧情已离开候选回复所在轮次，不能继续 Swipe。")
+
+            if not group:
+                base_state = copy.deepcopy(
+                    current_node.get("base_state_snapshot", {})
+                    if isinstance(current_node.get("base_state_snapshot"), dict)
+                    else {}
+                )
+                if not base_state:
+                    parent_id = str(current_node.get("parent_id", "") or "")
+                    parent = (
+                        await asyncio.to_thread(self.storage.get_story_node, parent_id)
+                        if parent_id else None
+                    )
+                    base_state = copy.deepcopy(
+                        (parent or {}).get("state_snapshot", {})
+                        if isinstance((parent or {}).get("state_snapshot"), dict)
+                        else {}
+                    )
+                base_campaign = copy.deepcopy(
+                    current_node.get("base_campaign_snapshot", {})
+                    if isinstance(current_node.get("base_campaign_snapshot"), dict)
+                    else {}
+                )
+                base_state.pop("_campaign_state", None)
+                group = await asyncio.to_thread(
+                    self.storage.create_candidate_group,
+                    {
+                        "session_id": session_id,
+                        "conversation_id": conversation_id,
+                        "parent_node_id": str(current_node.get("parent_id", "") or ""),
+                        "source_node_id": current_node_id,
+                        "selected_node_id": current_node_id,
+                        "user_message": copy.deepcopy(user_message),
+                        "base_history": copy.deepcopy(base_history),
+                        "base_state": base_state,
+                        "base_campaign_state": base_campaign,
+                    },
+                )
+
+            nodes = await asyncio.to_thread(
+                self.storage.list_candidate_nodes, str(group["id"])
+            )
+            limit = max(2, int(self.config.get("swipe_candidate_limit", 5) or 5))
+            if len(nodes) >= limit:
+                raise ValueError(f"本轮已经保留 {len(nodes)} 个候选，达到上限 {limit}。")
+
+            restored_state = copy.deepcopy(group.get("base_state", {}))
+            restored_state["current_story_node_id"] = str(
+                group.get("parent_node_id", "") or ""
+            )
+            restored_state["astrbot_conversation_id"] = str(conversation_id or "")
+            await asyncio.to_thread(self.storage.save_session, session_id, restored_state)
+            await asyncio.to_thread(self.storage.delete_preview, session_id)
+            removed_turn = int(state.get("turn", 0) or 0)
+            if removed_turn > 0:
+                await asyncio.to_thread(
+                    self.storage.delete_auto_memories_for_turn,
+                    session_id,
+                    removed_turn,
+                )
+            campaign = await asyncio.to_thread(
+                self.storage.campaign_for_session, session_id
+            )
+            if campaign and isinstance(group.get("base_campaign_state"), dict):
+                campaign["state_data"] = copy.deepcopy(group["base_campaign_state"])
+                await asyncio.to_thread(self.storage.save_campaign, campaign)
+
+            return {
+                "group_id": str(group["id"]),
+                "parent_node_id": str(group.get("parent_node_id", "") or ""),
+                "candidate_index": len(nodes) + 1,
+                "base_history": copy.deepcopy(group.get("base_history", [])),
+                "user_message": copy.deepcopy(group.get("user_message", {})),
+            }
+
+    async def candidate_group(self, session_id: str) -> dict[str, Any] | None:
+        group = await asyncio.to_thread(self.storage.active_candidate_group, session_id)
+        if not group:
+            return None
+        group["nodes"] = await asyncio.to_thread(
+            self.storage.list_candidate_nodes, str(group["id"])
+        )
+        group["limit"] = max(
+            2, int(self.config.get("swipe_candidate_limit", 5) or 5)
+        )
+        return group
+
+    async def select_candidate(
+        self, session_id: str, candidate_index: int
+    ) -> dict[str, Any]:
+        async with self._session_lock(session_id):
+            group = await asyncio.to_thread(
+                self.storage.active_candidate_group, session_id
+            )
+            if not group:
+                raise ValueError("当前最新一轮没有可切换的候选回复。")
+            nodes = await asyncio.to_thread(
+                self.storage.list_candidate_nodes, str(group["id"])
+            )
+            target = next(
+                (
+                    node for node in nodes
+                    if int(node.get("candidate_index", 0) or 0) == int(candidate_index)
+                ),
+                None,
+            )
+            if not target:
+                raise ValueError("找不到这个候选编号。")
+            await asyncio.to_thread(
+                self.storage.select_candidate_node,
+                str(group["id"]),
+                str(target["id"]),
+            )
+            await asyncio.to_thread(
+                self.storage.sync_candidate_state_changes,
+                str(group["id"]),
+                str(target["id"]),
+            )
+            state = copy.deepcopy(target.get("state_snapshot", {}))
+            campaign_state = state.pop("_campaign_state", None)
+            state["current_story_node_id"] = str(target["id"])
+            await asyncio.to_thread(self.storage.save_session, session_id, state)
+            preview = target.get("preview_payload")
+            if isinstance(preview, dict):
+                await asyncio.to_thread(self.storage.save_preview, session_id, preview)
+            campaign = await asyncio.to_thread(
+                self.storage.campaign_for_session, session_id
+            )
+            if campaign and isinstance(campaign_state, dict):
+                campaign["state_data"] = copy.deepcopy(campaign_state)
+                await asyncio.to_thread(self.storage.save_campaign, campaign)
+            return target
 
     async def set_pending_branch(self, session_id: str, node_id: str, branch_name: str = "") -> bool:
         node = await asyncio.to_thread(self.storage.get_story_node, node_id)
@@ -189,6 +523,11 @@ class TavernService:
                 **({"_campaign_state": copy.deepcopy(campaign.get("state_data", {}))} if campaign else {}),
             )
             node_id = await asyncio.to_thread(self.storage.create_story_node, payload)
+            candidate_group_id = str(payload.get("candidate_group_id", "") or "")
+            if candidate_group_id:
+                await asyncio.to_thread(
+                    self.storage.select_candidate_node, candidate_group_id, node_id
+                )
             state["current_story_node_id"] = node_id
             state.pop("archive_new_root", None)
             await asyncio.to_thread(self.storage.save_session, session_id, state)
@@ -207,6 +546,25 @@ class TavernService:
                     )
                 except Exception as exc:
                     logger.warning("%s 战役状态提取失败，已跳过本轮: %s", PLUGIN_TAG, exc)
+            final_campaign = await asyncio.to_thread(
+                self.storage.campaign_for_session, session_id
+            )
+            final_snapshot = dict(
+                copy.deepcopy(state),
+                **(
+                    {"_campaign_state": copy.deepcopy(final_campaign.get("state_data", {}))}
+                    if final_campaign else {}
+                ),
+            )
+            await asyncio.to_thread(
+                self.storage.update_story_node_state, node_id, final_snapshot
+            )
+            if candidate_group_id:
+                await asyncio.to_thread(
+                    self.storage.sync_candidate_state_changes,
+                    candidate_group_id,
+                    node_id,
+                )
         return node_id
 
     def ensure_defaults(self) -> None:
@@ -986,6 +1344,306 @@ class TavernService:
             system_prompt=system_prompt,
         )
 
+    def _url_provider_candidates(
+        self,
+        *,
+        session_id: str,
+        provider: Any,
+    ) -> list[tuple[Any, str]]:
+        candidates: list[tuple[Any, str]] = []
+        seen: set[str] = set()
+
+        def add(candidate: Any, candidate_id: str = "") -> None:
+            if candidate is None:
+                return
+            resolved_id = candidate_id or str(
+                getattr(candidate, "provider_config", {}).get("id", "")
+            )
+            identity = resolved_id or f"object:{id(candidate)}"
+            if identity in seen:
+                return
+            seen.add(identity)
+            candidates.append((candidate, resolved_id or "current"))
+
+        add(provider)
+        try:
+            astrbot_config = self.context.get_config(umo=session_id)
+            provider_settings = astrbot_config.get("provider_settings", {})
+            fallback_ids = provider_settings.get("fallback_chat_models", [])
+            if isinstance(fallback_ids, list):
+                for fallback_id in fallback_ids:
+                    if isinstance(fallback_id, str) and fallback_id:
+                        add(
+                            self.context.get_provider_by_id(fallback_id),
+                            fallback_id,
+                        )
+        except Exception as exc:
+            logger.debug(
+                "%s 读取 AstrBot 备用 Provider 列表失败: %s",
+                PLUGIN_TAG,
+                exc,
+            )
+        return candidates
+
+    @staticmethod
+    def _validate_url_tool_call(response: Any) -> tuple[str, dict[str, Any], str]:
+        names = list(getattr(response, "tools_call_name", []) or [])
+        args = list(getattr(response, "tools_call_args", []) or [])
+        call_ids = list(getattr(response, "tools_call_ids", []) or [])
+        if len(names) != 1 or len(args) != 1 or len(call_ids) != 1:
+            raise URLRequestProtocolError(
+                "网址请求模式只允许一次 fetch_request_url 工具调用。"
+            )
+        if names[0] not in {FETCH_TOOL_NAME, SUBMIT_REPLY_TOOL_NAME}:
+            raise URLRequestProtocolError(
+                f"网址请求模式不允许调用工具 {names[0]!r}。"
+            )
+        if not isinstance(args[0], dict):
+            raise URLRequestProtocolError("fetch_request_url 工具参数格式无效。")
+        return names[0], args[0], str(call_ids[0] or "")
+
+    async def _url_chat_completion_with_fallback_legacy(
+        self,
+        *,
+        session_id: str,
+        provider: Any,
+        handle: URLRequestHandle,
+    ) -> tuple[Any, str]:
+        candidates = self._url_provider_candidates(
+            session_id=session_id,
+            provider=provider,
+        )
+        if not candidates:
+            raise RuntimeError("当前会话没有可用的聊天 Provider")
+
+        tool_set = (
+            ToolSet(tools=[build_fetch_tool()])
+            if self.url_requests.fetch_tool_enabled
+            else None
+        )
+        protocol = self.url_requests.protocol_prompt
+        url_prompt = request_url_user_prompt(handle.url)
+        last_error: Exception | None = None
+        previous_id = candidates[0][1]
+
+        for index, (candidate, candidate_id) in enumerate(candidates):
+            if index:
+                logger.warning(
+                    "%s 网址请求从 %s 切换到备用 Provider: %s",
+                    PLUGIN_TAG,
+                    previous_id,
+                    candidate_id,
+                )
+            consumer_id = f"web:{index}:{candidate_id}"
+            try:
+                first = await candidate.text_chat(
+                    prompt=url_prompt,
+                    contexts=[],
+                    system_prompt=protocol,
+                    func_tool=tool_set,
+                )
+                if str(getattr(first, "role", "")) == "err":
+                    raise RuntimeError(
+                        str(
+                            getattr(first, "completion_text", "")
+                            or "Provider 返回错误响应"
+                        )
+                    )
+                if not list(getattr(first, "tools_call_name", []) or []):
+                    return first, candidate_id
+                if not self.url_requests.fetch_tool_enabled:
+                    raise URLRequestProtocolError(
+                        "当前网址请求未启用读取工具，但模型仍请求了工具调用。"
+                    )
+
+                _, arguments, call_id = self._validate_url_tool_call(first)
+                requested_url = str(arguments.get("url", "") or "")
+                try:
+                    tool_content = self.url_requests.tool_content(
+                        handle,
+                        requested_url,
+                        consumer_id=consumer_id,
+                    )
+                except ValueError as exc:
+                    raise URLRequestProtocolError(str(exc)) from exc
+                second_contexts = [
+                    {"role": "user", "content": url_prompt},
+                    {
+                        "role": "assistant",
+                        "content": str(getattr(first, "completion_text", "") or ""),
+                        "tool_calls": first.to_openai_tool_calls(),
+                    },
+                    {
+                        "role": "tool",
+                        "tool_call_id": call_id,
+                        "name": FETCH_TOOL_NAME,
+                        "content": tool_content,
+                    },
+                ]
+                second = await candidate.text_chat(
+                    prompt="Produce the final answer to the hosted request now.",
+                    contexts=second_contexts,
+                    system_prompt=protocol,
+                    func_tool=tool_set,
+                )
+                if str(getattr(second, "role", "")) == "err":
+                    raise RuntimeError(
+                        str(
+                            getattr(second, "completion_text", "")
+                            or "Provider 返回错误响应"
+                        )
+                    )
+                if list(getattr(second, "tools_call_name", []) or []):
+                    raise URLRequestProtocolError(
+                        "fetch_request_url 已调用一次，模型不得重复调用工具。"
+                    )
+                return second, candidate_id
+            except URLRequestProtocolError:
+                raise
+            except Exception as exc:
+                last_error = exc
+                logger.warning(
+                    "%s 网址请求 Provider %s 调用失败: %s",
+                    PLUGIN_TAG,
+                    candidate_id,
+                    exc,
+                )
+            previous_id = candidate_id
+
+        if last_error:
+            raise last_error
+        raise RuntimeError("没有可用的聊天 Provider")
+
+    async def _url_chat_completion_with_fallback(
+        self,
+        *,
+        session_id: str,
+        provider: Any,
+        handle: URLRequestHandle,
+    ) -> tuple[Any, str]:
+        candidates = self._url_provider_candidates(
+            session_id=session_id,
+            provider=provider,
+        )
+        if not candidates:
+            raise RuntimeError("当前会话没有可用的聊天 Provider。")
+
+        tools = []
+        if self.url_requests.fetch_tool_enabled:
+            tools.append(build_fetch_tool())
+        if self.url_requests.reply_tool_enabled:
+            tools.append(build_submit_reply_tool())
+        tool_set = ToolSet(tools=tools) if tools else None
+        protocol = self.url_requests.protocol_prompt
+        url_prompt = request_url_user_prompt(handle.url)
+        last_error: Exception | None = None
+        previous_id = candidates[0][1]
+
+        for index, (candidate, candidate_id) in enumerate(candidates):
+            if index:
+                logger.warning(
+                    "%s 网址请求从 %s 切换到备用 Provider: %s",
+                    PLUGIN_TAG,
+                    previous_id,
+                    candidate_id,
+                )
+            consumer_id = f"web:{index}:{candidate_id}"
+            try:
+                contexts: list[dict[str, Any]] = []
+                prompt = url_prompt
+                fetch_used = False
+                for _step in range(3):
+                    response = await candidate.text_chat(
+                        prompt=prompt,
+                        contexts=copy.deepcopy(contexts),
+                        system_prompt=protocol,
+                        func_tool=tool_set,
+                    )
+                    if str(getattr(response, "role", "")) == "err":
+                        raise RuntimeError(
+                            str(
+                                getattr(response, "completion_text", "")
+                                or "Provider returned an error response."
+                            )
+                        )
+                    if not list(getattr(response, "tools_call_name", []) or []):
+                        return response, candidate_id
+
+                    tool_name, arguments, call_id = self._validate_url_tool_call(
+                        response
+                    )
+                    if tool_name == SUBMIT_REPLY_TOOL_NAME:
+                        if not self.url_requests.reply_tool_enabled:
+                            raise URLRequestProtocolError(
+                                "submit_reply is disabled for URL request mode."
+                            )
+                        try:
+                            reply = await self.url_requests.submit_reply(
+                                handle,
+                                str(arguments.get("text", "") or ""),
+                                consumer_id=consumer_id,
+                            )
+                        except ValueError as exc:
+                            raise URLRequestProtocolError(str(exc)) from exc
+                        response.role = "assistant"
+                        response.completion_text = reply
+                        response.tools_call_name = []
+                        response.tools_call_args = []
+                        response.tools_call_ids = []
+                        return response, candidate_id
+
+                    if not self.url_requests.fetch_tool_enabled or fetch_used:
+                        raise URLRequestProtocolError(
+                            "fetch_request_url may be called at most once."
+                        )
+                    try:
+                        tool_content = self.url_requests.tool_content(
+                            handle,
+                            str(arguments.get("url", "") or ""),
+                            consumer_id=consumer_id,
+                        )
+                    except ValueError as exc:
+                        raise URLRequestProtocolError(str(exc)) from exc
+                    fetch_used = True
+                    contexts.extend([
+                        {"role": "user", "content": prompt},
+                        {
+                            "role": "assistant",
+                            "content": str(
+                                getattr(response, "completion_text", "") or ""
+                            ),
+                            "tool_calls": response.to_openai_tool_calls(),
+                        },
+                        {
+                            "role": "tool",
+                            "tool_call_id": call_id,
+                            "name": FETCH_TOOL_NAME,
+                            "content": tool_content,
+                        },
+                    ])
+                    prompt = (
+                        "Continue the hosted request. Submit the completed final "
+                        "reply through submit_reply when ready."
+                    )
+                raise URLRequestProtocolError(
+                    "URL request mode exceeded the allowed tool rounds."
+                )
+            except URLRequestProtocolError:
+                raise
+            except Exception as exc:
+                last_error = exc
+                logger.warning(
+                    "%s 网址请求 Provider %s 调用失败: %s",
+                    PLUGIN_TAG,
+                    candidate_id,
+                    exc,
+                )
+            previous_id = candidate_id
+
+        if last_error:
+            raise last_error
+        raise RuntimeError("没有可用的聊天 Provider。")
+
     @staticmethod
     def _parse_memory_items(text: str) -> list[dict[str, str]]:
         raw = text.strip()
@@ -1582,6 +2240,16 @@ class TavernService:
         async with self._session_lock(session_id):
             state = await asyncio.to_thread(self.storage.get_session, session_id)
             campaign = await asyncio.to_thread(self.storage.campaign_for_session, session_id)
+            swipe_meta = event.get_extra("_kt_swipe_generation")
+            if not isinstance(swipe_meta, dict):
+                await asyncio.to_thread(
+                    self.storage.close_candidate_groups, session_id
+                )
+                swipe_meta = {}
+            base_state_snapshot = copy.deepcopy(state)
+            base_campaign_snapshot = copy.deepcopy(
+                (campaign or {}).get("state_data", {})
+            )
             pending = state.pop("pending_generation", {})
             pending_branch = state.pop("pending_branch", {}) if isinstance(state.get("pending_branch"), dict) else {}
             source_contexts = self._normalize_messages(list(req.contexts or []))
@@ -1598,6 +2266,10 @@ class TavernService:
             branch_parent_id = ""
             branch_name = ""
             branch_contexts: list[dict[str, Any]] | None = None
+            if swipe_meta:
+                branch_parent_id = str(
+                    swipe_meta.get("parent_node_id", "") or ""
+                )
             if pending_branch:
                 branch_parent_id = str(pending_branch.get("source_node_id", "") or "")
                 branch_name = str(pending_branch.get("branch_name", "") or "")
@@ -1720,6 +2392,10 @@ class TavernService:
                     if match.reason in ("vector", "hybrid", "keyword")
                 ],
             }
+            preview["cipher"] = self.cipher_metadata(provider_encoded=self.cipher_enabled)
+            preview["url_request"] = self.url_request_metadata(
+                provider_externalized=self.url_request_enabled,
+            )
             await asyncio.to_thread(self.storage.save_preview, session_id, preview)
 
             if bool(self.config.get("archive_enabled", True)):
@@ -1739,6 +2415,11 @@ class TavernService:
                     "retrieval_snapshot": preview.get("retrieval", {}),
                     "memory_snapshot": preview.get("memory", {}),
                     "state_snapshot": dict(copy.deepcopy(state), **({"_campaign_state": copy.deepcopy(campaign.get("state_data", {}))} if campaign else {})),
+                    "base_state_snapshot": base_state_snapshot,
+                    "base_campaign_snapshot": base_campaign_snapshot,
+                    "candidate_group_id": str(swipe_meta.get("group_id", "") or ""),
+                    "candidate_index": int(swipe_meta.get("candidate_index", 0) or 0),
+                    "candidate_selected": bool(swipe_meta),
                 })
 
             retrieval_matches = [
@@ -1772,12 +2453,26 @@ class TavernService:
             if not provider_id:
                 using = getattr(self.context, "get_using_provider", lambda _sid: None)(session_id)
                 provider_id = str(getattr(using, "provider_config", {}).get("id", ""))
+            provider_messages = self.provider_messages(result)
+            url_overhead_tokens = (
+                estimate_tokens(
+                    url_request_overhead_text(
+                        fetch_tool_enabled=self.url_requests.fetch_tool_enabled,
+                        reply_tool_enabled=self.url_requests.reply_tool_enabled,
+                    )
+                )
+                if self.url_request_enabled
+                else 0
+            )
             await asyncio.to_thread(self.storage.record_metric, {
                 "session_id": session_id,
                 "provider_id": provider_id,
                 "mode": generation_mode,
-                "prompt_tokens": sum(estimate_tokens(str(message.get("content", ""))) for message in result.messages),
-                "message_count": len(result.messages),
+                "prompt_tokens": sum(
+                    estimate_tokens(str(message.get("content", "")))
+                    for message in provider_messages
+                ) + url_overhead_tokens,
+                "message_count": len(provider_messages),
                 "block_count": len(result.blocks),
                 "worldbook_hits": len(scan.activated),
                 "summary_generated": bool(summary_meta.get("generated_this_request")),
@@ -1791,6 +2486,9 @@ class TavernService:
     async def play_web_turn(
         self, *, session_id: str, prompt: str, mode: str = "normal", quiet_prompt: str = "",
         branch_node_id: str = "", branch_name: str = "",
+        contexts_override: list[dict[str, Any]] | None = None,
+        conversation_id_override: str = "",
+        swipe_meta: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         session_id = str(session_id or "").strip()
         prompt = str(prompt or "").strip()
@@ -1800,6 +2498,10 @@ class TavernService:
         if mode not in {"normal", "continue", "impersonate", "quiet"}:
             raise ValueError("生成模式无效。")
         contexts, conversation_id, context_source = await self._web_contexts_for_session(session_id)
+        if contexts_override is not None:
+            contexts = copy.deepcopy(contexts_override)
+            conversation_id = str(conversation_id_override or conversation_id)
+            context_source = "swipe"
         if branch_node_id:
             node = await asyncio.to_thread(self.storage.get_story_node, branch_node_id)
             if not node:
@@ -1811,7 +2513,8 @@ class TavernService:
             "_kt_astrbot_conversation_id": conversation_id,
             "_kt_mode": mode,
             "_kt_quiet_prompt": str(quiet_prompt or ""),
-            "_kt_skip_boundary_check": context_source in {"story", "branch"},
+            "_kt_skip_boundary_check": context_source in {"story", "branch", "swipe"},
+            "_kt_swipe_generation": copy.deepcopy(swipe_meta) if swipe_meta else None,
         }
         event = SimpleNamespace(
             unified_msg_origin=session_id,
@@ -1832,10 +2535,35 @@ class TavernService:
             conversation=SimpleNamespace(persona_id=""),
         )
         result = await self.process(event, req, mode=mode, quiet_prompt=str(quiet_prompt or ""))
-        response, provider_id = await self._chat_completion_with_fallback(
-            session_id=session_id, provider=provider, messages=result.messages,
-        )
-        assistant_text = str(getattr(response, "completion_text", "") or "").strip()
+        if self.url_request_enabled:
+            handle = await self.url_requests.create(result.messages)
+            try:
+                response, provider_id = await self._url_chat_completion_with_fallback(
+                    session_id=session_id,
+                    provider=provider,
+                    handle=handle,
+                )
+            finally:
+                await self.url_requests.delete(handle)
+        else:
+            response, provider_id = await self._chat_completion_with_fallback(
+                session_id=session_id,
+                provider=provider,
+                messages=self.provider_messages(result),
+            )
+        raw_assistant_text = str(getattr(response, "completion_text", "") or "").strip()
+        assistant_text, decoded, decode_error = self.decode_model_response(raw_assistant_text)
+        assistant_text = strip_reasoning_tags(assistant_text)
+        if not decoded:
+            logger.warning(
+                "%s 主模型密文回复自动解码失败（%s）: %s",
+                PLUGIN_TAG, self.cipher.method, decode_error,
+            )
+        elif decode_error:
+            logger.warning(
+                "%s 主模型密文回复已降级恢复（%s）: %s",
+                PLUGIN_TAG, self.cipher.method, decode_error,
+            )
         if not assistant_text:
             raise RuntimeError("Provider 返回空回复。")
         snapshot = event.get_extra("_kt_story_snapshot")
@@ -1981,6 +2709,10 @@ class TavernService:
                     if match.reason in ("vector", "hybrid", "keyword")
                 ],
             },
+            "cipher": self.cipher_metadata(provider_encoded=False),
+            "url_request": self.url_request_metadata(
+                provider_externalized=False,
+            ),
         })
         return serialized
 

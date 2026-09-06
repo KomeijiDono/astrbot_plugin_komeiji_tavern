@@ -103,4 +103,4 @@ class BuildResult:
     dropped: list[str]
     warnings: list[str]
     messages: list[dict[str, Any]]
-
+    current_prompt: str

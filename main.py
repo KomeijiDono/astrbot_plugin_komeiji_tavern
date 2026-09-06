@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import re
 import time
@@ -12,6 +13,9 @@ from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.message_components import At, Node, Nodes, Plain
 from astrbot.api.provider import LLMResponse, ProviderRequest
 from astrbot.api.star import Context, Star, register
+from astrbot.core.agent.message import Message, TextPart
+from astrbot.core.agent.tool import ToolSet
+from astrbot.core.message.message_event_result import MessageEventResult
 from astrbot.core.star.filter.command import GreedyStr
 
 from .constants import DESCRIPTION, DISPLAY_NAME, PLUGIN_ID, PLUGIN_VERSION
@@ -19,13 +23,21 @@ from .illustration import OmniDrawBridge
 from .service import TavernService
 from .qq_delivery import split_forward_text
 from .storage import TavernStorage
+from .url_request import (
+    URLRequestHandle,
+    build_fetch_tool,
+    build_submit_reply_tool,
+    request_url_user_prompt,
+    strip_reasoning_tags,
+)
 from .web import TavernWebApi
 
 
 _STATE_JSON = re.compile(r"\[TAVERN_STATE\]\s*(\{.*?\})\s*$", re.DOTALL)
 _STATE_FIELDS = re.compile(r"\[LOVE_DATA\]\s*(.+)$", re.MULTILINE)
 _CONFIG_GROUPS = (
-    "basic_config", "context_config", "worldbook_config", "qq_direct_config",
+    "basic_config", "cipher_config", "url_request_config", "context_config",
+    "worldbook_config", "qq_direct_config",
     "qq_forward_config", "status_config", "illustration_config", "summary_config",
     "memory_config", "metrics_config", "lifecycle_config",
 )
@@ -63,6 +75,46 @@ def _remove_last_completed_turn(history: list[Any]) -> tuple[list[Any], int]:
     return list(history[:user_index]), len(history) - user_index
 
 
+def _latest_plain_turn(
+    history: list[Any],
+) -> tuple[list[dict[str, Any]], dict[str, Any], dict[str, Any]] | None:
+    """Return base history, the latest plain user message and its assistant reply."""
+    assistant_index = next(
+        (
+            index for index in range(len(history) - 1, -1, -1)
+            if isinstance(history[index], dict)
+            and str(history[index].get("role", "")) == "assistant"
+        ),
+        -1,
+    )
+    if assistant_index < 0:
+        return None
+    user_index = next(
+        (
+            index for index in range(assistant_index - 1, -1, -1)
+            if isinstance(history[index], dict)
+            and str(history[index].get("role", "")) == "user"
+        ),
+        -1,
+    )
+    if user_index < 0:
+        return None
+    suffix = history[user_index + 1:]
+    if any(
+        not isinstance(item, dict)
+        or str(item.get("role", "")) not in {"assistant", "checkpoint", "_checkpoint"}
+        for item in suffix
+    ):
+        return None
+    user = history[user_index]
+    assistant = history[assistant_index]
+    if not isinstance(user.get("content"), str) or not isinstance(
+        assistant.get("content"), str
+    ):
+        return None
+    return list(history[:user_index]), copy.deepcopy(user), copy.deepcopy(assistant)
+
+
 @register(PLUGIN_ID, "KomeijiDono", DESCRIPTION, PLUGIN_VERSION)
 class KomeijiTavernPlugin(Star):
     def __init__(self, context: Context, config: dict[str, Any] | None = None):
@@ -77,6 +129,27 @@ class KomeijiTavernPlugin(Star):
 
     async def initialize(self) -> None:
         self.service.ensure_defaults()
+        if self.service.url_request_enabled:
+            await self.service.url_requests.start()
+            if self.service.url_requests.start_error:
+                logger.error(
+                    "[%s] 网址请求临时网页服务启动失败：%s",
+                    DISPLAY_NAME,
+                    self.service.url_requests.start_error,
+                )
+            else:
+                if self.service.url_requests.backend == "hosted":
+                    logger.info(
+                        "[%s] 网址请求托管服务连接验证成功",
+                        DISPLAY_NAME,
+                    )
+                else:
+                    logger.info(
+                        "[%s] 网址请求临时网页服务已监听 %s:%d",
+                        DISPLAY_NAME,
+                        self.service.url_requests.listen_host,
+                        self.service.url_requests.bound_port,
+                    )
         if self.config.get("cleanup_enabled", True):
             await self._cleanup_expired()
             self._cleanup_task = asyncio.create_task(self._cleanup_loop())
@@ -91,6 +164,7 @@ class KomeijiTavernPlugin(Star):
                 await self._cleanup_task
             except asyncio.CancelledError:
                 pass
+        await self.service.url_requests.stop()
         await self.illustration.terminate()
 
     async def _cleanup_expired(self) -> dict[str, int]:
@@ -142,9 +216,76 @@ class KomeijiTavernPlugin(Star):
             pass
         result = await self.service.process(event, req)
         req.system_prompt = result.system_prompt
-        req.contexts = result.contexts
+        req.contexts = copy.deepcopy(result.contexts)
+        req.prompt = result.current_prompt
+        url_request_active = bool(
+            getattr(self.service, "url_request_enabled", False)
+        )
+        event.set_extra("_kt_url_request_active", url_request_active)
+        event.set_extra("_kt_cipher_active", self.service.cipher_enabled)
 
-        if self.config.get("tool_delivery_enabled", False) and req.func_tool:
+        if url_request_active:
+            try:
+                handle = await self.service.url_requests.create(result.messages)
+            except Exception as exc:
+                logger.error(
+                    "[%s] 网址请求模式不可用，本轮已终止：%s",
+                    DISPLAY_NAME,
+                    exc,
+                )
+                event.set_result(
+                    MessageEventResult().message(f"网址请求模式不可用：{exc}")
+                )
+                event.stop_event()
+                return
+
+            consumer_id = f"agent:{id(event)}"
+
+            async def fetch_request_url(tool_event, url: str) -> str | None:
+                try:
+                    return self.service.url_requests.tool_content(
+                        handle,
+                        url,
+                        consumer_id=consumer_id,
+                    )
+                except ValueError as exc:
+                    message = f"网址请求读取被拒绝：{exc}"
+                    event.set_extra("_kt_url_request_protocol_error", message)
+                    tool_event.set_result(MessageEventResult().message(message))
+                    return None
+
+            async def submit_reply(tool_event, text: str) -> str:
+                try:
+                    reply = await self.service.url_requests.submit_reply(
+                        handle,
+                        text,
+                        consumer_id=consumer_id,
+                    )
+                    event.set_extra("_kt_url_submitted_reply", reply)
+                    return (
+                        "Reply accepted. Return exactly OK with no additional "
+                        "text and do not call another tool."
+                    )
+                except ValueError as exc:
+                    message = f"网址请求回复提交被拒绝：{exc}"
+                    event.set_extra("_kt_url_request_protocol_error", message)
+                    return message
+
+            event.set_extra("_kt_url_request_handle", handle)
+            event.set_extra("_kt_url_request_consumer_id", consumer_id)
+            tools = []
+            if self.service.url_requests.fetch_tool_enabled:
+                tools.append(build_fetch_tool(fetch_request_url))
+            if self.service.url_requests.reply_tool_enabled:
+                tools.append(build_submit_reply_tool(submit_reply))
+            req.func_tool = ToolSet(tools=tools) if tools else None
+            return
+
+        if (
+            not self.service.cipher_enabled
+            and self.config.get("tool_delivery_enabled", False)
+            and req.func_tool
+        ):
             tool = req.func_tool.get_func("send_message_to_user")
             if tool is not None:
                 event.set_extra("_kt_tool", tool)
@@ -154,12 +295,372 @@ class KomeijiTavernPlugin(Star):
                     "this tool call instead of returning it as ordinary assistant content."
                 )
 
+    @staticmethod
+    def _cipher_message_text(message: Message) -> str:
+        content = message.content
+        if isinstance(content, str):
+            return content
+        if not isinstance(content, list):
+            return str(content or "")
+        chunks: list[str] = []
+        for part in content:
+            text = getattr(part, "text", None)
+            if isinstance(text, str):
+                chunks.append(text)
+                continue
+            think = getattr(part, "think", None)
+            if isinstance(think, str):
+                chunks.append(think)
+        return "".join(chunks)
+
+    @classmethod
+    def _url_page_messages(cls, messages: list[Message]) -> list[dict[str, str]]:
+        return [
+            {
+                "role": str(message.role or "unknown"),
+                "content": cls._cipher_message_text(message),
+            }
+            for message in messages
+            if str(message.role or "") != "_checkpoint"
+        ]
+
+    @staticmethod
+    def _url_message_attachments(messages: list[Message]) -> list[Any]:
+        attachments: list[Any] = []
+        for message in messages:
+            content = message.content
+            if not isinstance(content, list):
+                continue
+            for part in content:
+                if isinstance(getattr(part, "text", None), str):
+                    continue
+                if isinstance(getattr(part, "think", None), str):
+                    continue
+                attachments.append(copy.deepcopy(part))
+        return attachments
+
+    def _encode_agent_message(self, message: Message) -> Message:
+        encoded = copy.deepcopy(message)
+        if encoded.role == "_checkpoint":
+            return encoded
+        payload = self.service.cipher.encode_content(
+            self._cipher_message_text(encoded)
+        )
+        if isinstance(encoded.content, list):
+            retained = [
+                copy.deepcopy(part)
+                for part in encoded.content
+                if not isinstance(getattr(part, "text", None), str)
+                and not isinstance(getattr(part, "think", None), str)
+            ]
+            encoded.content = [TextPart(text=payload), *retained] if retained else payload
+        else:
+            encoded.content = payload
+        return encoded
+
+    @filter.on_agent_begin(priority=-1000)
+    async def on_agent_begin(self, event: AstrMessageEvent, run_context):
+        if event.get_extra("_kt_url_request_active"):
+            handle = event.get_extra("_kt_url_request_handle")
+            if not isinstance(handle, URLRequestHandle):
+                return
+            messages = copy.deepcopy(
+                list(getattr(run_context, "messages", []) or [])
+            )
+            event.set_extra("_kt_url_request_plain_messages", messages)
+            try:
+                await self.service.url_requests.update(
+                    handle,
+                    self._url_page_messages(messages),
+                )
+                attachments = self._url_message_attachments(messages)
+                url_prompt = request_url_user_prompt(handle.url)
+                user_content: str | list[Any] = (
+                    [TextPart(text=url_prompt), *attachments]
+                    if attachments
+                    else url_prompt
+                )
+                run_context.messages = [
+                    Message(
+                        role="system",
+                        content=self.service.url_requests.protocol_prompt,
+                    ),
+                    Message(role="user", content=user_content),
+                ]
+                event.set_extra("_kt_url_request_agent_externalized", True)
+            except Exception as exc:
+                logger.error(
+                    "[%s] 网址请求页面更新失败，已阻止明文请求进入 Provider：%s",
+                    DISPLAY_NAME,
+                    exc,
+                )
+                await self.service.url_requests.delete(handle)
+                event.set_result(
+                    MessageEventResult().message(
+                        f"网址请求页面更新失败，本轮已终止：{exc}"
+                    )
+                )
+                event.stop_event()
+                run_context.messages = [
+                    Message(
+                        role="system",
+                        content="The temporary hosted request is unavailable. Do not answer.",
+                    ),
+                    Message(
+                        role="user",
+                        content="Abort this request without reconstructing any prior content.",
+                    ),
+                ]
+            return
+        if not event.get_extra("_kt_cipher_active"):
+            return
+        messages = list(getattr(run_context, "messages", []) or [])
+        encoded = [self._encode_agent_message(message) for message in messages]
+        run_context.messages = [
+            Message(role="system", content=self.service.cipher.protocol_prompt),
+            *encoded,
+        ]
+        event.set_extra("_kt_cipher_agent_encoded", True)
+
+    def _decode_agent_message(self, message: Message) -> tuple[Message, str]:
+        restored = copy.deepcopy(message)
+        if restored.role == "_checkpoint":
+            return restored, ""
+        content = restored.content
+        if isinstance(content, str):
+            decoded = self.service.cipher.decode_response(content)
+            if decoded.ok:
+                restored.content = decoded.text
+                return restored, decoded.error
+            return restored, decoded.error
+        if not isinstance(content, list):
+            return restored, ""
+        warnings: list[str] = []
+        for part in content:
+            text = getattr(part, "text", None)
+            if not isinstance(text, str) or "<KOMEIJI_CIPHER>" not in text:
+                continue
+            decoded = self.service.cipher.decode_response(text)
+            if decoded.ok:
+                part.text = decoded.text
+                if decoded.error:
+                    warnings.append(decoded.error)
+            elif decoded.error:
+                warnings.append(decoded.error)
+        return restored, "; ".join(warnings)
+
+    @staticmethod
+    def _replace_agent_message_text(message: Message, text: str) -> Message:
+        restored = copy.deepcopy(message)
+        if isinstance(restored.content, list):
+            non_text = [
+                copy.deepcopy(part)
+                for part in restored.content
+                if not isinstance(getattr(part, "text", None), str)
+            ]
+            restored.content = [*non_text, TextPart(text=str(text or ""))]
+        else:
+            restored.content = str(text or "")
+        return restored
+
+    @filter.on_agent_done(priority=-1000)
+    async def on_agent_done(
+        self,
+        event: AstrMessageEvent,
+        run_context,
+        response: LLMResponse | None,
+    ):
+        swipe_meta = event.get_extra("_kt_swipe_generation")
+        if isinstance(swipe_meta, dict) and (
+            response is None
+            or str(getattr(response, "role", "")) == "err"
+            or not str(getattr(response, "completion_text", "") or "").strip()
+        ):
+            try:
+                await self.service.select_candidate(
+                    self._session_id(event),
+                    int(swipe_meta.get("previous_index", 1) or 1),
+                )
+            except Exception as exc:
+                logger.warning("[%s] Swipe 失败后恢复原候选失败：%s", DISPLAY_NAME, exc)
+        if event.get_extra("_kt_url_request_active"):
+            handle = event.get_extra("_kt_url_request_handle")
+            plain_messages = event.get_extra("_kt_url_request_plain_messages")
+            if isinstance(plain_messages, list):
+                restored = copy.deepcopy(plain_messages)
+                if response is not None:
+                    restored.append(
+                        Message(
+                            role="assistant",
+                            content=str(response.completion_text or ""),
+                        )
+                    )
+                run_context.messages = restored
+            await self.service.url_requests.delete(
+                handle if isinstance(handle, URLRequestHandle) else None
+            )
+            event.set_extra("_kt_url_request_agent_externalized", False)
+            event.set_extra("_kt_url_request_handle", None)
+            event.set_extra("_kt_url_request_plain_messages", None)
+            event.set_extra("_kt_url_submitted_reply", None)
+            return
+        if not event.get_extra("_kt_cipher_agent_encoded"):
+            return
+        messages = list(getattr(run_context, "messages", []) or [])
+        if (
+            messages
+            and messages[0].role == "system"
+            and messages[0].content == self.service.cipher.protocol_prompt
+        ):
+            messages = messages[1:]
+
+        restored: list[Message] = []
+        warnings: list[str] = []
+        last_index = len(messages) - 1
+        for index, message in enumerate(messages):
+            if (
+                index == last_index
+                and message.role == "assistant"
+                and response is not None
+            ):
+                restored.append(
+                    self._replace_agent_message_text(
+                        message,
+                        str(response.completion_text or ""),
+                    )
+                )
+                continue
+            item, warning = self._decode_agent_message(message)
+            restored.append(item)
+            if warning:
+                warnings.append(warning)
+        run_context.messages = restored
+        event.set_extra("_kt_cipher_agent_encoded", False)
+        if warnings:
+            logger.warning(
+                "[%s] 恢复主模型明文会话时出现降级或异常（%s）: %s",
+                DISPLAY_NAME,
+                self.service.cipher.method,
+                "; ".join(warnings),
+            )
+        """
+
+
+            "正在处理",
+            "请稍候",
+            "正在构建",
+            "正在准备",
+            "已解析出",
+        )
+        return any(marker in normalized for marker in markers)
+        """
+
+    @staticmethod
+    def _is_url_request_progress_reply(text: str) -> bool:
+        normalized = re.sub(r"\s+", " ", str(text or "").strip().lower())
+        if not normalized or len(normalized) > 240:
+            return False
+        markers = (
+            "please wait",
+            "one moment",
+            "working on",
+            "processing",
+            "preparing",
+            "constructing",
+            "\u6b63\u5728\u5904\u7406",
+            "\u8bf7\u7a0d\u5019",
+            "\u6b63\u5728\u6784\u5efa",
+            "\u6b63\u5728\u51c6\u5907",
+            "\u5df2\u89e3\u6790\u51fa",
+        )
+        return any(marker in normalized for marker in markers)
+
     @filter.on_llm_response(priority=-1000)
+
     async def on_llm_response(self, event: AstrMessageEvent, response: LLMResponse):
+        response.completion_text = strip_reasoning_tags(
+            str(response.completion_text or "")
+        )
+        protocol_markers = (
+            "temporary url", "temporary page", "temporary link", "automatically deleted",
+            "will be deleted", "expires in", "临时网页", "临时页面", "临时链接",
+            "自动删除", "页面将在", "页面会在", "执行本指令后",
+        )
         tool = event.get_extra("_kt_tool")
         original = event.get_extra("_kt_tool_description")
         if tool is not None and original is not None:
             tool.description = original
+
+        submitted_reply = event.get_extra("_kt_url_submitted_reply")
+        if (
+            event.get_extra("_kt_url_request_active")
+            and isinstance(submitted_reply, str)
+            and submitted_reply.strip()
+        ):
+            response.role = "assistant"
+            response.completion_text = submitted_reply
+        elif event.get_extra("_kt_url_request_active"):
+            direct_reply = str(response.completion_text or "").strip()
+            normalized_reply = re.sub(r"\s+", " ", direct_reply.lower())
+            blocked_protocol_reply = len(normalized_reply) <= 480 and any(
+                marker in normalized_reply for marker in protocol_markers
+            )
+            blocked_progress_reply = self._is_url_request_progress_reply(direct_reply)
+            if blocked_protocol_reply:
+                logger.warning(
+                    "[%s] Provider returned temporary-URL metadata instead of a final reply; it was discarded.",
+                    DISPLAY_NAME,
+                )
+                response.completion_text = ""
+            if blocked_progress_reply:
+                logger.warning(
+                    "[%s] Provider returned a URL-request progress message instead of a final reply; it was not submitted.",
+                    DISPLAY_NAME,
+                )
+                response.completion_text = "模型未提交最终回复，请重试。"
+            if (
+                direct_reply
+                and self.service.url_requests.reply_tool_enabled
+                and direct_reply.upper() != "OK"
+                and not blocked_progress_reply
+                and not blocked_protocol_reply
+            ):
+                # Keep the webpage workflow useful for providers that answer
+                # normally but do not expose function calls through AstrBot.
+                handle = event.get_extra("_kt_url_request_handle")
+                consumer_id = event.get_extra("_kt_url_request_consumer_id")
+                if isinstance(handle, URLRequestHandle) and isinstance(consumer_id, str):
+                    try:
+                        await self.service.url_requests.submit_reply(
+                            handle, direct_reply, consumer_id=consumer_id
+                        )
+                        event.set_extra("_kt_url_submitted_reply", direct_reply)
+                        logger.info(
+                            "[%s] Provider 未调用 submit_reply，已将普通文本回复兼容写入临时网页。",
+                            DISPLAY_NAME,
+                        )
+                    except (RuntimeError, ValueError) as exc:
+                        logger.warning(
+                            "[%s] 普通文本回复写入临时网页失败：%s",
+                            DISPLAY_NAME,
+                            exc,
+                        )
+
+        if event.get_extra("_kt_cipher_active"):  # URL request mode takes precedence.
+            decoded, ok, error = self.service.decode_model_response(
+                str(response.completion_text or "")
+            )
+            response.completion_text = strip_reasoning_tags(decoded)
+            if not ok:
+                logger.warning(
+                    "[%s] 主模型密文回复自动解码失败（%s）: %s",
+                    DISPLAY_NAME, self.service.cipher.method, error,
+                )
+            elif error:
+                logger.warning(
+                    "[%s] 主模型密文回复已降级恢复（%s）: %s",
+                    DISPLAY_NAME, self.service.cipher.method, error,
+                )
 
         try:
             if not self.config.get("status_bar_enabled", False):
@@ -194,7 +695,11 @@ class KomeijiTavernPlugin(Star):
                 await asyncio.to_thread(self.storage.save_session, session_id, state)
         finally:
             snapshot = event.get_extra("_kt_story_snapshot")
-            if isinstance(snapshot, dict):
+            if (
+                isinstance(snapshot, dict)
+                and str(response.completion_text or "").strip()
+                and str(getattr(response, "role", "assistant")) != "err"
+            ):
                 event.set_extra("_kt_story_snapshot", None)
                 try:
                     await self.service.finalize_story_snapshot(
@@ -206,6 +711,11 @@ class KomeijiTavernPlugin(Star):
                     logger.warning("[%s] 保存分支树节点失败：%s", DISPLAY_NAME, exc)
             if self.config.get("illustration_enabled", False):
                 event.set_extra("_kt_illustration_text", str(response.completion_text or ""))
+            if event.get_extra("_kt_url_request_active"):
+                handle = event.get_extra("_kt_url_request_handle")
+                await self.service.url_requests.delete(
+                    handle if isinstance(handle, URLRequestHandle) else None
+                )
 
     async def _dispatch_pending_illustration(self, event: AstrMessageEvent) -> None:
         get_extra = getattr(event, "get_extra", None)
@@ -372,6 +882,178 @@ class KomeijiTavernPlugin(Star):
         if action == "reset":
             await self.service.reset_session(session_id)
             yield event.plain_result("当前会话的世界书生命周期和预览状态已清除。")
+            return
+        if action in {"swipe", "sw", "换一个", "候选"}:
+            manager = self.context.conversation_manager
+            conversation_id = await manager.get_curr_conversation_id(
+                event.unified_msg_origin
+            )
+            if not conversation_id:
+                yield event.plain_result("当前没有可用的 AstrBot 会话。")
+                return
+            conversation = await manager.get_conversation(
+                event.unified_msg_origin, conversation_id
+            )
+            if not conversation:
+                yield event.plain_result("当前会话不存在，无法操作候选回复。")
+                return
+            try:
+                history = json.loads(conversation.history or "[]")
+            except (json.JSONDecodeError, TypeError):
+                yield event.plain_result("当前会话历史格式异常，无法操作候选回复。")
+                return
+            if not isinstance(history, list):
+                yield event.plain_result("当前会话历史格式异常，无法操作候选回复。")
+                return
+
+            parts = rest.strip().split()
+            sub = parts[0].lower() if parts else ""
+            sub = {
+                "ls": "list",
+                "列表": "list",
+                "p": "prev",
+                "上一个": "prev",
+                "n": "next",
+                "下一个": "next",
+                "u": "use",
+                "选用": "use",
+            }.get(sub, sub)
+            group = await self.service.candidate_group(session_id)
+
+            if sub == "list":
+                if not group:
+                    yield event.plain_result("当前最新一轮还没有候选组。发送 /tv sw 生成新候选。")
+                    return
+                lines = ["当前轮候选回复："]
+                for node in group.get("nodes", []):
+                    marker = "（当前）" if node.get("candidate_selected") else ""
+                    preview = re.sub(
+                        r"\s+", " ", str(node.get("assistant_text", "") or "")
+                    )[:120]
+                    lines.append(
+                        f"{node.get('candidate_index')}. {marker} {preview}".rstrip()
+                    )
+                lines.append("切换：/tv sw u <编号>；继续生成：/tv sw")
+                yield event.plain_result("\n".join(lines))
+                return
+
+            if sub in {"prev", "next", "use"}:
+                if not group:
+                    yield event.plain_result("当前最新一轮没有可切换的候选回复。")
+                    return
+                nodes = list(group.get("nodes", []))
+                if not nodes:
+                    yield event.plain_result("候选组为空，无法切换。")
+                    return
+                current_pos = next(
+                    (
+                        index for index, node in enumerate(nodes)
+                        if node.get("candidate_selected")
+                    ),
+                    0,
+                )
+                if sub == "use":
+                    if len(parts) < 2 or not parts[1].isdigit():
+                        yield event.plain_result("用法：/tv sw u <候选编号>")
+                        return
+                    target_index = int(parts[1])
+                else:
+                    offset = -1 if sub == "prev" else 1
+                    target_index = int(
+                        nodes[(current_pos + offset) % len(nodes)].get(
+                            "candidate_index", 1
+                        )
+                    )
+                target = next(
+                    (
+                        node for node in nodes
+                        if int(node.get("candidate_index", 0) or 0) == target_index
+                    ),
+                    None,
+                )
+                if not target:
+                    yield event.plain_result("找不到这个候选编号。")
+                    return
+                latest = _latest_plain_turn(history)
+                if not latest:
+                    yield event.plain_result(
+                        "当前最新轮包含附件或工具消息，无法安全切换候选。"
+                    )
+                    return
+                base_history, _, _ = latest
+                user_message = copy.deepcopy(group.get("user_message", {}))
+                replacement = {
+                    "role": "assistant",
+                    "content": str(target.get("assistant_text", "") or ""),
+                }
+                await manager.update_conversation(
+                    event.unified_msg_origin,
+                    conversation_id,
+                    [*base_history, user_message, replacement],
+                )
+                selected = await self.service.select_candidate(
+                    session_id, target_index
+                )
+                event.set_extra("_kt_force_long_delivery", True)
+                yield event.plain_result(
+                    f"已切换到候选 {target_index}/{len(nodes)}：\n\n"
+                    + str(selected.get("assistant_text", "") or "")
+                )
+                return
+
+            if sub:
+                yield event.plain_result(
+                    "用法：/tv sw [ls|p|n|u <编号>]"
+                )
+                return
+            latest = _latest_plain_turn(history)
+            if not latest:
+                yield event.plain_result(
+                    "上一轮不是可重放的纯文本用户消息与助手回复；包含附件或工具消息时不支持 Swipe。"
+                )
+                return
+            base_history, user_message, _ = latest
+            previous_index = 1
+            if group:
+                current = next(
+                    (
+                        node for node in group.get("nodes", [])
+                        if node.get("candidate_selected")
+                    ),
+                    None,
+                )
+                previous_index = int(
+                    (current or {}).get("candidate_index", 1) or 1
+                )
+            try:
+                swipe = await self.service.prepare_swipe(
+                    session_id=session_id,
+                    conversation_id=str(conversation_id),
+                    base_history=base_history,
+                    user_message=user_message,
+                )
+            except ValueError as exc:
+                yield event.plain_result(str(exc))
+                return
+            cloned_conversation = copy.copy(conversation)
+            cloned_conversation.history = json.dumps(
+                swipe["base_history"], ensure_ascii=False
+            )
+            event.set_extra(
+                "_kt_swipe_generation",
+                {
+                    "group_id": swipe["group_id"],
+                    "parent_node_id": swipe["parent_node_id"],
+                    "candidate_index": swipe["candidate_index"],
+                    "previous_index": previous_index,
+                },
+            )
+            event.set_extra("_kt_skip_boundary_check", True)
+            prompt = str(swipe["user_message"].get("content", "") or "")
+            yield event.request_llm(
+                prompt=prompt,
+                conversation=cloned_conversation,
+            )
             return
         if action in {"undo", "rollback", "撤回"}:
             manager = self.context.conversation_manager
@@ -641,7 +1323,7 @@ class KomeijiTavernPlugin(Star):
             yield event.request_llm(prompt=prompt, conversation=conversation)
             return
         if action not in {"continue", "impersonate", "quiet"}:
-            yield event.plain_result("用法：/tavern status|preview|reset|undo|continue|impersonate|quiet|retrieval|character|archive [补充提示]")
+            yield event.plain_result("用法：/tavern status|preview|reset|undo|swipe|continue|impersonate|quiet|retrieval|character|archive [补充提示]")
             return
         event.set_extra("_kt_mode", action)
         event.set_extra("_kt_quiet_prompt", str(rest) if action == "quiet" else "")

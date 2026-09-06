@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import copy
-from typing import Any
+from typing import Any, Callable
 
 from .macros import MacroResolver
 from .models import BuildResult, LoreEntry, Position, PromptBlock, ScanResult
@@ -45,12 +45,18 @@ class PromptBuilder:
         history_first_trimming: bool = True,
         history_keep_recent_messages: int = 6,
         history_max_messages: int = 12,
+        content_token_estimator: Callable[[str], int] | None = None,
+        request_overhead_tokens: int = 0,
+        message_overhead_tokens: int = 0,
     ):
         self.context_budget = max(2048, context_budget)
         self.output_reserve = max(256, output_reserve)
         self.history_first_trimming = bool(history_first_trimming)
         self.history_keep_recent_messages = max(0, int(history_keep_recent_messages))
         self.history_max_messages = max(0, int(history_max_messages))
+        self.content_token_estimator = content_token_estimator or estimate_tokens
+        self.request_overhead_tokens = max(0, int(request_overhead_tokens))
+        self.message_overhead_tokens = max(0, int(message_overhead_tokens))
         self.macros = MacroResolver()
 
     @staticmethod
@@ -189,9 +195,15 @@ class PromptBuilder:
             if block.identifier == "memory" and memory_context.strip():
                 generated = f"[长期记忆]\n{memory_context.strip()}"
                 block.content = f"{block.content}\n\n{generated}".strip()
-            if block.identifier == "campaign" and campaign_context.strip():
-                block.content = f"{block.content}\n\n{campaign_context.strip()}".strip()
-            block.token_estimate = estimate_tokens(block.content)
+            if block.identifier == "campaign":
+                if campaign_context.strip():
+                    block.content = f"{block.content}\n\n{campaign_context.strip()}".strip()
+                else:
+                    # A configured campaign block is only a placeholder.  Without an
+                    # actual campaign binding, stale authority-state text must not leak
+                    # into ordinary non-campaign conversations.
+                    block.content = ""
+            block.token_estimate = self.content_token_estimator(block.content)
 
         active = [block for block in blocks if block.enabled and block.content]
         history = copy.deepcopy(contexts or [])
@@ -200,15 +212,33 @@ class PromptBuilder:
             removed_count = len(history) - self.history_max_messages
             history = history[-self.history_max_messages:]
             dropped.extend(["history:max_messages"] * removed_count)
-        available = self.context_budget - self.output_reserve - estimate_tokens(current_prompt)
-        total = sum(block.token_estimate for block in active) + sum(estimate_tokens(str(m.get("content", ""))) for m in history)
+        current_cost = (
+            self.content_token_estimator(current_prompt) + self.message_overhead_tokens
+            if current_prompt else 0
+        )
+        available = (
+            self.context_budget - self.output_reserve
+            - current_cost - self.request_overhead_tokens
+        )
+        total = (
+            sum(block.token_estimate for block in active)
+            + (self.message_overhead_tokens if active else 0)
+            + sum(
+                self.content_token_estimator(str(m.get("content", "")))
+                + self.message_overhead_tokens
+                for m in history
+            )
+        )
 
         # Preserve role identity and recent continuity. Older history is normally
         # less valuable than deleting an entire character/persona/memory block.
         if self.history_first_trimming:
             while len(history) > self.history_keep_recent_messages and total > available:
                 removed = history.pop(0)
-                total -= estimate_tokens(str(removed.get("content", "")))
+                total -= (
+                    self.content_token_estimator(str(removed.get("content", "")))
+                    + self.message_overhead_tokens
+                )
                 dropped.append("history:oldest")
 
         optional_blocks = [block for block in active if block.identifier not in self.CORE_BLOCKS]
@@ -225,7 +255,10 @@ class PromptBuilder:
         # preferred recent-message floor. Core prompt blocks remain intact.
         while history and total > available:
             removed = history.pop(0)
-            total -= estimate_tokens(str(removed.get("content", "")))
+            total -= (
+                self.content_token_estimator(str(removed.get("content", "")))
+                + self.message_overhead_tokens
+            )
             dropped.append("history:oldest")
 
         # Hard-limit fallback for abnormally large core data. Main Prompt and
@@ -256,4 +289,7 @@ class PromptBuilder:
         messages = ([{"role": "system", "content": system_prompt}] if system_prompt else []) + history
         if current_prompt:
             messages.append({"role": "user", "content": current_prompt})
-        return BuildResult(system_prompt, history, active, dropped, list(lore.warnings), messages)
+        return BuildResult(
+            system_prompt, history, active, dropped, list(lore.warnings), messages,
+            current_prompt,
+        )

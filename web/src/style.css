@@ -1795,6 +1795,146 @@ details summary { cursor: pointer; color: var(--text); font-weight: 900; }
 .binding-slot b,
 .summary-card b { display: block; word-break: break-word; }
 
+.session-assembler-hero {
+  overflow: visible;
+}
+
+.session-picker-grid {
+  display: grid;
+  grid-template-columns: minmax(260px, 1.5fr) minmax(220px, 1fr) auto auto;
+  align-items: end;
+  gap: 12px;
+  margin-top: 14px;
+}
+
+.session-context-strip {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 14px;
+}
+
+.session-context-strip span {
+  min-width: 0;
+  padding: 11px 12px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: rgba(255, 255, 255, .045);
+  color: var(--muted);
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.session-context-strip b {
+  display: block;
+  margin-bottom: 5px;
+  color: var(--accent);
+  font: 900 10px/1 var(--font-mono);
+  letter-spacing: .08em;
+  text-transform: uppercase;
+}
+
+.session-context-strip span.warn {
+  border-color: color-mix(in srgb, var(--warn) 32%, transparent);
+  background: var(--warn-bg);
+}
+
+.session-assembler-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.1fr) minmax(320px, .9fr);
+  gap: 14px;
+  align-items: start;
+}
+
+.session-slots {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.binding-slot.editable {
+  display: grid;
+  gap: 9px;
+}
+
+.binding-slot.editable select {
+  width: 100%;
+}
+
+.additive-pickers {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+  margin-top: 14px;
+}
+
+.picker-stack {
+  min-height: 220px;
+}
+
+.pick-list {
+  display: grid;
+  gap: 7px;
+  max-height: 280px;
+  overflow: auto;
+  padding-right: 3px;
+}
+
+.campaign-state-card {
+  margin: 12px 0 14px;
+  padding: 15px;
+  border: 1px solid color-mix(in srgb, var(--accent) 32%, transparent);
+  border-radius: 16px;
+  background: linear-gradient(135deg, rgba(118, 235, 255, .10), rgba(255, 110, 160, .08));
+  box-shadow: var(--shadow-soft);
+}
+
+.campaign-state-card.safe {
+  border-color: color-mix(in srgb, var(--good) 34%, transparent);
+  background: var(--good-bg);
+}
+
+.campaign-state-card span {
+  display: block;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.campaign-state-card b {
+  display: block;
+  margin: 6px 0 5px;
+  color: var(--text);
+  font: 900 18px/1.2 var(--font-title);
+}
+
+.campaign-state-card small {
+  color: var(--muted);
+}
+
+.campaign-state-card details {
+  margin-top: 10px;
+}
+
+.campaign-state-card pre {
+  max-height: 220px;
+  overflow: auto;
+}
+
+.effective-slots {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.advanced-binding-panel[open] {
+  overflow: visible;
+}
+
+.advanced-binding-panel summary {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
 .debug { grid-template-columns: minmax(310px, 430px) minmax(0, 1fr); }
 .debug .panel { margin: 0; }
 .result { max-height: calc(100vh - 112px); overflow: auto; }
@@ -1900,7 +2040,11 @@ code {
   .home-hero-grid,
   .ops-grid,
   .guide-grid,
-  .summary-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .summary-grid,
+  .session-context-strip,
+  .additive-pickers { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .session-picker-grid,
+  .session-assembler-grid { grid-template-columns: 1fr; }
   .cards { grid-template-columns: repeat(3, minmax(0, 1fr)); }
   .binding-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .debug { grid-template-columns: 1fr; }
@@ -1938,7 +2082,13 @@ code {
   .guide-grid,
   .cards,
   .summary-grid,
-  .binding-summary { grid-template-columns: 1fr; }
+  .binding-summary,
+  .session-picker-grid,
+  .session-context-strip,
+  .session-assembler-grid,
+  .session-slots,
+  .additive-pickers,
+  .effective-slots { grid-template-columns: 1fr; }
   .workspace { min-height: 0; }
   .library { max-height: 250px; border-right: 0; border-bottom: 1px solid var(--line); }
   .editor,

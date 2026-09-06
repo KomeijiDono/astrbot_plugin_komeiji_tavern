@@ -1,0 +1,90 @@
+:root {
+  color-scheme: dark;
+  --background: #090d12;
+  --panel: #111821;
+  --border: #263241;
+  --foreground: #e8eef5;
+  --muted: #9ba9b8;
+  --accent: #80e6b5;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  min-height: 100%;
+  margin: 0;
+}
+
+body {
+  background:
+    radial-gradient(circle at 18% 12%, rgb(47 122 94 / 18%), transparent 30rem),
+    var(--background);
+  color: var(--foreground);
+  font-family:
+    Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
+    sans-serif;
+}
+
+.status-shell {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 2rem;
+}
+
+.status-card {
+  width: min(100%, 42rem);
+  padding: clamp(1.75rem, 5vw, 3rem);
+  background: rgb(17 24 33 / 92%);
+  border: 1px solid var(--border);
+  border-radius: 1.25rem;
+  box-shadow: 0 2rem 6rem rgb(0 0 0 / 35%);
+}
+
+.status-line {
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+  color: var(--accent);
+  font-size: 0.78rem;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.status-dot {
+  width: 0.65rem;
+  height: 0.65rem;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 1rem rgb(128 230 181 / 75%);
+}
+
+h1 {
+  margin: 1.25rem 0 1rem;
+  font-size: clamp(2rem, 7vw, 3.6rem);
+  letter-spacing: -0.05em;
+  line-height: 1;
+}
+
+p {
+  color: var(--muted);
+  font-size: 1.05rem;
+  line-height: 1.7;
+}
+
+.privacy-note {
+  padding: 1rem;
+  border-left: 3px solid var(--accent);
+  background: rgb(128 230 181 / 7%);
+}
+
+a {
+  display: inline-block;
+  margin-top: 0.5rem;
+  color: var(--accent);
+  text-underline-offset: 0.25rem;
+}

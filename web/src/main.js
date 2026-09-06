@@ -255,12 +255,22 @@ createApp({
     const archive = ref({ session_id: '', nodes: [], selected: null, branch_name: '' })
     const playDraft = ref({ prompt: '', mode: 'normal', quiet_prompt: '', branch_name: '' })
     const playResult = ref(null)
+    const candidateGroup = ref(null)
     const continueVisibleCount = ref(1)
     const selectedQuickReplyId = ref('')
     const twistOpen = ref(false)
     const twistText = ref(twistSeeds[0])
 
     const binding = ref({ scope_type: 'session', scope_id: '', kind: 'character', target_id: '', priority: 0 })
+    const singleBindingKinds = ['preset', 'character', 'character_group', 'persona']
+    const additiveBindingKinds = ['lorebook', 'material', 'quick_reply']
+    const sessionBindingKinds = [...singleBindingKinds, ...additiveBindingKinds]
+    const newSessionBindingDraft = () => ({
+      campaign_id: '',
+      single: Object.fromEntries(singleBindingKinds.map(kind => [kind, ''])),
+      additive: Object.fromEntries(additiveBindingKinds.map(kind => [kind, []])),
+    })
+    const sessionBindingDraft = ref(newSessionBindingDraft())
     const newMemoryDraft = () => ({ id: '', scope_type: 'session', scope_id: '', category: 'status', content: '', enabled: true, status: 'active', importance: 1, source_type: 'manual', source_ref: '', expires_at: 0 })
     const memoryDraft = ref(newMemoryDraft())
     const newCampaignDraft = () => ({
@@ -477,10 +487,17 @@ createApp({
       if (debug.value.session_id) return debug.value.session_id
       return '未选择会话，仅显示全局与 Persona 绑定'
     })
+    const selectedSessionId = computed(() => debug.value.session_id || '')
+    const activeCampaigns = computed(() => campaigns.value.filter(value => !value.archived))
+    const currentSessionCampaign = computed(() => {
+      const sessionId = selectedSessionId.value
+      if (!sessionId) return null
+      return activeCampaigns.value.find(value => value.session_ids?.includes(sessionId)) || null
+    })
     const bindingsForTarget = computed(() => {
       const sessionId = debug.value.session_id || ''
       const personaId = debug.value.persona_id || ''
-      const campaign = campaigns.value.find(value => value.session_ids?.includes(sessionId))
+      const campaign = currentSessionCampaign.value
       return bindings.value.filter(item => {
         if (item.scope_type === 'global') return true
         if (item.scope_type === 'session') return sessionId && item.scope_id === sessionId
@@ -491,19 +508,117 @@ createApp({
         return false
       })
     })
+    const directSessionBindings = computed(() => {
+      const sessionId = selectedSessionId.value
+      return sessionId ? bindings.value.filter(item => item.scope_type === 'session' && item.scope_id === sessionId) : []
+    })
+    const sessionDirectSummary = computed(() => {
+      const single = Object.fromEntries(singleBindingKinds.map(kind => [kind, null]))
+      const additive = Object.fromEntries(additiveBindingKinds.map(kind => [kind, []]))
+      const ordered = directSessionBindings.value.slice().sort((a, b) => Number(a.priority || 0) - Number(b.priority || 0) || String(a.target_name || '').localeCompare(String(b.target_name || ''), 'zh-Hans-CN'))
+      for (const item of ordered) {
+        if (singleBindingKinds.includes(item.kind) && !single[item.kind]) single[item.kind] = item
+        if (additiveBindingKinds.includes(item.kind)) additive[item.kind].push(item)
+      }
+      return { single, additive }
+    })
+    const docsByKind = kind => documents.value.filter(item => item.kind === kind)
     const bindingSummary = computed(() => {
-      const singleKinds = ['preset', 'character', 'character_group', 'persona']
-      const additiveKinds = ['lorebook', 'material', 'quick_reply']
       const rank = { global: 1, persona: 2, world: 3, ruleset: 4, campaign: 5, session: 6 }
       const out = { single: {}, additive: {} }
-      for (const kind of singleKinds) {
+      for (const kind of singleBindingKinds) {
         out.single[kind] = bindingsForTarget.value
           .filter(item => item.kind === kind)
-          .sort((a, b) => (rank[b.scope_type] || 0) - (rank[a.scope_type] || 0) || Number(b.priority || 0) - Number(a.priority || 0))[0] || null
+          .sort((a, b) => (rank[b.scope_type] || 0) - (rank[a.scope_type] || 0) || Number(a.priority || 0) - Number(b.priority || 0) || String(a.target_name || '').localeCompare(String(b.target_name || ''), 'zh-Hans-CN'))[0] || null
       }
-      for (const kind of additiveKinds) out.additive[kind] = bindingsForTarget.value.filter(item => item.kind === kind)
+      for (const kind of additiveBindingKinds) out.additive[kind] = bindingsForTarget.value.filter(item => item.kind === kind)
       return out
     })
+    const hydrateSessionBindingDraft = () => {
+      const draft = newSessionBindingDraft()
+      draft.campaign_id = currentSessionCampaign.value?.id || ''
+      for (const kind of singleBindingKinds) draft.single[kind] = sessionDirectSummary.value.single[kind]?.target_id || ''
+      for (const kind of additiveBindingKinds) draft.additive[kind] = sessionDirectSummary.value.additive[kind].map(item => item.target_id)
+      sessionBindingDraft.value = draft
+    }
+    const inheritedBindingText = kind => {
+      const effective = bindingSummary.value.single[kind]
+      if (!effective) return '没有继承项'
+      if (effective.scope_type === 'session') return '当前会话覆盖'
+      return '继承自' + scopeName(effective)
+    }
+    const saveSessionAssembly = async () => {
+      clear()
+      const sessionId = selectedSessionId.value.trim()
+      if (!sessionId) { error.value = '请先选择一个会话。'; return }
+      busy.value = true
+      try {
+        const wanted = new Set()
+        for (const kind of singleBindingKinds) {
+          const targetId = String(sessionBindingDraft.value.single[kind] || '').trim()
+          if (targetId) wanted.add(kind + '\u0000' + targetId)
+        }
+        for (const kind of additiveBindingKinds) {
+          for (const targetId of sessionBindingDraft.value.additive[kind] || []) {
+            if (targetId) wanted.add(kind + '\u0000' + targetId)
+          }
+        }
+        for (const item of directSessionBindings.value) {
+          if (sessionBindingKinds.includes(item.kind) && !wanted.has(item.kind + '\u0000' + item.target_id)) {
+            await post('/bindings/delete', item)
+          }
+        }
+        const existing = new Set(directSessionBindings.value.map(item => item.kind + '\u0000' + item.target_id))
+        for (const kind of singleBindingKinds) {
+          const targetId = String(sessionBindingDraft.value.single[kind] || '').trim()
+          if (targetId && !existing.has(kind + '\u0000' + targetId)) {
+            await post('/bindings', { scope_type: 'session', scope_id: sessionId, kind, target_id: targetId, priority: 0 })
+          }
+        }
+        for (const kind of additiveBindingKinds) {
+          let priority = 0
+          for (const targetId of sessionBindingDraft.value.additive[kind] || []) {
+            if (targetId && !existing.has(kind + '\u0000' + targetId)) {
+              await post('/bindings', { scope_type: 'session', scope_id: sessionId, kind, target_id: targetId, priority })
+            }
+            priority += 10
+          }
+        }
+        const nextCampaignId = String(sessionBindingDraft.value.campaign_id || '').trim()
+        const currentCampaignId = currentSessionCampaign.value?.id || ''
+        if (nextCampaignId && nextCampaignId !== currentCampaignId) {
+          await post('/campaigns/' + encodeURIComponent(nextCampaignId) + '/sessions', { session_id: sessionId })
+        } else if (!nextCampaignId && currentCampaignId) {
+          await post('/campaigns/sessions/unbind', { session_id: sessionId })
+        }
+        debug.value.session_id = sessionId
+        newGameDraft.value.session_id = sessionId
+        archive.value.session_id = sessionId
+        await load()
+        notice.value = '会话装配已保存；当前会话的资料与战役归属已聚合更新。'
+      } catch (e) {
+        error.value = e.message
+      } finally {
+        busy.value = false
+      }
+    }
+    const clearSessionAssemblyOverrides = async () => {
+      clear()
+      const sessionId = selectedSessionId.value.trim()
+      if (!sessionId) { error.value = '请先选择一个会话。'; return }
+      busy.value = true
+      try {
+        for (const item of directSessionBindings.value.filter(item => sessionBindingKinds.includes(item.kind))) {
+          await post('/bindings/delete', item)
+        }
+        await load()
+        notice.value = '已清空这个会话自己的资料覆盖；仍会继续继承战役、Persona 与全局设置。'
+      } catch (e) {
+        error.value = e.message
+      } finally {
+        busy.value = false
+      }
+    }
     const debugSummary = computed(() => {
       const result = debugResult.value || {}
       const effective = result.effective || {}
@@ -553,6 +668,10 @@ createApp({
       }, 4200)
     })
 
+    watch(selectedSessionId, () => {
+      hydrateSessionBindingDraft()
+    })
+
     const load = async () => {
       try {
         const x = await Promise.all([
@@ -589,6 +708,7 @@ createApp({
         if (warnings.length) notice.value = warnings.join('；')
         await refreshCurrentGame()
         await refreshArchive()
+        hydrateSessionBindingDraft()
       } catch (e) {
         error.value = e.message
       }
@@ -957,6 +1077,51 @@ createApp({
       playDraft.value.branch_name = ''
       await refreshCurrentGame()
       await refreshArchive()
+      await refreshCandidates()
+    }
+
+    const refreshCandidates = async () => {
+      const sessionId = debug.value.session_id || newGameDraft.value.session_id || ''
+      if (!sessionId) { candidateGroup.value = null; return }
+      try {
+        candidateGroup.value = (await request('/candidates/' + encodeURIComponent(sessionId))).data
+      } catch (_) {
+        candidateGroup.value = null
+      }
+    }
+
+    const generateCandidate = async () => {
+      const sessionId = debug.value.session_id || newGameDraft.value.session_id || ''
+      if (!sessionId) { error.value = '请先选择当前会话。'; return }
+      busy.value = true; clear()
+      try {
+        const out = await post('/candidates/' + encodeURIComponent(sessionId) + '/generate', {})
+        playResult.value = out.data
+        candidateGroup.value = out.data.candidate_group
+        await refreshArchive()
+        notice.value = '新候选已生成并设为当前回复。'
+      } catch (e) {
+        error.value = e.message
+      } finally {
+        busy.value = false
+      }
+    }
+
+    const selectWebCandidate = async index => {
+      const sessionId = debug.value.session_id || newGameDraft.value.session_id || ''
+      if (!sessionId) return
+      busy.value = true; clear()
+      try {
+        const out = await post('/candidates/' + encodeURIComponent(sessionId) + '/select', { candidate_index: index })
+        candidateGroup.value = out.data.candidate_group
+        playResult.value = { reply: out.data.selected.assistant_text, conversation_synced: true, provider_id: 'saved candidate' }
+        await refreshArchive()
+        notice.value = '已切换到候选 ' + index + '。'
+      } catch (e) {
+        error.value = e.message
+      } finally {
+        busy.value = false
+      }
     }
 
     const clearSelectedContinueNode = () => {
@@ -996,6 +1161,7 @@ createApp({
         currentGame.value = { campaign: out.data.campaign, pack: currentGame.value.pack, changes: out.data.changes || [] }
         if (out.data.reply) playDraft.value.prompt = ''
         await refreshArchive()
+        await refreshCandidates()
         if (out.data.node_id) archive.value.selected = (await request('/archive/' + encodeURIComponent(out.data.node_id))).data
         notice.value = out.data.conversation_synced ? '一轮完成，已同步到 AstrBot conversation。' : '一轮完成，已保存到插件分支树。'
       } catch (e) {
@@ -1248,10 +1414,12 @@ createApp({
       metricDays, metrics, metricItems, metricTotals, metricProviders, maxMetricTokens,
       retrievalTest, retrievalStats, retrievalResult,
       archive, archiveTree, archiveSegments, homeGuide, selectedQuickReplyId, promptAssembly, twistOpen, twistText,
-      playDraft, playResult, continueVisibleCount, hiddenContinueCount, sortedContinueNodes, continueTimeline, latestContinueNode, selectedContinueNode, pendingCurrentChanges, activeContinueSegment, continueHits, compactStateRows,
+      playDraft, playResult, candidateGroup, continueVisibleCount, hiddenContinueCount, sortedContinueNodes, continueTimeline, latestContinueNode, selectedContinueNode, pendingCurrentChanges, activeContinueSegment, continueHits, compactStateRows,
       debug, debugResult, debugSummary, docsForTab, bindDocs, characterDocs, card, entries, filteredEntries, quickReplies,
       groupMembers, availableGroupMembers,
       sessionOptions, sFiltered, dFiltered, sessionDisplay, debugDisplay, bindingTargetTitle, bindingsForTarget, bindingSummary,
+      singleBindingKinds, additiveBindingKinds, sessionBindingDraft, selectedSessionId, activeCampaigns, currentSessionCampaign, directSessionBindings,
+      docsByKind, hydrateSessionBindingDraft, inheritedBindingText, saveSessionAssembly, clearSessionAssemblyOverrides,
       entryQuery, entryFilter, openEntryUid,
       sOpen, dOpen, pickSession, onSFocus, onSBlur, pickDebug, onDFocus, onDBlur,
       choose, createDoc, save, remove, duplicate, applyAdvanced, importData,
@@ -1263,7 +1431,7 @@ createApp({
       updateSelectedMemoryStatus, deleteMemory, refreshMetrics,
       editCampaign, resetCampaignDraft, saveCampaign, deleteCampaign,
       bindCampaignSession, unbindCampaignSession, resolveCampaignChange,
-      refreshCurrentGame, refreshPlayableSession, expandContinueNodes, expandAllContinueNodes, collapseContinueNodes, clearSelectedContinueNode, previewPlayPrompt, playTurn, createPackFromCurrent, deleteRpPack, startNewGame,
+      refreshCurrentGame, refreshPlayableSession, refreshCandidates, generateCandidate, selectWebCandidate, expandContinueNodes, expandAllContinueNodes, collapseContinueNodes, clearSelectedContinueNode, previewPlayPrompt, playTurn, createPackFromCurrent, deleteRpPack, startNewGame,
       setCurrentStateValue, saveCurrentState, analyzeCurrentWorldbooks, riskLabel,
       refreshRetrievalStats, runRetrievalTest,
       move, moveMember, addMember, addBlock, addEntry, addQuickReply, removeQuickReply, applyQuickReply,
@@ -1427,7 +1595,7 @@ createApp({
               <button v-if="continueVisibleCount > 1" class="ghost compact" @click="collapseContinueNodes">折叠</button>
             </div>
             <button v-for="node in continueTimeline" :key="node.id" :class="['continue-node',{active:archive.selected?.id===node.id,latest:latestContinueNode?.id===node.id}]" @click="selectArchiveNode(node)" :style="{paddingLeft: (18 + Math.min(node.depth || 0, 5) * 12) + 'px'}">
-              <span>{{node.branch_name || '主线'}}</span>
+              <span>{{node.candidate_group_id ? '候选 '+node.candidate_index+(node.candidate_selected?' · 当前':'') : (node.branch_name || '主线')}}</span>
               <b>{{node.title || '未命名节点'}}</b>
               <small>第 {{node.turn_index}} 轮 · {{formatTimestamp(node.created_at)}}</small>
             </button>
@@ -1441,6 +1609,20 @@ createApp({
               <article v-else-if="selectedContinueNode" class="chat-bubble assistant pending"><small>{{latestContinueNode?.id===selectedContinueNode.id ? '最新节点' : '存档节点'}} · {{selectedContinueNode.branch_name || '主线'}} · 第 {{selectedContinueNode.turn_index}} 轮</small><p>点左侧节点可读取完整回复；不选择节点时，下一轮会接当前会话最新剧情继续。</p></article>
               <article v-if="playResult?.reply" class="chat-bubble assistant live"><small>刚生成 · {{playResult.provider_id || 'current provider'}} · {{playResult.conversation_synced ? '已同步 AstrBot' : '插件分支树'}}</small><pre>{{playResult.reply}}</pre></article>
               <p v-if="!archive.selected?.assistant_text && !playResult?.reply && !selectedContinueNode" class="muted">这里会显示选中存档或刚生成的回复。输入玩家行动后，网页会直接完成一轮 RP 并自动保存新节点。</p>
+            </div>
+
+            <div v-if="candidateGroup" class="activation">
+              <div>
+                <b>本轮候选回复</b>
+                <small>当前 {{candidateGroup.nodes?.find(x=>x.candidate_selected)?.candidate_index || 1}} / {{candidateGroup.nodes?.length || 0}}，继续下一轮后将锁定。</small>
+              </div>
+              <div class="actions">
+                <button v-for="node in candidateGroup.nodes" :class="{primary:node.candidate_selected}" @click="selectWebCandidate(node.candidate_index)" :disabled="busy">{{node.candidate_index}}</button>
+                <button @click="generateCandidate" :disabled="busy || (candidateGroup.nodes?.length || 0) >= (candidateGroup.limit || 5)">换一个</button>
+              </div>
+            </div>
+            <div v-else class="actions">
+              <button @click="generateCandidate" :disabled="busy || !latestContinueNode">为最新回复生成候选</button>
             </div>
 
             <label class="composer-field"><span>玩家行动 / 续写要求</span><textarea v-model="playDraft.prompt" placeholder="例如：我推开门，压低声音问她刚才听见了什么。"></textarea></label>
@@ -1671,45 +1853,75 @@ createApp({
       </article>
       <article v-else class="empty"><h3>选择一项开始编辑</h3></article>
     </section>
-    <section v-else-if="tab==='bindings'" class="stack">
-      <div class="panel">
+    <section v-else-if="tab==='bindings'" class="stack session-assembler">
+      <div class="panel session-assembler-hero">
         <div class="result-head">
           <div>
-            <h3>当前目标的有效配置</h3>
-            <p class="muted">{{bindingTargetTitle}}</p>
+            <h3>会话装配台</h3>
+            <p class="muted">先选一个 AstrBot 会话，再把战役归属、核心角色/预设和叠加资料一次性收束到同一屏。</p>
           </div>
-          <button @click="tab='debug'">去调试器验证</button>
+          <div class="actions"><button @click="hydrateSessionBindingDraft">按当前覆盖重载</button><button class="primary" @click="saveSessionAssembly" :disabled="busy || !selectedSessionId">保存会话装配</button></div>
         </div>
-        <label class="combo">用于查看生效结果的会话
-          <input v-model="debugDisplay" @focus="onDFocus" @blur="onDBlur" placeholder="搜索或输入会话 ID">
-          <div class="combo-panel" v-if="dOpen">
-            <div v-for="c in dFiltered" class="combo-option" @mousedown.prevent="pickDebug(c)">{{c.title}} · {{c.platform}}</div>
-            <div v-if="!dFiltered.length" class="combo-option muted">无匹配，可直接输入 ID</div>
+        <div class="session-picker-grid">
+          <label class="combo">目标会话
+            <input v-model="debugDisplay" @focus="onDFocus" @blur="onDBlur" placeholder="搜索或输入会话 ID">
+            <div class="combo-panel" v-if="dOpen">
+              <div v-for="c in dFiltered" class="combo-option" @mousedown.prevent="pickDebug(c)">{{c.title}} · {{c.platform}}</div>
+              <div v-if="!dFiltered.length" class="combo-option muted">无匹配，可直接输入 ID</div>
+            </div>
+          </label>
+          <label>战役归属<select v-model="sessionBindingDraft.campaign_id"><option value="">不绑定战役（普通会话）</option><option v-for="c in activeCampaigns" :value="c.id">{{c.name}} · {{c.world_id || '无世界标识'}}</option></select></label>
+          <button @click="refreshPlayableSession" :disabled="!selectedSessionId">刷新当前游戏</button>
+          <button class="danger" @click="clearSessionAssemblyOverrides" :disabled="busy || !directSessionBindings.length">清空会话覆盖</button>
+        </div>
+        <div class="session-context-strip">
+          <span><b>会话</b>{{bindingTargetTitle}}</span>
+          <span :class="{warn: !currentSessionCampaign}"><b>战役</b>{{currentSessionCampaign?.name || '未绑定，权威状态不会注入'}}</span>
+          <span><b>Persona</b>{{debug.persona_id || '未识别'}}</span>
+          <span><b>直接覆盖</b>{{directSessionBindings.length}} 条</span>
+        </div>
+      </div>
+      <div class="session-assembler-grid">
+        <div class="panel">
+          <div class="result-head compact"><div><h3>本会话直接绑定</h3><p class="muted">这里保存的是会话自己的覆盖项；留空则继续继承战役、Persona 或全局。</p></div></div>
+          <div class="binding-summary session-slots">
+            <label class="binding-slot editable" v-for="kind in singleBindingKinds">
+              <span>{{labels[kind]}}</span>
+              <select v-model="sessionBindingDraft.single[kind]"><option value="">继承 / 不覆盖</option><option v-for="d in docsByKind(kind)" :value="d.id">{{d.name}}</option></select>
+              <small>当前：{{bindingSummary.single[kind]?.target_name || '未生效'}} · {{inheritedBindingText(kind)}}</small>
+            </label>
           </div>
-        </label>
-        <div class="binding-summary">
-          <div class="binding-slot" v-for="kind in ['preset','character','character_group','persona']">
-            <span>{{labels[kind]}}</span>
-            <b>{{bindingSummary.single[kind]?.target_name || '未生效'}}</b>
-            <small>{{bindingSummary.single[kind] ? scopeName(bindingSummary.single[kind]) : '没有匹配当前目标的绑定'}}</small>
+          <div class="additive-pickers">
+            <div class="binding-stack picker-stack" v-for="kind in additiveBindingKinds">
+              <h4>{{labels[kind]}}</h4>
+              <p class="muted">勾选后只绑定到当前会话；战役/世界/全局继承项会在右侧总览里继续显示。</p>
+              <div class="pick-list">
+                <label v-for="d in docsByKind(kind)" class="check-field"><input type="checkbox" :value="d.id" v-model="sessionBindingDraft.additive[kind]">{{d.name}}</label>
+                <p v-if="!docsByKind(kind).length" class="muted">还没有{{labels[kind]}}。</p>
+              </div>
+            </div>
           </div>
         </div>
-        <div class="grid">
-          <div class="binding-stack">
-            <h4>叠加世界书</h4>
-            <div class="activation" v-for="i in bindingSummary.additive.lorebook"><b>{{i.target_name}}</b><small> · {{scopeName(i)}}</small></div>
-            <p v-if="!bindingSummary.additive.lorebook.length" class="muted">当前目标没有叠加世界书。</p>
+        <div class="panel effective-stack-panel">
+          <div class="result-head compact"><div><h3>聚合后的最终生效链路</h3><p class="muted">调试器和真实请求会按这条链路解析；战役状态只在本会话确实绑定战役时出现。</p></div><button @click="tab='debug'">去调试器验证</button></div>
+          <div v-if="currentSessionCampaign" class="campaign-state-card">
+            <span>当前战役</span><b>{{currentSessionCampaign.name}}</b><small>{{currentSessionCampaign.world_id || '无世界'}} / {{currentSessionCampaign.ruleset_id || '无规则集'}}</small>
+            <details><summary>查看权威状态</summary><pre>{{JSON.stringify(currentSessionCampaign.state_data || {}, null, 2)}}</pre></details>
           </div>
-          <div class="binding-stack">
-            <h4>叠加创作素材</h4>
-            <div class="activation" v-for="i in bindingSummary.additive.material"><b>{{i.target_name}}</b><small> · {{scopeName(i)}}</small></div>
-            <p v-if="!bindingSummary.additive.material.length" class="muted">当前目标没有叠加创作素材。</p>
+          <div v-else class="campaign-state-card safe"><span>普通会话</span><b>未绑定战役</b><small>不会注入战役规则、世界/规则集绑定或权威状态。</small></div>
+          <div class="binding-summary effective-slots">
+            <div class="binding-slot" v-for="kind in singleBindingKinds"><span>{{labels[kind]}}</span><b>{{bindingSummary.single[kind]?.target_name || '未生效'}}</b><small>{{bindingSummary.single[kind] ? scopeName(bindingSummary.single[kind]) : '没有匹配当前目标的绑定'}}</small></div>
+          </div>
+          <div class="binding-stack" v-for="kind in additiveBindingKinds">
+            <h4>叠加{{labels[kind]}}</h4>
+            <div class="activation" v-for="i in bindingSummary.additive[kind]"><b>{{i.target_name}}</b><small> · {{scopeName(i)}}</small></div>
+            <p v-if="!bindingSummary.additive[kind].length" class="muted">当前目标没有叠加{{labels[kind]}}。</p>
           </div>
         </div>
       </div>
-      <div class="panel">
-        <h3>新增绑定</h3>
-        <p>角色、角色组、预设、用户设定按“会话 → 战役 → 规则集 → 世界 → Persona → 全局”覆盖；世界书和创作素材会按作用域叠加。</p>
+      <details class="panel advanced-binding-panel">
+        <summary>高级：手动新增任意作用域绑定</summary>
+        <p>保留老入口：适合把资料绑定到战役、世界、规则集、Persona 或全局。普通会话日常操作建议优先使用上面的装配台。</p>
         <div class="binding-form">
           <label>资料类型<select v-model="binding.kind"><option v-for="(v,k) in labels" :value="k">{{v}}</option></select></label>
           <label>资料<select v-model="binding.target_id"><option value="">请选择</option><option v-for="d in bindDocs" :value="d.id">{{d.name}}</option></select></label>
@@ -1727,7 +1939,7 @@ createApp({
           <label v-if="binding.scope_type==='ruleset'">规则集标识<input v-model="binding.scope_id" placeholder="与战役 ruleset_id 一致"></label>
           <button class="primary" @click="addBinding">确认绑定</button>
         </div>
-      </div>
+      </details>
       <div class="panel">
         <h3>全部绑定记录</h3>
         <table><tr><th>范围</th><th>类型</th><th>资料</th><th></th></tr>
@@ -1880,7 +2092,7 @@ createApp({
           </summary>
           <button v-for="n in segment.nodes" :key="n.id" :class="['doc','archive-node',{active:archive.selected?.id===n.id}]" @click="selectArchiveNode(n)" :style="{paddingLeft: (16 + Math.min(n.depth, 5) * 18) + 'px'}">
             <b>{{n.title||'（无标题）'}}</b>
-            <small>轮次 {{n.turn_index}} · {{n.branch_name||'主线'}} · {{formatTimestamp(n.created_at)}}</small>
+            <small>轮次 {{n.turn_index}} · {{n.candidate_group_id ? '候选 '+n.candidate_index+(n.candidate_selected?' · 当前':'') : (n.branch_name||'主线')}} · {{formatTimestamp(n.created_at)}}</small>
             <small>{{n.id}}</small>
           </button>
         </details>
@@ -1980,6 +2192,17 @@ createApp({
           </div>
           <pre v-if="debugResult.summary.content">{{debugResult.summary.content}}</pre>
           <div class="alert error" v-if="debugResult.summary.error">{{debugResult.summary.error}}</div>
+        </details>
+        <details v-if="debugResult.cipher" open><summary>主模型密文测试</summary>
+          <div class="effective">
+            <span>状态：{{debugResult.cipher.enabled?'已启用':'未启用'}}</span>
+            <span>方式：{{debugResult.cipher.method_label||debugResult.cipher.method}}</span>
+            <span>作用范围：{{debugResult.cipher.scope||'未启用'}}</span>
+            <span>回复处理：{{debugResult.cipher.response_mode||'普通明文回复'}}</span>
+            <span>Provider 请求已编码：{{debugResult.cipher.provider_request_encoded?'是':'否'}}</span>
+            <span>调试与存档：{{debugResult.cipher.stored_messages==='plaintext'?'仅保存明文':'未知'}}</span>
+          </div>
+          <div class="alert warn" v-if="debugResult.cipher.enabled">{{debugResult.cipher.security_notice}}</div>
         </details>
         <details v-if="debugResult.retrieval" open><summary>混合检索状态</summary>
           <div class="effective">

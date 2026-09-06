@@ -156,6 +156,11 @@ WebUI 的“角色组”页签可把多个角色卡组合成一个可绑定资�
 /tavern preview
 /tavern reset
 /tavern undo
+/tavern swipe
+/tavern swipe list
+/tavern swipe prev
+/tavern swipe next
+/tavern swipe use <编号>
 /tavern character status
 /tavern character next
 /tavern character use <角色名>
@@ -170,6 +175,8 @@ WebUI 的“角色组”页签可把多个角色卡组合成一个可绑定资�
 
 `undo`（也可写作 `rollback` 或 `撤回`）会删除当前 AstrBot 会话中最近一次用户消息和对应的助手回复，并回退该轮产生的插件状态、滚动摘要、请求预览和自动提取记忆。分支树快照仍会保留，便于误操作后找回；执行后可直接重新发送剧情指令。
 
+`swipe` 可写作 `sw` 或 `换一个`，会用完全相同的上一轮纯文本输入重新生成候选回复。新候选立即成为当前版本；`/tv sw ls` 查看候选，`/tv sw p|n` 前后切换，`/tv sw u <编号>` 选用指定版本。每轮默认最多 5 个候选，继续正常剧情后该组锁定，旧版本仍保留在分支树中。
+
 - `retrieval test`：在当前会话绑定范围内测试输入文本会召回哪些世界书或素材条目。
 - `retrieval stats`：查看检索日志数量、高频命中条目和当前会话统计。
 - `archive list|show|branch`：查看当前会话分支树节点，或从指定节点快照继续生成新分支。
@@ -179,6 +186,8 @@ WebUI 的“角色组”页签可把多个角色卡组合成一个可绑定资�
 配置页按功能分组：
 
 - **基础功能**：插件开关、发送工具引导。普通聊天建议关闭发送工具引导。
+- **主模型密文测试**：默认关闭；可把主聊天的 system、历史和本轮输入临时转换为 UTF-8 Base64、UTF-8 Hex、反转后 Base64、ROT47、Unicode 位移、XOR + Base64、Base91 或 JSON Unicode 转义，并自动解码模型回复。该功能仅用于测试模型对可逆编码协议的理解与遵循，不属于安全加密。
+- **主模型网址请求模式**：默认关闭；把最终 system、历史和本轮输入放入临时网页，首次 Provider 请求只发送读取协议、临时网址和可选的 `fetch_request_url` 兜底工具。可启用 `submit_reply`，让模型通过函数提交最终回复，由插件写入当前临时页面并还原到正常回复、状态栏、分支、配图和明文会话链路。支持本机内存服务 `local` 与 GPT Sites 托管中转 `hosted`；网址模式与密文模式同时开启时优先使用网址模式。
 - **上下文与裁剪**：上下文预算、输出预留、历史条数与裁剪顺序。
 - **自动摘要与历史压缩**：Provider、触发条数、输出上限、超时和提示词。
 - **会话数据生命周期**：自动清理、状态保留天数、预览保留天数、分支树归档和检查间隔。
@@ -187,6 +196,14 @@ WebUI 的“角色组”页签可把多个角色卡组合成一个可绑定资�
 - **状态栏 / 自动配图**：可选创作扩展。
 
 默认生命周期策略：会话状态保留 30 天，请求预览保留 7 天，每 24 小时检查一次。
+
+`local` 后端需要自行把 `url_request_listen_host:url_request_listen_port` 反向代理或映射到模型能访问的 `url_request_public_base_url`。`hosted` 后端使用仓库内的 `hosted/url-request-relay` GPT Sites 项目，通过 `url_request_hosted_api_base_url` 和 Bearer 密钥创建、更新及删除 D1 临时记录；创建、更新或鉴权失败时会终止本轮，不回退到本机、密文或明文请求。两种后端都提供 `GET/HEAD /request/{token}`，临时页面正常完成后立即删除，异常残留由 TTL 清理。随机网址本身就是短期访问凭证，取得者在有效期内可以读取完整请求，因此应使用 HTTPS、限制日志记录，并避免把网址转发给无关人员。
+
+GPT Sites 的边缘防护会拒绝普通 Python HTTP 客户端的 TLS 指纹，因此托管管理请求使用 `curl-cffi` 的浏览器兼容传输；该依赖已列入 `requirements.txt`。
+管理 API 还会用 UTF-8 Base64 包装消息正文，Worker 收到后立即还原，再按原计划以短期明文写入 D1。这样可减少 Cloudflare 对角色扮演正文的 WAF 误判；该包装只用于传输兼容，不提供保密性。
+如果 AstrBot 所在网络直连 Sites 仍收到 Cloudflare 403，可配置 `url_request_hosted_proxy_url`，例如 `http://127.0.0.1:7897`。该代理仅用于插件调用托管管理 API，不会代替模型读取临时网页。
+
+模型若能原生访问网页可直接处理；不能访问时可调用一次 `fetch_request_url`。启用回复提交工具后，模型调用一次中性的 `submit_reply(text)`，插件将正文追加到当前临时页面；模型不接触管理密钥，也不能指定其他页面。工具确认后的普通模型输出仅用于结束 Agent，展示和存档使用提交的正文。图片和音频仍直接附加给 Provider，调试预览、备份、分支节点和 AstrBot 本地会话只保存明文逻辑消息，不保存临时 token、网址或工具消息。
 
 ## 导入与数据
 

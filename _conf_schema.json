@@ -17,6 +17,107 @@
       }
     }
   },
+  "cipher_config": {
+    "description": "主模型密文测试",
+    "hint": "把主聊天请求临时转换为可逆编码，并要求模型以同样方式返回。仅用于测试模型能力，不提供安全加密；摘要、记忆、向量和战役状态辅助模型不受影响。",
+    "type": "object",
+    "items": {
+      "cipher_enabled": {
+        "description": "启用主模型密文测试",
+        "hint": "开启后，只有自动生成的协议说明保持明文；角色设定、历史和本轮输入都会编码。密文模式会停用发送工具引导。",
+        "type": "bool",
+        "default": false
+      },
+      "cipher_method": {
+        "description": "可逆编码方式",
+        "hint": "支持 UTF-8 Base64/Hex、反转 Base64、JSON 转义后 ROT47、Unicode 标量值 +3、固定密钥 XOR + Base64、标准 basE91 和 JSON Unicode 转义。",
+        "type": "string",
+        "options": ["base64_utf8", "hex_utf8", "reverse_base64", "rot47", "unicode_shift_3", "xor_base64", "base91", "json_escape"],
+        "default": "base64_utf8"
+      }
+    }
+  },
+  "url_request_config": {
+    "description": "主模型网址请求模式",
+    "hint": "把最终明文请求放入临时网页，首次只向主模型发送读取协议和临时网址。可使用本机反向代理或 GPT Sites 托管中转；网址相当于短期访问凭证。",
+    "type": "object",
+    "items": {
+      "url_request_enabled": {
+        "description": "启用网址请求模式",
+        "hint": "开启后网址模式优先于密文模式。临时网页服务或公网基址不可用时会直接终止本轮，不回退发送明文。",
+        "type": "bool",
+        "default": false
+      },
+      "url_request_backend": {
+        "description": "临时网页后端",
+        "hint": "local 使用本机独立 HTTP 服务；hosted 把请求短暂上传到配置的 GPT Sites 中转站。",
+        "type": "string",
+        "options": ["local", "hosted"],
+        "default": "local"
+      },
+      "url_request_hosted_api_base_url": {
+        "description": "托管中转站地址",
+        "hint": "hosted 模式必填，例如 GPT Sites 部署得到的 https://... 地址，不要以 /api/v1 结尾。",
+        "type": "string",
+        "default": ""
+      },
+      "url_request_hosted_api_key": {
+        "description": "托管中转站 API 密钥",
+        "hint": "hosted 模式必填，仅用于创建、更新和删除临时请求，不会发送给模型。",
+        "type": "string",
+        "obvious_hint": true,
+        "default": ""
+      },
+      "url_request_hosted_timeout_seconds": {
+        "description": "托管接口超时（秒）",
+        "hint": "创建、更新、删除和启动健康验证的总超时。",
+        "type": "int",
+        "default": 10
+      },
+      "url_request_hosted_proxy_url": {
+        "description": "托管接口代理地址",
+        "hint": "可选。AstrBot 访问 GPT Sites 被 Cloudflare 返回 403 时填写本机 HTTP 代理，例如 http://127.0.0.1:7897。仅管理 API 上传、更新和删除走此代理，模型访问临时网页不受影响。",
+        "type": "string",
+        "default": ""
+      },
+      "url_request_public_base_url": {
+        "description": "本机模式公开基址",
+        "hint": "local 模式必填，例如 https://example.com/komeiji。请把该地址反向代理到下方监听地址；不要以 /request 结尾。",
+        "type": "string",
+        "default": ""
+      },
+      "url_request_listen_host": {
+        "description": "临时网页监听地址",
+        "hint": "默认监听所有网卡。仅本机反向代理时可改为 127.0.0.1。",
+        "type": "string",
+        "default": "0.0.0.0"
+      },
+      "url_request_listen_port": {
+        "description": "临时网页监听端口",
+        "hint": "需要确保未被其他程序占用，并在防火墙或反向代理中正确放行。",
+        "type": "int",
+        "default": 6190
+      },
+      "url_request_ttl_seconds": {
+        "description": "异常残留页面寿命（秒）",
+        "hint": "正常完成、异常或取消时立即删除；此值仅作为未正常清理时的兜底。",
+        "type": "int",
+        "default": 600
+      },
+      "url_request_fetch_tool_enabled": {
+        "description": "提供读取工具兜底",
+        "hint": "模型不能原生访问网页时，可调用一次 fetch_request_url。工具只允许读取本轮精确网址，不会访问任意 URL。",
+        "type": "bool",
+        "default": true
+      },
+      "url_request_reply_tool_enabled": {
+        "description": "启用回复提交工具",
+        "hint": "要求模型通过 submit_reply 提交最终回复。插件把回复写入当前临时页面，再将提交内容送入正常状态栏、分支、配图和明文会话保存流程。",
+        "type": "bool",
+        "default": true
+      }
+    }
+  },
   "context_config": {
     "description": "上下文与裁剪",
     "hint": "控制 token 预算、输出预留和发送给模型的聊天历史范围。",
@@ -173,6 +274,12 @@
         "hint": "开启后每次真实请求完成时保存请求 messages、绑定快照、检索命中和最终回复。/tavern reset 不会删除归档节点。",
         "type": "bool",
         "default": true
+      },
+      "swipe_candidate_limit": {
+        "description": "每轮候选回复上限",
+        "hint": "使用 /tv sw 或管理页为同一条用户输入重新生成回复时，最多保留的候选数量。",
+        "type": "int",
+        "default": 5
       },
       "cleanup_interval_hours": {
         "description": "清理检查间隔（小时）",

@@ -13,7 +13,7 @@ from typing import Any, Iterable
 
 
 class TavernStorage:
-    SCHEMA_VERSION = 10
+    SCHEMA_VERSION = 11
 
     def __init__(self, path: str | Path):
         self.path = Path(path)
@@ -114,6 +114,7 @@ class TavernStorage:
             patch TEXT NOT NULL DEFAULT '[]',
             reason TEXT NOT NULL DEFAULT '',
             status TEXT NOT NULL DEFAULT 'pending',
+            candidate_base_status TEXT NOT NULL DEFAULT '',
             risk_level TEXT NOT NULL DEFAULT 'high',
             source_type TEXT NOT NULL DEFAULT 'llm',
             before_state TEXT NOT NULL DEFAULT '{}',
@@ -165,11 +166,32 @@ class TavernStorage:
             retrieval_snapshot TEXT NOT NULL DEFAULT '{}',
             memory_snapshot TEXT NOT NULL DEFAULT '{}',
             state_snapshot TEXT NOT NULL DEFAULT '{}',
+            base_state_snapshot TEXT NOT NULL DEFAULT '{}',
+            base_campaign_snapshot TEXT NOT NULL DEFAULT '{}',
+            candidate_group_id TEXT NOT NULL DEFAULT '',
+            candidate_index INTEGER NOT NULL DEFAULT 0,
+            candidate_selected INTEGER NOT NULL DEFAULT 0,
             created_at REAL NOT NULL,
             updated_at REAL NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_story_nodes_session ON story_nodes(session_id, created_at);
         CREATE INDEX IF NOT EXISTS idx_story_nodes_parent ON story_nodes(parent_id, created_at);
+        CREATE TABLE IF NOT EXISTS candidate_groups (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            conversation_id TEXT NOT NULL DEFAULT '',
+            parent_node_id TEXT NOT NULL DEFAULT '',
+            source_node_id TEXT NOT NULL DEFAULT '',
+            user_message TEXT NOT NULL DEFAULT '{}',
+            base_history TEXT NOT NULL DEFAULT '[]',
+            base_state TEXT NOT NULL DEFAULT '{}',
+            base_campaign_state TEXT NOT NULL DEFAULT '{}',
+            selected_node_id TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'open',
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_candidate_groups_session ON candidate_groups(session_id,status,updated_at);
         CREATE INDEX IF NOT EXISTS idx_sessions_updated_at ON sessions(updated_at);
         CREATE INDEX IF NOT EXISTS idx_previews_updated_at ON previews(updated_at);
         CREATE TABLE IF NOT EXISTS schema_meta (
@@ -232,6 +254,7 @@ class TavernStorage:
 
     def _migrate_schema(self, conn: sqlite3.Connection) -> None:
         self._ensure_column(conn, "campaign_state_changes", "risk_level", "TEXT NOT NULL DEFAULT 'high'")
+        self._ensure_column(conn, "campaign_state_changes", "candidate_base_status", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column(conn, "memories", "embedding_model", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column(conn, "memories", "status", "TEXT NOT NULL DEFAULT 'active'")
         self._ensure_column(conn, "memories", "importance", "REAL NOT NULL DEFAULT 1.0")
@@ -298,6 +321,30 @@ class TavernStorage:
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_story_nodes_session ON story_nodes(session_id, created_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_story_nodes_parent ON story_nodes(parent_id, created_at)")
+        self._ensure_column(conn, "story_nodes", "base_state_snapshot", "TEXT NOT NULL DEFAULT '{}'")
+        self._ensure_column(conn, "story_nodes", "base_campaign_snapshot", "TEXT NOT NULL DEFAULT '{}'")
+        self._ensure_column(conn, "story_nodes", "candidate_group_id", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column(conn, "story_nodes", "candidate_index", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column(conn, "story_nodes", "candidate_selected", "INTEGER NOT NULL DEFAULT 0")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_story_nodes_candidate ON story_nodes(candidate_group_id,candidate_index)")
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS candidate_groups (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            conversation_id TEXT NOT NULL DEFAULT '',
+            parent_node_id TEXT NOT NULL DEFAULT '',
+            source_node_id TEXT NOT NULL DEFAULT '',
+            user_message TEXT NOT NULL DEFAULT '{}',
+            base_history TEXT NOT NULL DEFAULT '[]',
+            base_state TEXT NOT NULL DEFAULT '{}',
+            base_campaign_state TEXT NOT NULL DEFAULT '{}',
+            selected_node_id TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'open',
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL
+        )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_candidate_groups_session ON candidate_groups(session_id,status,updated_at)")
 
     def rebuild_document_index(
         self,
@@ -932,8 +979,9 @@ class TavernStorage:
                     id,session_id,parent_id,branch_name,title,turn_index,
                     request_messages,preview_payload,assistant_text,assistant_payload,
                     bindings_snapshot,retrieval_snapshot,memory_snapshot,state_snapshot,
-                    created_at,updated_at
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    base_state_snapshot,base_campaign_snapshot,candidate_group_id,
+                    candidate_index,candidate_selected,created_at,updated_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     node_id,
                     str(payload.get("session_id", "")),
@@ -949,6 +997,11 @@ class TavernStorage:
                     json.dumps(payload.get("retrieval_snapshot", {}), ensure_ascii=False),
                     json.dumps(payload.get("memory_snapshot", {}), ensure_ascii=False),
                     json.dumps(payload.get("state_snapshot", {}), ensure_ascii=False),
+                    json.dumps(payload.get("base_state_snapshot", {}), ensure_ascii=False),
+                    json.dumps(payload.get("base_campaign_snapshot", {}), ensure_ascii=False),
+                    str(payload.get("candidate_group_id", "") or ""),
+                    int(payload.get("candidate_index", 0) or 0),
+                    int(bool(payload.get("candidate_selected", False))),
                     created_at,
                     updated_at,
                 ),
@@ -1021,6 +1074,140 @@ class TavernStorage:
             result = conn.execute(f"UPDATE story_nodes SET {','.join(updates)} WHERE id=?", params)
         return bool(result.rowcount)
 
+    def update_story_node_state(self, node_id: str, state_snapshot: dict[str, Any]) -> bool:
+        with self._lock, self._connection() as conn:
+            result = conn.execute(
+                "UPDATE story_nodes SET state_snapshot=?,updated_at=? WHERE id=?",
+                (json.dumps(state_snapshot, ensure_ascii=False), time.time(), node_id),
+            )
+        return bool(result.rowcount)
+
+    def create_candidate_group(self, payload: dict[str, Any]) -> dict[str, Any]:
+        group_id = str(payload.get("id") or uuid.uuid4())
+        now = time.time()
+        with self._lock, self._connection() as conn:
+            conn.execute(
+                """INSERT INTO candidate_groups(
+                    id,session_id,conversation_id,parent_node_id,source_node_id,
+                    user_message,base_history,base_state,base_campaign_state,
+                    selected_node_id,status,created_at,updated_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    group_id,
+                    str(payload.get("session_id", "")),
+                    str(payload.get("conversation_id", "")),
+                    str(payload.get("parent_node_id", "")),
+                    str(payload.get("source_node_id", "")),
+                    json.dumps(payload.get("user_message", {}), ensure_ascii=False),
+                    json.dumps(payload.get("base_history", []), ensure_ascii=False),
+                    json.dumps(payload.get("base_state", {}), ensure_ascii=False),
+                    json.dumps(payload.get("base_campaign_state", {}), ensure_ascii=False),
+                    str(payload.get("selected_node_id", "")),
+                    str(payload.get("status", "open")),
+                    now,
+                    now,
+                ),
+            )
+            source_node_id = str(payload.get("source_node_id", ""))
+            if source_node_id:
+                conn.execute(
+                    """UPDATE story_nodes SET candidate_group_id=?,candidate_index=1,
+                    candidate_selected=1,updated_at=? WHERE id=?""",
+                    (group_id, now, source_node_id),
+                )
+        self.sync_candidate_state_changes(group_id, source_node_id)
+        return self.get_candidate_group(group_id) or {}
+
+    @classmethod
+    def _decode_candidate_group(cls, row: sqlite3.Row) -> dict[str, Any]:
+        item = dict(row)
+        for key, fallback in (
+            ("user_message", {}),
+            ("base_history", []),
+            ("base_state", {}),
+            ("base_campaign_state", {}),
+        ):
+            item[key] = cls._load_json(item.get(key), fallback)
+        return item
+
+    def get_candidate_group(self, group_id: str) -> dict[str, Any] | None:
+        with self._connection() as conn:
+            row = conn.execute("SELECT * FROM candidate_groups WHERE id=?", (group_id,)).fetchone()
+        return self._decode_candidate_group(row) if row else None
+
+    def active_candidate_group(self, session_id: str) -> dict[str, Any] | None:
+        with self._connection() as conn:
+            row = conn.execute(
+                """SELECT * FROM candidate_groups WHERE session_id=? AND status='open'
+                ORDER BY updated_at DESC LIMIT 1""",
+                (session_id,),
+            ).fetchone()
+        return self._decode_candidate_group(row) if row else None
+
+    def list_candidate_nodes(self, group_id: str) -> list[dict[str, Any]]:
+        with self._connection() as conn:
+            rows = conn.execute(
+                """SELECT * FROM story_nodes WHERE candidate_group_id=?
+                ORDER BY candidate_index,created_at""",
+                (group_id,),
+            ).fetchall()
+        return [self._decode_story_node(row, summary=False) for row in rows]
+
+    def select_candidate_node(self, group_id: str, node_id: str) -> bool:
+        now = time.time()
+        with self._lock, self._connection() as conn:
+            exists = conn.execute(
+                "SELECT 1 FROM story_nodes WHERE id=? AND candidate_group_id=?",
+                (node_id, group_id),
+            ).fetchone()
+            if not exists:
+                return False
+            conn.execute(
+                """UPDATE story_nodes SET candidate_selected=CASE WHEN id=? THEN 1 ELSE 0 END,
+                updated_at=? WHERE candidate_group_id=?""",
+                (node_id, now, group_id),
+            )
+            conn.execute(
+                "UPDATE candidate_groups SET selected_node_id=?,updated_at=? WHERE id=?",
+                (node_id, now, group_id),
+            )
+        return True
+
+    def sync_candidate_state_changes(self, group_id: str, selected_node_id: str) -> None:
+        with self._lock, self._connection() as conn:
+            rows = conn.execute(
+                "SELECT id FROM story_nodes WHERE candidate_group_id=?",
+                (group_id,),
+            ).fetchall()
+            node_ids = [str(row["id"]) for row in rows]
+            if not node_ids:
+                return
+            placeholders = ",".join("?" for _ in node_ids)
+            conn.execute(
+                f"""UPDATE campaign_state_changes
+                SET candidate_base_status=CASE
+                    WHEN candidate_base_status='' THEN status ELSE candidate_base_status END,
+                    status='candidate_inactive',updated_at=?
+                WHERE story_node_id IN ({placeholders}) AND story_node_id<>?
+                AND status<>'candidate_inactive'""",
+                [time.time(), *node_ids, selected_node_id],
+            )
+            conn.execute(
+                """UPDATE campaign_state_changes
+                SET status=CASE WHEN candidate_base_status<>'' THEN candidate_base_status ELSE 'pending' END,
+                updated_at=? WHERE story_node_id=? AND status='candidate_inactive'""",
+                (time.time(), selected_node_id),
+            )
+
+    def close_candidate_groups(self, session_id: str) -> int:
+        with self._lock, self._connection() as conn:
+            result = conn.execute(
+                """UPDATE candidate_groups SET status='closed',updated_at=?
+                WHERE session_id=? AND status='open'""",
+                (time.time(), session_id),
+            )
+        return int(result.rowcount)
+
     @staticmethod
     def _load_json(value: Any, fallback: Any) -> Any:
         try:
@@ -1038,6 +1225,9 @@ class TavernStorage:
         retrieval = cls._load_json(result.pop("retrieval_snapshot"), {})
         memory = cls._load_json(result.pop("memory_snapshot"), {})
         state = cls._load_json(result.pop("state_snapshot"), {})
+        base_state = cls._load_json(result.pop("base_state_snapshot", "{}"), {})
+        base_campaign = cls._load_json(result.pop("base_campaign_snapshot", "{}"), {})
+        result["candidate_selected"] = bool(result.get("candidate_selected"))
         result["message_count"] = len(messages) if isinstance(messages, list) else 0
         result["assistant_preview"] = str(result.get("assistant_text", ""))[:240]
         assistant_normalized = " ".join(str(result.get("assistant_text", "") or "").split())
@@ -1062,6 +1252,8 @@ class TavernStorage:
                 "retrieval_snapshot": retrieval,
                 "memory_snapshot": memory,
                 "state_snapshot": state,
+                "base_state_snapshot": base_state,
+                "base_campaign_snapshot": base_campaign,
             })
         return result
 

@@ -94,6 +94,9 @@ class TavernWebApi:
             (f"{self.PREFIX}/archive/<node_id>", ["GET"], self.archive_node, "Get story node"),
             (f"{self.PREFIX}/archive/<node_id>/rename", ["POST"], self.archive_rename, "Rename story node"),
             (f"{self.PREFIX}/archive/<node_id>/branch", ["POST"], self.archive_branch, "Continue from story node"),
+            (f"{self.PREFIX}/candidates/<session_id>", ["GET"], self.candidates, "Latest reply candidates"),
+            (f"{self.PREFIX}/candidates/<session_id>/generate", ["POST"], self.generate_candidate, "Generate reply candidate"),
+            (f"{self.PREFIX}/candidates/<session_id>/select", ["POST"], self.select_candidate, "Select reply candidate"),
             (f"{self.PREFIX}/preview/<session_id>", ["GET"], self.preview, "Last request preview"),
             (f"{self.PREFIX}/session/<session_id>", ["GET"], self.session, "Session state"),
             (f"{self.PREFIX}/session/<session_id>/reset", ["POST"], self.reset_session, "Reset session"),
@@ -665,6 +668,146 @@ class TavernWebApi:
         content = json.dumps(nodes, ensure_ascii=False, indent=2).encode("utf-8")
         name = safe_filename(session_id or "archive", "archive")
         return self.ok(download_payload(f"tavern-archive-{name}.json", "application/json", content))
+
+    @staticmethod
+    def _latest_plain_turn(history: list[Any]):
+        assistant_index = next(
+            (
+                index for index in range(len(history) - 1, -1, -1)
+                if isinstance(history[index], dict)
+                and str(history[index].get("role", "")) == "assistant"
+            ),
+            -1,
+        )
+        user_index = next(
+            (
+                index for index in range(assistant_index - 1, -1, -1)
+                if isinstance(history[index], dict)
+                and str(history[index].get("role", "")) == "user"
+            ),
+            -1,
+        )
+        if user_index < 0 or assistant_index < 0:
+            return None
+        user = history[user_index]
+        assistant = history[assistant_index]
+        if not isinstance(user.get("content"), str) or not isinstance(
+            assistant.get("content"), str
+        ):
+            return None
+        if any(
+            not isinstance(item, dict)
+            or str(item.get("role", "")) not in {"assistant", "checkpoint", "_checkpoint"}
+            for item in history[user_index + 1:]
+        ):
+            return None
+        return history[:user_index], user, assistant
+
+    async def candidates(self, session_id: str):
+        group = await self.service.candidate_group(session_id)
+        return self.ok(group) if group else self.error("No active candidate group", 404)
+
+    async def generate_candidate(self, session_id: str):
+        manager = self.context.conversation_manager
+        conversation_id = await manager.get_curr_conversation_id(session_id)
+        conversation = (
+            await manager.get_conversation(session_id, conversation_id)
+            if conversation_id else None
+        )
+        if not conversation:
+            return self.error("AstrBot conversation not found", 404)
+        try:
+            history = json.loads(conversation.history or "[]")
+        except (json.JSONDecodeError, TypeError):
+            return self.error("Conversation history is invalid")
+        latest = self._latest_plain_turn(history if isinstance(history, list) else [])
+        if not latest:
+            return self.error("Latest turn is not a replayable plain-text turn")
+        base_history, user_message, _ = latest
+        group = await self.service.candidate_group(session_id)
+        previous_index = 1
+        if group:
+            selected = next(
+                (node for node in group.get("nodes", []) if node.get("candidate_selected")),
+                None,
+            )
+            previous_index = int((selected or {}).get("candidate_index", 1) or 1)
+        try:
+            swipe = await self.service.prepare_swipe(
+                session_id=session_id,
+                conversation_id=str(conversation_id),
+                base_history=base_history,
+                user_message=user_message,
+            )
+            result = await self.service.play_web_turn(
+                session_id=session_id,
+                prompt=str(swipe["user_message"].get("content", "") or ""),
+                contexts_override=swipe["base_history"],
+                conversation_id_override=str(conversation_id),
+                swipe_meta={
+                    "group_id": swipe["group_id"],
+                    "parent_node_id": swipe["parent_node_id"],
+                    "candidate_index": swipe["candidate_index"],
+                    "previous_index": previous_index,
+                },
+            )
+        except Exception as exc:
+            try:
+                await self.service.select_candidate(session_id, previous_index)
+            except Exception:
+                pass
+            return self.error(str(exc), 502)
+        result["candidate_group"] = await self.service.candidate_group(session_id)
+        return self.ok(result)
+
+    async def select_candidate(self, session_id: str):
+        payload = await request.get_json(force=True)
+        try:
+            candidate_index = int(payload.get("candidate_index", 0))
+        except (TypeError, ValueError):
+            return self.error("candidate_index must be an integer")
+        group = await self.service.candidate_group(session_id)
+        if not group:
+            return self.error("No active candidate group", 404)
+        target = next(
+            (
+                node for node in group.get("nodes", [])
+                if int(node.get("candidate_index", 0) or 0) == candidate_index
+            ),
+            None,
+        )
+        if not target:
+            return self.error("Candidate not found", 404)
+        manager = self.context.conversation_manager
+        conversation_id = str(group.get("conversation_id", "") or "")
+        conversation = (
+            await manager.get_conversation(session_id, conversation_id)
+            if conversation_id else None
+        )
+        if not conversation:
+            return self.error("AstrBot conversation not found", 404)
+        try:
+            history = json.loads(conversation.history or "[]")
+        except (json.JSONDecodeError, TypeError):
+            return self.error("Conversation history is invalid")
+        latest = self._latest_plain_turn(history if isinstance(history, list) else [])
+        if not latest:
+            return self.error("Latest turn is no longer switchable")
+        base_history, _, _ = latest
+        await manager.update_conversation(
+            session_id,
+            conversation_id,
+            [
+                *base_history,
+                group.get("user_message", {}),
+                {"role": "assistant", "content": str(target.get("assistant_text", ""))},
+            ],
+        )
+        selected = await self.service.select_candidate(session_id, candidate_index)
+        return self.ok({
+            "selected": selected,
+            "candidate_group": await self.service.candidate_group(session_id),
+        })
 
     async def generation(self):
         payload = await request.get_json(force=True)
